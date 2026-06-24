@@ -1,0 +1,15 @@
+// PNG icons embedded in the plugin DLL (optional: if present at build time)
+#include "overlay-icons-resource.h"
+
+IDR_ICON_PLAY            RCDATA "@ICONS_SOURCE_DIR@/play.png"
+IDR_ICON_PAUSE           RCDATA "@ICONS_SOURCE_DIR@/pause.png"
+IDR_ICON_CARET_LEFT      RCDATA "@ICONS_SOURCE_DIR@/caret-line-left.png"
+IDR_ICON_CARET_RIGHT     RCDATA "@ICONS_SOURCE_DIR@/caret-line-right.png"
+IDR_ICON_DOWNLOAD        RCDATA "@ICONS_SOURCE_DIR@/download-simple.png"
+IDR_ICON_TRASH           RCDATA "@ICONS_SOURCE_DIR@/trash-simple.png"
+IDR_ICON_SPEAKER         RCDATA "@ICONS_SOURCE_DIR@/speaker-high.png"
+IDR_ICON_ARROW_LEFT      RCDATA "@ICONS_SOURCE_DIR@/arrow-left.png"
+IDR_ICON_ARROWS_OUT      RCDATA "@ICONS_SOURCE_DIR@/arrows-out.png"
+IDR_ICON_ARROWS_IN       RCDATA "@ICONS_SOURCE_DIR@/arrows-in.png"
+IDR_ICON_GEAR            RCDATA "@ICONS_SOURCE_DIR@/gear.png"
+IDR_ICON_CHART           RCDATA "@ICONS_SOURCE_DIR@/chart-line.png"
