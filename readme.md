@@ -1,5 +1,8 @@
 # ntchffs-overlay
 
+![Release](https://img.shields.io/github/v/release/notch4ff4/ntchffs-overlay)
+![Downloads](https://img.shields.io/github/downloads/notch4ff4/ntchffs-overlay/total)
+
 Данный плагин представляет собой ультимативный оверлей для OBS Studio, напоминающий всем известный Nvidia ShadowPlay, только ***на стероидах***.
 
 # Возможности
