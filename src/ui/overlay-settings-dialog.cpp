@@ -8,6 +8,7 @@
 #include <QApplication>
 #include <QScreen>
 #include <QKeyEvent>
+#include <QHideEvent>
 #include <QFileDialog>
 
 extern "C" {
@@ -587,6 +588,17 @@ bool OverlaySettingsDialog::eventFilter(QObject *watched, QEvent *event)
 		}
 	}
 	return QDialog::eventFilter(watched, event);
+}
+
+void OverlaySettingsDialog::hideEvent(QHideEvent *event)
+{
+	QDialog::hideEvent(event);
+	// Drop modality once the dialog is closed/hidden. A persistent modal child
+	// keeps OBS from minimizing to tray because OBSBasic::ToggleShowHide() bails
+	// out whenever EnumDialogs() finds a child QDialog whose isModal() is true,
+	// and that flag stays set even while the dialog is hidden. Modality is
+	// re-armed right before the dialog is shown again.
+	setModal(false);
 }
 
 OverlaySettingsDialog::Position OverlaySettingsDialog::getPosition() const

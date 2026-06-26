@@ -394,6 +394,9 @@ void open_settings_dialog_from_overlay(void)
 	// Reload from disk on every open; the overlay does not push state into the dialog.
 	settings_dialog->loadSettings();
 
+	// Re-arm modality before showing: it is dropped on hide so OBS can still
+	// minimize to tray once the dialog is closed (see hideEvent()).
+	settings_dialog->setModal(true);
 	settings_dialog->show();
 	settings_dialog->raise();
 	settings_dialog->activateWindow();
