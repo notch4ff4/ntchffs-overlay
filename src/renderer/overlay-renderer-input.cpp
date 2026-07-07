@@ -9,10 +9,6 @@
 #include <QWidget>
 #endif
 
-extern "C" {
-void open_settings_dialog_from_overlay(void);
-}
-
 bool OverlayRenderer::IsPointInRect(const POINT &pt, const RECT &rect) const
 {
 	return pt.x >= rect.left && pt.x <= rect.right && pt.y >= rect.top && pt.y <= rect.bottom;
@@ -21,6 +17,10 @@ bool OverlayRenderer::IsPointInRect(const POINT &pt, const RECT &rect) const
 void OverlayRenderer::HandleClick(int x, int y)
 {
 	m_lastInteractionTick = GetTickCount64();
+	if (m_settingsOpen) {
+		HandleSettingsClick(x, y);
+		return;
+	}
 	if (m_galleryOpen) {
 		if (m_suppressNextGalleryClick) {
 			m_suppressNextGalleryClick = false;
@@ -111,7 +111,7 @@ void OverlayRenderer::HandleClick(int x, int y)
 	}
 
 	if (IsPointInRect(pt, m_layout.settingsButtonRect)) {
-		open_settings_dialog_from_overlay();
+		OpenSettings();
 		return;
 	}
 
@@ -156,6 +156,15 @@ void OverlayRenderer::HandleMouseUp(int x, int y)
 void OverlayRenderer::HandleMouseMove(int x, int y)
 {
 	m_lastInteractionTick = GetTickCount64();
+	if (m_settingsOpen) {
+		POINT spt = ClientToLayoutPoint(x, y);
+		int idx = SettingsHoverIndexAt(spt);
+		if (idx != m_settingsHoverIndex) {
+			m_settingsHoverIndex = idx;
+			Render();
+		}
+		return;
+	}
 	if (m_galleryOpen && m_timelineDragging) {
 		HandleGalleryClick(x, y);
 		return;
@@ -173,6 +182,13 @@ void OverlayRenderer::HandleMouseMove(int x, int y)
 
 void OverlayRenderer::HandleMouseLeave()
 {
+	if (m_settingsOpen) {
+		if (m_settingsHoverIndex != -1) {
+			m_settingsHoverIndex = -1;
+			Render();
+		}
+		return;
+	}
 	if (m_hoverTarget != HoverTarget::None) {
 		m_hoverTarget = HoverTarget::None;
 		Render();
@@ -181,6 +197,9 @@ void OverlayRenderer::HandleMouseLeave()
 
 OverlayRenderer::HoverTarget OverlayRenderer::GetHoverTarget(const POINT &pt) const
 {
+	if (m_settingsOpen) {
+		return HoverTarget::None;
+	}
 	if (m_galleryOpen) {
 		if (IsPointInRect(pt, m_galleryBackRect))
 			return HoverTarget::GalleryBack;

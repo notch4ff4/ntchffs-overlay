@@ -113,14 +113,6 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
   src/indicators/overlay-indicators-c.h
 )
 
-if(ENABLE_QT)
-  # Qt is only used for settings dialog now
-  target_sources(${CMAKE_PROJECT_NAME} PRIVATE
-    src/ui/overlay-settings-dialog.cpp
-    src/ui/overlay-settings-dialog.h
-  )
-endif()
-
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
 
 # Include dirs for modularized source layout.

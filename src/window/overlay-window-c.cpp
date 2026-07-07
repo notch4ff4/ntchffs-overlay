@@ -227,9 +227,11 @@ void overlay_window_set_background_alpha(void *window, float alpha)
 
 void overlay_window_open_settings(void *window)
 {
-	UNUSED_PARAMETER(window);
-	extern void open_settings_dialog_from_overlay(void);
-	open_settings_dialog_from_overlay();
+	if (!window) {
+		return;
+	}
+	OverlayRenderer *renderer = static_cast<OverlayRenderer *>(window);
+	renderer->OpenSettings();
 }
 
 int overlay_window_get_position(void *window)

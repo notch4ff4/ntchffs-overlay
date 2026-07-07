@@ -45,7 +45,10 @@ public:
 
 	void UpdateStatus();
 	void Render();
-	
+
+	// Opens the in-overlay settings panel (replaces the old Qt dialog).
+	void OpenSettings();
+
 	void HandleClick(int x, int y);
 	void HandleMouseDown(int x, int y);
 	void HandleMouseUp(int x, int y);
@@ -76,6 +79,18 @@ private:
 	void HandleGalleryClick(int x, int y);
 	void HandleGalleryKey(int vkCode, int mods);
 	bool HandleGalleryMouseDown(int x, int y);
+
+	// --- In-overlay settings panel ---
+	void CloseSettings();
+	void ApplySettingsWindowSize();
+	void RenderSettingsPanel();
+	void HandleSettingsClick(int x, int y);
+	void HandleSettingsKey(int vkCode, int mods);
+	void HandleSettingsWheel(int delta);
+	void LoadSettingsWorkingValues();
+	void PersistSettingsWorkingValues();
+	int SettingsHoverIndexAt(const POINT &pt) const;
+	std::wstring SettingsHotkeyName(int vk, int mod) const;
 	void MaybeStartDrag(int x, int y);
 	void RenderText(const std::wstring &text, const RECT &rect, 
 	                float fontSize, DWRITE_FONT_WEIGHT weight, 
@@ -216,6 +231,58 @@ private:
 	std::vector<bool> m_exportTrackKeep;
 	std::vector<RECT> m_exportTrackKeepRects;
 	std::vector<std::wstring> m_exportTrackLabels;
+
+	// --- Settings panel state ---
+	enum class SettingsAction { ToggleBool, StepDown, StepUp, HotkeyCapture, Browse, Close };
+	enum class SettingsField {
+		// bool fields (ToggleBool)
+		AutoHideEnabled,
+		IndicatorsEnabled,
+		IndicatorsOled,
+		SmartReplay,
+		GalleryInOverlay,
+		CaptureFocus,
+		// numeric/enum fields (StepDown / StepUp)
+		Position,
+		Margin,
+		Orientation,
+		Opacity,
+		AutoHideSeconds,
+		IndicatorsPosition
+	};
+	struct SettingsHit {
+		RECT rect;
+		SettingsAction action;
+		int field; // SettingsField for Toggle/Step, hotkey index for HotkeyCapture
+	};
+
+	bool m_settingsOpen;
+	int m_settingsContentWidth;
+	int m_settingsContentHeight;
+	int m_settingsScrollOffset;
+	int m_settingsContentTotalHeight;
+	int m_settingsViewportTop;
+	int m_settingsViewportBottom;
+	int m_settingsCapturingHotkeyIndex;
+	int m_settingsHoverIndex;
+	std::vector<SettingsHit> m_settingsHits;
+
+	// Working copies edited by the panel; mirrored into saved_settings_data.
+	int m_setPosition;
+	int m_setMargin;
+	int m_setOrientation;
+	int m_setOpacityPct;
+	bool m_setAutoHideEnabled;
+	int m_setAutoHideSeconds;
+	bool m_setIndicatorsEnabled;
+	int m_setIndicatorsPosition;
+	bool m_setIndicatorsOled;
+	bool m_setSmartReplay;
+	bool m_setGalleryInOverlay;
+	bool m_setCaptureFocus;
+	std::wstring m_setExportPath;
+	int m_setHotkeyVk[7];
+	int m_setHotkeyMod[7];
 
 	ID2D1PathGeometry *m_iconPlayGeometry;
 

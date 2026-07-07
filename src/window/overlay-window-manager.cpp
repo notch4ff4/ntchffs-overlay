@@ -1,6 +1,7 @@
 #ifdef _WIN32
 
 #include "overlay-window-manager.h"
+#include <windowsx.h>
 #include <obs-module.h>
 
 extern "C" {
@@ -15,8 +16,12 @@ OverlayWindowManager::OverlayWindowManager()
 	  m_mouseMoveHandler(nullptr), m_mouseMoveUserData(nullptr),
 	m_mouseLeaveHandler(nullptr), m_mouseLeaveUserData(nullptr),
 	  m_keyHandler(nullptr), m_keyHandlerUserData(nullptr),
-	  m_trackingMouseLeave(false), m_allowActivate(false) {
+	  m_wheelHandler(nullptr), m_wheelHandlerUserData(nullptr),
+	  m_trackingMouseLeave(false), m_allowActivate(false),
+	  m_keyboardHook(nullptr) {
 }
+
+OverlayWindowManager *OverlayWindowManager::s_keyboardCaptureManager = nullptr;
 
 OverlayWindowManager::~OverlayWindowManager() {
 	Shutdown();
@@ -89,6 +94,17 @@ LRESULT CALLBACK OverlayWindowManager::WindowProc(HWND hwnd, UINT msg, WPARAM wP
 		manager->m_trackingMouseLeave = false;
 		if (manager->m_mouseLeaveHandler) {
 			manager->m_mouseLeaveHandler(manager->m_mouseLeaveUserData);
+		}
+		return 0;
+	}
+
+	case WM_MOUSEWHEEL: {
+		if (manager->m_wheelHandler) {
+			int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+			// WM_MOUSEWHEEL reports screen coordinates; convert to client space.
+			POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+			ScreenToClient(hwnd, &pt);
+			manager->m_wheelHandler(delta, pt.x, pt.y, manager->m_wheelHandlerUserData);
 		}
 		return 0;
 	}
@@ -183,6 +199,7 @@ bool OverlayWindowManager::Initialize(HINSTANCE hInstance) {
 }
 
 void OverlayWindowManager::Shutdown() {
+	SetKeyboardCaptureActive(false);
 	if (m_hwnd) {
 		DestroyWindow(m_hwnd);
 		m_hwnd = nullptr;
@@ -260,6 +277,63 @@ void OverlayWindowManager::SetMouseLeaveHandler(void (*handler)(void *userData),
 void OverlayWindowManager::SetKeyHandler(void (*handler)(int vkCode, int mods, void *userData), void *userData) {
 	m_keyHandler = handler;
 	m_keyHandlerUserData = userData;
+}
+
+void OverlayWindowManager::SetWheelHandler(void (*handler)(int delta, int x, int y, void *userData), void *userData) {
+	m_wheelHandler = handler;
+	m_wheelHandlerUserData = userData;
+}
+
+void OverlayWindowManager::SetKeyboardCaptureActive(bool active) {
+	if (active) {
+		if (m_keyboardHook) {
+			return;
+		}
+		s_keyboardCaptureManager = this;
+		m_keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc,
+						  GetModuleHandle(NULL), 0);
+		if (!m_keyboardHook) {
+			s_keyboardCaptureManager = nullptr;
+			obs_log(LOG_WARNING, "Failed to install keyboard capture hook: %lu", GetLastError());
+		}
+	} else {
+		if (m_keyboardHook) {
+			UnhookWindowsHookEx(m_keyboardHook);
+			m_keyboardHook = nullptr;
+		}
+		if (s_keyboardCaptureManager == this) {
+			s_keyboardCaptureManager = nullptr;
+		}
+	}
+}
+
+LRESULT CALLBACK OverlayWindowManager::LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
+	if (code == HC_ACTION) {
+		OverlayWindowManager *mgr = s_keyboardCaptureManager;
+		if (mgr) {
+			if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+				KBDLLHOOKSTRUCT *kb = reinterpret_cast<KBDLLHOOKSTRUCT *>(lParam);
+				if (kb && mgr->m_keyHandler) {
+					int vk = static_cast<int>(kb->vkCode);
+					int mods = 0;
+					// Physical key state is reliable here even though the event is swallowed.
+					if (GetAsyncKeyState(VK_SHIFT) & 0x8000)
+						mods |= 1;
+					if (GetAsyncKeyState(VK_CONTROL) & 0x8000)
+						mods |= 2;
+					if (GetAsyncKeyState(VK_MENU) & 0x8000)
+						mods |= 4;
+					mgr->m_keyHandler(vk, mods, mgr->m_keyHandlerUserData);
+				}
+				// Swallow so the bind key does not reach the focused app/game.
+				return 1;
+			}
+			if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
+				return 1;
+			}
+		}
+	}
+	return CallNextHookEx(NULL, code, wParam, lParam);
 }
 
 void OverlayWindowManager::SetClickThrough(bool enabled) {

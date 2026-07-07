@@ -29,7 +29,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #ifdef ENABLE_QT
 #include "overlay-window-c.h"
 #include "overlay-indicators-c.h"
-#include "overlay-settings-dialog.h"
+#include "overlay-runtime-apply.h"
 #include "overlay-state.h"
 #include <QAction>
 #include <QInputDialog>
@@ -55,7 +55,6 @@ static bool hotkeys_loaded = false;
 #ifdef ENABLE_QT
 static void *overlay_window = NULL;
 static void *overlay_indicators = NULL;
-static QPointer<OverlaySettingsDialog> settings_dialog = NULL;
 static bool replay_restart_pending = false;
 static int replay_restart_attempts = 0;
 static bool smart_replay_enabled = true;
@@ -157,9 +156,6 @@ static void handle_replay_saved_event(void)
 }
 
 static void frontend_event_callback(enum obs_frontend_event event, void *priv_data);
-static void open_settings_dialog(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed);
-
-extern "C" void open_settings_dialog_from_overlay(void);
 
 #endif
 
@@ -321,85 +317,19 @@ static void load_hotkeys_from_saved_data(void)
 #endif
 
 #ifdef ENABLE_QT
-static void open_settings_dialog(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
+// --- Runtime apply bridge (used by the in-overlay settings panel) ---
+extern "C" void overlay_runtime_set_indicators(bool enabled, int position, bool oledProtection)
 {
-	UNUSED_PARAMETER(data);
-	UNUSED_PARAMETER(id);
-	UNUSED_PARAMETER(hotkey);
-
-	if (!pressed)
+	if (!overlay_indicators)
 		return;
-
-	open_settings_dialog_from_overlay();
+	overlay_indicators_set_enabled(overlay_indicators, enabled);
+	overlay_indicators_set_position(overlay_indicators, position);
+	overlay_indicators_set_oled_protection(overlay_indicators, oledProtection);
 }
 
-void open_settings_dialog_from_overlay(void)
+extern "C" void overlay_runtime_set_smart_replay(bool enabled)
 {
-	if (!settings_dialog) {
-		QWidget *mainWindow = static_cast<QWidget*>(obs_frontend_get_main_window());
-		settings_dialog = new OverlaySettingsDialog(mainWindow);
-
-		// Live apply while the modal is open is unreliable; defer to the next event-loop tick.
-		QObject::connect(settings_dialog, &OverlaySettingsDialog::settingsChanged, []() {
-			if (!overlay_window || !settings_dialog)
-				return;
-			int pos = settings_dialog->getPosition();
-			int m = settings_dialog->getMargin();
-			int orient = settings_dialog->getOrientation();
-			bool autoHideEnabled = settings_dialog->getAutoHideEnabled();
-			int autoHideSeconds = settings_dialog->getAutoHideSeconds();
-			bool indicatorsEnabled = settings_dialog->getIndicatorsEnabled();
-			int indicatorsPosition = settings_dialog->getIndicatorsPosition();
-			bool smartReplayEnabled = settings_dialog->getSmartReplayEnabled();
-			bool galleryInOverlay = settings_dialog->getGalleryInOverlay();
-			bool captureFocus = settings_dialog->getCaptureFocus();
-			double overlayAlpha = settings_dialog->getOverlayBackgroundAlpha();
-			QTimer::singleShot(0, [pos, m, orient, autoHideEnabled, autoHideSeconds,
-					       indicatorsEnabled, indicatorsPosition, smartReplayEnabled,
-					       galleryInOverlay, captureFocus, overlayAlpha]() {
-				if (!overlay_window)
-					return;
-				overlay_window_set_orientation(overlay_window, orient);
-				overlay_window_set_position(overlay_window, pos, m);
-				overlay_window_set_auto_hide(overlay_window, autoHideEnabled, autoHideSeconds);
-				overlay_window_set_gallery_enabled(overlay_window, galleryInOverlay);
-				overlay_window_set_capture_focus(overlay_window, captureFocus);
-				overlay_window_set_background_alpha(overlay_window, static_cast<float>(overlayAlpha));
-				if (overlay_indicators) {
-					overlay_indicators_set_enabled(overlay_indicators, indicatorsEnabled);
-					overlay_indicators_set_position(overlay_indicators, indicatorsPosition);
-				}
-				set_smart_replay_enabled(smartReplayEnabled);
-				overlay_window_apply_position(overlay_window);
-				obs_log(LOG_INFO, "Overlay applied: position=%d, margin=%d, orientation=%d",
-					pos, m, orient);
-				// Re-apply once layout has settled so containers land in the final position.
-				QTimer::singleShot(50, []() {
-					if (overlay_window)
-						overlay_window_apply_position(overlay_window);
-				});
-			});
-		});
-		QObject::connect(settings_dialog, &OverlaySettingsDialog::indicatorsChanged,
-				 [](bool enabled, int position, bool oledProtection) {
-			if (!overlay_indicators)
-				return;
-			overlay_indicators_set_enabled(overlay_indicators, enabled);
-			overlay_indicators_set_position(overlay_indicators, position);
-			overlay_indicators_set_oled_protection(overlay_indicators, oledProtection);
-		});
-	} else {
-		settings_dialog->loadSettings();
-	}
-	// Reload from disk on every open; the overlay does not push state into the dialog.
-	settings_dialog->loadSettings();
-
-	// Re-arm modality before showing: it is dropped on hide so OBS can still
-	// minimize to tray once the dialog is closed (see hideEvent()).
-	settings_dialog->setModal(true);
-	settings_dialog->show();
-	settings_dialog->raise();
-	settings_dialog->activateWindow();
+	set_smart_replay_enabled(enabled);
 }
 
 static void frontend_event_callback(enum obs_frontend_event event, void *priv_data)
@@ -540,15 +470,9 @@ void obs_module_unload(void)
 	// Null globals first so deferred QTimer callbacks skip instead of touching freed objects.
 	void *ow = overlay_window;
 	void *oi = overlay_indicators;
-	OverlaySettingsDialog *sd = settings_dialog;
 	overlay_window = NULL;
 	overlay_indicators = NULL;
-	settings_dialog = NULL;
 
-	if (sd) {
-		delete sd;
-		obs_log(LOG_INFO, "Settings dialog destroyed");
-	}
 	if (ow) {
 		overlay_window_destroy(ow);
 		obs_log(LOG_INFO, "Overlay window destroyed");
