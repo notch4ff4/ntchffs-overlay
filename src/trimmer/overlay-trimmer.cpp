@@ -20,6 +20,8 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/avstring.h>
+#include <libavutil/audio_fifo.h>
+#include <libavutil/samplefmt.h>
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 }
@@ -158,6 +160,13 @@ static bool transcode_trim_mp4(const std::wstring &inputPath, const std::wstring
 	};
 	struct SwrDeleter {
 		void operator()(SwrContext *c) const { swr_free(&c); }
+	};
+	struct AudioFifoDeleter {
+		void operator()(AVAudioFifo *f) const
+		{
+			if (f)
+				av_audio_fifo_free(f);
+		}
 	};
 
 	AVFormatContext *ifmt_raw = avformat_alloc_context();
@@ -491,6 +500,19 @@ static bool transcode_trim_mp4(const std::wstring &inputPath, const std::wstring
 	bool video_done = (video_in < 0);
 	std::vector<bool> audio_done(aenc.size(), false);
 
+	std::vector<std::unique_ptr<AVAudioFifo, AudioFifoDeleter>> audio_fifos;
+	audio_fifos.reserve(aenc.size());
+	for (size_t i = 0; i < aenc.size(); i++) {
+		AVCodecContext *enc = aenc[i].get();
+		AVAudioFifo *fifo = av_audio_fifo_alloc(enc->sample_fmt, enc->ch_layout.nb_channels,
+						       enc->frame_size > 0 ? enc->frame_size : 1024);
+		if (!fifo) {
+			outError = L"FFmpeg: av_audio_fifo_alloc failed";
+			return false;
+		}
+		audio_fifos.emplace_back(fifo);
+	}
+
 	auto all_done = [&]() -> bool {
 		if (!video_done)
 			return false;
@@ -551,6 +573,100 @@ static bool transcode_trim_mp4(const std::wstring &inputPath, const std::wstring
 		return true;
 	};
 
+	auto encode_audio_chunks = [&](size_t ai) -> bool {
+		AVCodecContext *enc = aenc[ai].get();
+		AVAudioFifo *fifo = audio_fifos[ai].get();
+		const int frame_size = enc->frame_size > 0 ? enc->frame_size : 0;
+
+		while (true) {
+			const int avail = av_audio_fifo_size(fifo);
+			if (avail <= 0)
+				break;
+			const int nb_samples = (frame_size > 0) ? frame_size : avail;
+			if (frame_size > 0 && avail < frame_size)
+				break;
+
+			std::unique_ptr<AVFrame, FrameDeleter> outF(av_frame_alloc());
+			if (!outF) {
+				outError = L"FFmpeg: av_frame_alloc failed";
+				return false;
+			}
+			outF->format = enc->sample_fmt;
+			outF->sample_rate = enc->sample_rate;
+			av_channel_layout_copy(&outF->ch_layout, &enc->ch_layout);
+			outF->nb_samples = nb_samples;
+			ret = av_frame_get_buffer(outF.get(), 0);
+			if (ret < 0) {
+				set_err(outError, L"FFmpeg: av_frame_get_buffer(audio) failed: ", ret);
+				return false;
+			}
+			if (av_audio_fifo_read(fifo, (void **)outF->data, nb_samples) < nb_samples) {
+				outError = L"FFmpeg: av_audio_fifo_read failed";
+				return false;
+			}
+			outF->pts = audio_pts[ai];
+			audio_pts[ai] += nb_samples;
+
+			AVStream *out_st = ofmt->streams[audio_out[ai]];
+			while (true) {
+				ret = avcodec_send_frame(enc, outF.get());
+				if (ret == AVERROR(EAGAIN)) {
+					if (!write_encoded(enc, out_st, audio_out[ai]))
+						return false;
+					continue;
+				}
+				if (ret < 0) {
+					set_err(outError, L"FFmpeg: avcodec_send_frame(audio) failed: ", ret);
+					return false;
+				}
+				break;
+			}
+			if (!write_encoded(enc, out_st, audio_out[ai]))
+				return false;
+		}
+		return true;
+	};
+
+	auto flush_audio_fifo = [&](size_t ai) -> bool {
+		AVCodecContext *enc = aenc[ai].get();
+		AVAudioFifo *fifo = audio_fifos[ai].get();
+		const int frame_size = enc->frame_size > 0 ? enc->frame_size : 0;
+		int avail = av_audio_fifo_size(fifo);
+		if (avail <= 0)
+			return true;
+
+		if (frame_size > 0) {
+			const int pad = (frame_size - (avail % frame_size)) % frame_size;
+			if (pad > 0) {
+				std::unique_ptr<AVFrame, FrameDeleter> silence(av_frame_alloc());
+				if (!silence) {
+					outError = L"FFmpeg: av_frame_alloc failed";
+					return false;
+				}
+				silence->format = enc->sample_fmt;
+				silence->sample_rate = enc->sample_rate;
+				av_channel_layout_copy(&silence->ch_layout, &enc->ch_layout);
+				silence->nb_samples = pad;
+				ret = av_frame_get_buffer(silence.get(), 0);
+				if (ret < 0) {
+					set_err(outError, L"FFmpeg: av_frame_get_buffer(audio pad) failed: ", ret);
+					return false;
+				}
+				ret = av_samples_set_silence(silence->data, 0, pad, enc->ch_layout.nb_channels,
+							     enc->sample_fmt);
+				if (ret < 0) {
+					set_err(outError, L"FFmpeg: av_samples_set_silence failed: ", ret);
+					return false;
+				}
+				if (av_audio_fifo_write(fifo, (void **)silence->data, pad) < pad) {
+					outError = L"FFmpeg: av_audio_fifo_write(pad) failed";
+					return false;
+				}
+			}
+		}
+		return encode_audio_chunks(ai);
+	};
+
 	auto handle_audio_frame = [&](size_t ai, AVFrame *inFrame) -> bool {
 		int in_idx = audio_in[ai];
 		if (in_idx < 0)
@@ -583,6 +699,8 @@ static bool transcode_trim_mp4(const std::wstring &inputPath, const std::wstring
 		av_channel_layout_copy(&outF->ch_layout, &enc->ch_layout);
 
 		int out_nb = swr_get_out_samples(s, inFrame->nb_samples);
+		if (out_nb <= 0)
+			return true;
 		outF->nb_samples = out_nb;
 		ret = av_frame_get_buffer(outF.get(), 0);
 		if (ret < 0) {
@@ -595,20 +713,15 @@ static bool transcode_trim_mp4(const std::wstring &inputPath, const std::wstring
 			outError = L"FFmpeg: swr_convert failed";
 			return false;
 		}
+		if (converted == 0)
+			return true;
 		outF->nb_samples = converted;
-		outF->pts = audio_pts[ai];
-		audio_pts[ai] += outF->nb_samples;
 
-		ret = avcodec_send_frame(enc, outF.get());
-		if (ret < 0 && ret != AVERROR(EAGAIN)) {
-			set_err(outError, L"FFmpeg: avcodec_send_frame(audio) failed: ", ret);
+		if (av_audio_fifo_write(audio_fifos[ai].get(), (void **)outF->data, converted) < converted) {
+			outError = L"FFmpeg: av_audio_fifo_write failed";
 			return false;
 		}
-		AVStream *out_st = ofmt->streams[audio_out[ai]];
-		if (!write_encoded(enc, out_st, audio_out[ai]))
-			return false;
-
-		return true;
+		return encode_audio_chunks(ai);
 	};
 
 	AVPacket ipkt = {};
@@ -733,6 +846,10 @@ static bool transcode_trim_mp4(const std::wstring &inputPath, const std::wstring
 		avcodec_send_frame(venc.get(), nullptr);
 		AVStream *out_st = ofmt->streams[video_out];
 		if (!write_encoded(venc.get(), out_st, video_out))
+			return false;
+	}
+	for (size_t i = 0; i < aenc.size(); i++) {
+		if (!flush_audio_fifo(i))
 			return false;
 	}
 	for (size_t i = 0; i < aenc.size(); i++) {
@@ -1167,6 +1284,7 @@ void OverlayTrimmer::RunExport(const std::wstring &inputPath, const std::wstring
 	if (outputPath.empty()) {
 		m_lastError = L"Output path is empty";
 		m_status.store(Status::Error);
+		obs_log(LOG_ERROR, "Gallery export failed: output path is empty");
 		return;
 	}
 
@@ -1179,6 +1297,7 @@ void OverlayTrimmer::RunExport(const std::wstring &inputPath, const std::wstring
 		// In-process mode cannot spawn external ffmpeg with custom args.
 		m_lastError = L"Custom ffmpeg args are not supported (in-process mode)";
 		m_status.store(Status::Error);
+		obs_log(LOG_ERROR, "Gallery export failed: custom ffmpeg args are not supported");
 		return;
 	}
 
@@ -1197,6 +1316,14 @@ void OverlayTrimmer::RunExport(const std::wstring &inputPath, const std::wstring
 	} else {
 		m_lastError = err.empty() ? L"Export failed" : err;
 		m_status.store(Status::Error);
+		if (err == L"Cancelled") {
+			obs_log(LOG_INFO, "Gallery export cancelled (input: %s)", WideToUtf8(inputPath).c_str());
+		} else {
+			obs_log(LOG_ERROR,
+				"Gallery export failed: %s (input: %s, output: %s, range: %.3f-%.3f s, compress: %s, crf: %d)",
+				WideToUtf8(m_lastError).c_str(), WideToUtf8(inputPath).c_str(),
+				WideToUtf8(outputPath).c_str(), startSeconds, endSeconds, compress ? "yes" : "no", crf);
+		}
 	}
 }
 

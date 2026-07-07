@@ -27,7 +27,7 @@
 extern "C" {
 #include <plugin-support.h>
 #include "overlay-settings-storage.h"
-void open_settings_dialog_from_overlay(void);
+#include "overlay-runtime-apply.h"
 }
 
 OverlayRenderer *OverlayRenderer::s_timerInstance = nullptr;
@@ -173,6 +173,32 @@ OverlayRenderer::OverlayRenderer()
 	for (int i = 0; i < ICON_CACHE_SIZE; i++) {
 		m_iconBitmaps[i] = nullptr;
 		m_iconMasks[i] = IconMask{};
+	}
+
+	m_settingsOpen = false;
+	m_settingsContentWidth = 0;
+	m_settingsContentHeight = 0;
+	m_settingsScrollOffset = 0;
+	m_settingsContentTotalHeight = 0;
+	m_settingsViewportTop = 0;
+	m_settingsViewportBottom = 0;
+	m_settingsCapturingHotkeyIndex = -1;
+	m_settingsHoverIndex = -1;
+	m_setPosition = 0;
+	m_setMargin = 20;
+	m_setOrientation = 0;
+	m_setOpacityPct = 88;
+	m_setAutoHideEnabled = false;
+	m_setAutoHideSeconds = 5;
+	m_setIndicatorsEnabled = true;
+	m_setIndicatorsPosition = 5;
+	m_setIndicatorsOled = false;
+	m_setSmartReplay = true;
+	m_setGalleryInOverlay = false;
+	m_setCaptureFocus = true;
+	for (int i = 0; i < 7; i++) {
+		m_setHotkeyVk[i] = 0;
+		m_setHotkeyMod[i] = 0;
 	}
 }
 
@@ -623,6 +649,9 @@ void OverlayRenderer::Show()
 	if (m_galleryOpen) {
 		ApplyGalleryWindowSize();
 		SetUpdateInterval(16);
+	} else if (m_settingsOpen) {
+		ApplySettingsWindowSize();
+		SetUpdateInterval(16);
 	} else {
 		ApplyWindowGeometry();
 		SetUpdateInterval(500);
@@ -792,7 +821,9 @@ void OverlayRenderer::Render()
 			static_cast<float>(m_dimContentOffset.x), static_cast<float>(m_dimContentOffset.y)));
 	}
 
-	if (m_galleryOpen) {
+	if (m_settingsOpen) {
+		RenderSettingsPanel();
+	} else if (m_galleryOpen) {
 		RenderGallery();
 	} else {
 		RenderMainOverlay();
@@ -1702,6 +1733,9 @@ void OverlayRenderer::UpdateAutoHide()
 		return;
 	// Gallery playback and export must stay visible while active.
 	if (m_galleryOpen)
+		return;
+	// Keep the overlay visible while the settings panel is open.
+	if (m_settingsOpen)
 		return;
 	// Long exports should not trigger auto-hide mid-job.
 	if (m_trimmer.GetStatus() == OverlayTrimmer::Status::Trimming)
@@ -2771,6 +2805,680 @@ void OverlayRenderer::HandleGalleryKey(int vkCode, int mods)
 	}
 }
 
+// ============================================================================
+// In-overlay settings panel
+// ============================================================================
+
+namespace {
+
+// Storage keys for the 7 gallery hotkeys, in panel display order.
+const char *const kSettingsHotkeyKeys[7] = {
+	"hotkey_play",         "hotkey_seek_forward_5", "hotkey_seek_back_5", "hotkey_frame_forward",
+	"hotkey_frame_back",   "hotkey_go_in",          "hotkey_go_out"};
+const int kSettingsHotkeyDefaultVk[7] = {32, 39, 37, 190, 188, 36, 35};
+const char *const kSettingsHotkeyLabelKeys[7] = {
+	"Hotkeys.PlayPause", "Hotkeys.SeekForward5", "Hotkeys.SeekBack5", "Hotkeys.FrameForward",
+	"Hotkeys.FrameBack", "Hotkeys.GoIn",         "Hotkeys.GoOut"};
+
+const char *const kSettingsPositionKeys[9] = {
+	"Position.Top",        "Position.Bottom",     "Position.Left",
+	"Position.Right",      "Position.TopLeft",    "Position.TopRight",
+	"Position.BottomLeft", "Position.BottomRight", "Position.Center"};
+const char *const kSettingsOrientationKeys[2] = {"Orientation.Horizontal", "Orientation.Vertical"};
+
+// Native folder picker so the panel does not depend on Qt for the export path.
+bool BrowseForExportFolderNative(HWND owner, std::wstring &out)
+{
+	bool didInit = false;
+	HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+	if (SUCCEEDED(hrInit))
+		didInit = true; // balanced with CoUninitialize below
+
+	bool result = false;
+	IFileOpenDialog *dlg = nullptr;
+	HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
+	if (SUCCEEDED(hr) && dlg) {
+		DWORD opts = 0;
+		dlg->GetOptions(&opts);
+		dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+		if (SUCCEEDED(dlg->Show(owner))) {
+			IShellItem *item = nullptr;
+			if (SUCCEEDED(dlg->GetResult(&item)) && item) {
+				PWSTR path = nullptr;
+				if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+					out = path;
+					result = true;
+					CoTaskMemFree(path);
+				}
+				item->Release();
+			}
+		}
+		dlg->Release();
+	}
+
+	if (didInit)
+		CoUninitialize();
+	return result;
+}
+
+} // namespace
+
+std::wstring OverlayRenderer::SettingsHotkeyName(int vk, int mod) const
+{
+	std::wstring s;
+	if (mod & 2)
+		s += L"Ctrl+";
+	if (mod & 4)
+		s += L"Alt+";
+	if (mod & 1)
+		s += L"Shift+";
+
+	static const struct {
+		int vk;
+		const wchar_t *name;
+	} names[] = {{32, L"Space"}, {37, L"Left"}, {39, L"Right"}, {38, L"Up"},  {40, L"Down"},
+		     {36, L"Home"},  {35, L"End"},  {188, L","},    {190, L"."}, {112, L"F1"},
+		     {113, L"F2"},   {114, L"F3"},  {115, L"F4"},   {116, L"F5"}, {117, L"F6"},
+		     {118, L"F7"},   {119, L"F8"},  {120, L"F9"},   {121, L"F10"}, {0, nullptr}};
+	for (int i = 0; names[i].name != nullptr; i++) {
+		if (names[i].vk == vk)
+			return s + names[i].name;
+	}
+	if (vk >= 0x41 && vk <= 0x5A)
+		return s + static_cast<wchar_t>(vk);
+	if (vk >= 0x30 && vk <= 0x39)
+		return s + static_cast<wchar_t>(vk);
+	return s + std::to_wstring(vk);
+}
+
+void OverlayRenderer::LoadSettingsWorkingValues()
+{
+	obs_data_t *d = saved_settings_data;
+	auto getIntDef = [&](const char *k, int def) {
+		return (d && obs_data_has_user_value(d, k)) ? static_cast<int>(obs_data_get_int(d, k)) : def;
+	};
+	auto getBoolDef = [&](const char *k, bool def) {
+		return (d && obs_data_has_user_value(d, k)) ? obs_data_get_bool(d, k) : def;
+	};
+
+	m_setPosition = ClampInt(getIntDef("position", 0), 0, 8);
+	m_setMargin = ClampInt(getIntDef("margin", 20), 0, 200);
+	int orient = getIntDef("orientation", 0);
+	m_setOrientation = (orient == 1) ? 1 : 0;
+	double alpha = (d && obs_data_has_user_value(d, "overlay_background_alpha"))
+			       ? obs_data_get_double(d, "overlay_background_alpha")
+			       : 0.88;
+	m_setOpacityPct = ClampInt(static_cast<int>(alpha * 100.0 + 0.5), 50, 100);
+	m_setAutoHideEnabled = getBoolDef("auto_hide_enabled", false);
+	m_setAutoHideSeconds = ClampInt(getIntDef("auto_hide_seconds", 5), 1, 3600);
+	m_setIndicatorsEnabled = getBoolDef("indicators_enabled", true);
+	m_setIndicatorsPosition = ClampInt(getIntDef("indicators_position", 5), 0, 8);
+	m_setIndicatorsOled = getBoolDef("indicators_oled_protection", false);
+	m_setSmartReplay = getBoolDef("smart_replay", true);
+	m_setGalleryInOverlay = getBoolDef("gallery_in_overlay", false);
+	m_setCaptureFocus = getBoolDef("capture_focus", true);
+	if (d && obs_data_has_user_value(d, "gallery_export_path"))
+		m_setExportPath = overlay::util::Utf8ToWide(obs_data_get_string(d, "gallery_export_path"));
+	else
+		m_setExportPath.clear();
+
+	for (int i = 0; i < 7; i++) {
+		int hkVk, hkMod;
+		getHotkeyVkMod(d, kSettingsHotkeyKeys[i], kSettingsHotkeyDefaultVk[i], 0, hkVk, hkMod);
+		m_setHotkeyVk[i] = hkVk;
+		m_setHotkeyMod[i] = hkMod;
+	}
+}
+
+void OverlayRenderer::PersistSettingsWorkingValues()
+{
+	overlay_settings_ensure();
+	obs_data_t *d = saved_settings_data;
+	if (!d)
+		return;
+	obs_data_set_int(d, "position", m_setPosition);
+	obs_data_set_int(d, "margin", m_setMargin);
+	obs_data_set_int(d, "orientation", m_setOrientation);
+	obs_data_set_double(d, "overlay_background_alpha", m_setOpacityPct / 100.0);
+	obs_data_set_bool(d, "auto_hide_enabled", m_setAutoHideEnabled);
+	obs_data_set_int(d, "auto_hide_seconds", m_setAutoHideSeconds);
+	obs_data_set_bool(d, "indicators_enabled", m_setIndicatorsEnabled);
+	obs_data_set_int(d, "indicators_position", m_setIndicatorsPosition);
+	obs_data_set_bool(d, "indicators_oled_protection", m_setIndicatorsOled);
+	obs_data_set_bool(d, "smart_replay", m_setSmartReplay);
+	obs_data_set_bool(d, "gallery_in_overlay", m_setGalleryInOverlay);
+	obs_data_set_bool(d, "capture_focus", m_setCaptureFocus);
+	obs_data_set_string(d, "gallery_export_path", overlay::util::WideToUtf8(m_setExportPath).c_str());
+	for (int i = 0; i < 7; i++) {
+		obs_data_set_int(d, (std::string(kSettingsHotkeyKeys[i]) + "_vk").c_str(), m_setHotkeyVk[i]);
+		obs_data_set_int(d, (std::string(kSettingsHotkeyKeys[i]) + "_mod").c_str(), m_setHotkeyMod[i]);
+	}
+}
+
+void OverlayRenderer::OpenSettings()
+{
+	if (m_settingsOpen)
+		return;
+	if (m_galleryOpen)
+		CloseGallery();
+
+	m_settingsOpen = true;
+	m_settingsScrollOffset = 0;
+	m_settingsCapturingHotkeyIndex = -1;
+	m_settingsHoverIndex = -1;
+	m_settingsHits.clear();
+	LoadSettingsWorkingValues();
+
+	m_windowManager.SetKeyHandler(
+		[](int vkCode, int mods, void *userData) {
+			OverlayRenderer *r = static_cast<OverlayRenderer *>(userData);
+			if (r)
+				r->HandleSettingsKey(vkCode, mods);
+		},
+		this);
+	m_windowManager.SetWheelHandler(
+		[](int delta, int x, int y, void *userData) {
+			UNUSED_PARAMETER(x);
+			UNUSED_PARAMETER(y);
+			OverlayRenderer *r = static_cast<OverlayRenderer *>(userData);
+			if (r)
+				r->HandleSettingsWheel(delta);
+		},
+		this);
+
+	m_lastInteractionTick = GetTickCount64();
+	if (!IsVisible()) {
+		Show();
+	} else {
+		ApplySettingsWindowSize();
+		SetUpdateInterval(16);
+	}
+	Render();
+}
+
+void OverlayRenderer::CloseSettings()
+{
+	if (!m_settingsOpen)
+		return;
+	m_settingsOpen = false;
+	m_settingsCapturingHotkeyIndex = -1;
+	m_settingsHoverIndex = -1;
+	m_settingsHits.clear();
+	m_windowManager.SetKeyboardCaptureActive(false);
+	m_windowManager.SetKeyHandler(nullptr, nullptr);
+	m_windowManager.SetWheelHandler(nullptr, nullptr);
+
+	// Flush working values to disk and apply overlay-geometry settings (only
+	// visible on the small overlay, so deferred until the panel closes).
+	PersistSettingsWorkingValues();
+	if (!overlay_settings_save())
+		obs_log(LOG_ERROR, "Overlay settings not saved to disk");
+
+	m_position = static_cast<OverlayPosition>(m_setPosition);
+	m_margin = m_setMargin;
+	m_orientation = static_cast<OverlayOrientation>(m_setOrientation);
+	m_overlayBackgroundAlpha = static_cast<float>(m_setOpacityPct) / 100.0f;
+	m_autoHideEnabled = m_setAutoHideEnabled;
+	m_autoHideSeconds = ClampInt(m_setAutoHideSeconds, 1, 3600);
+	m_galleryEnabled = m_setGalleryInOverlay;
+	m_captureFocus = m_setCaptureFocus;
+	m_windowManager.SetAllowActivate(m_setCaptureFocus);
+
+	m_lastInteractionTick = GetTickCount64();
+	SetUpdateInterval(500);
+	ApplyPosition();
+	Render();
+}
+
+void OverlayRenderer::ApplySettingsWindowSize()
+{
+	if (!m_settingsOpen)
+		return;
+	RECT workArea = m_layoutManager.GetScreenWorkArea();
+	int workWidth = workArea.right - workArea.left;
+	int workHeight = workArea.bottom - workArea.top;
+
+	int targetWidth = std::min(640, workWidth - 40);
+	int targetHeight = std::min(780, workHeight - 60);
+	if (targetWidth < 360)
+		targetWidth = std::max(360, workWidth - 20);
+	if (targetHeight < 360)
+		targetHeight = std::max(360, workHeight - 20);
+
+	POINT contentPos = {workArea.left + (workWidth - targetWidth) / 2,
+			    workArea.top + (workHeight - targetHeight) / 2};
+
+	m_settingsContentWidth = targetWidth;
+	m_settingsContentHeight = targetHeight;
+
+	if (IsDimmingActive()) {
+		ApplyDimmingWindowGeometry(contentPos, targetWidth, targetHeight);
+	} else {
+		m_dimContentOffset = {0, 0};
+		m_windowManager.SetPosition(contentPos, targetWidth, targetHeight);
+	}
+}
+
+void OverlayRenderer::RenderSettingsPanel()
+{
+	ID2D1RenderTarget *target = m_bitmapRenderTarget ? m_bitmapRenderTarget : m_renderTarget;
+	if (!target)
+		return;
+
+	int width;
+	int height;
+	if (IsDimmingActive()) {
+		width = m_settingsContentWidth;
+		height = m_settingsContentHeight;
+	} else {
+		HWND hwnd = m_windowManager.GetHWND();
+		if (!hwnd)
+			return;
+		RECT clientRect;
+		GetClientRect(hwnd, &clientRect);
+		width = clientRect.right - clientRect.left;
+		height = clientRect.bottom - clientRect.top;
+	}
+	if (width <= 0 || height <= 0)
+		return;
+
+	m_settingsHits.clear();
+
+	const D2D1_COLOR_F kWhite = D2D1::ColorF(1.0f, 1.0f, 1.0f);
+	const D2D1_COLOR_F kDim = D2D1::ColorF(0.75f, 0.75f, 0.80f);
+	const D2D1_COLOR_F kAccent = D2D1::ColorF(0.66f, 0.51f, 1.0f);
+	const D2D1_COLOR_F kRowBg = D2D1::ColorF(30.0f / 255.0f, 30.0f / 255.0f, 38.0f / 255.0f, 0.9f);
+	const D2D1_COLOR_F kRowHover = D2D1::ColorF(0.48f, 0.42f, 0.65f, 0.30f);
+	const D2D1_COLOR_F kCtrlBg = D2D1::ColorF(0.12f, 0.12f, 0.15f, 1.0f);
+	const D2D1_COLOR_F kBorder = D2D1::ColorF(58.0f / 255.0f, 58.0f / 255.0f, 69.0f / 255.0f, 1.0f);
+
+	const int pad = 3;
+	RECT shell = {pad, pad, width - pad, height - pad};
+	DrawRoundedRectangle(shell, 14.0f, D2D1::ColorF(20.0f / 255.0f, 20.0f / 255.0f, 25.0f / 255.0f, 0.98f));
+	DrawRoundedRectangleBorder(shell, 14.0f, 1.0f, kBorder);
+
+	const int insetH = 18;
+	const int headerTop = shell.top + 12;
+	const int headerH = 34;
+	RECT headerRect = {shell.left + insetH, headerTop, shell.right - insetH, headerTop + headerH};
+	RenderText(overlay::util::ModuleTextW("OverlaySettings"),
+		   {headerRect.left, headerRect.top, headerRect.right - 40, headerRect.bottom}, 15.0f,
+		   DWRITE_FONT_WEIGHT_BOLD, kWhite, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+	const int closeSize = 30;
+	RECT closeRect = {headerRect.right - closeSize, headerRect.top + (headerH - closeSize) / 2,
+			  headerRect.right, headerRect.top + (headerH - closeSize) / 2 + closeSize};
+	{
+		int idx = static_cast<int>(m_settingsHits.size());
+		bool hover = (idx == m_settingsHoverIndex);
+		if (hover)
+			DrawRoundedRectangle(closeRect, 8.0f, kRowHover);
+		D2D1_COLOR_F tint = hover ? kAccent : kDim;
+		DrawGalleryIcon(closeRect, 7, &tint); // icon 7 = back/close
+		m_settingsHits.push_back({closeRect, SettingsAction::Close, 0});
+	}
+
+	const int viewTop = headerRect.bottom + 10;
+	const int viewBottom = shell.bottom - 12;
+	m_settingsViewportTop = viewTop;
+	m_settingsViewportBottom = viewBottom;
+	const int viewportHeight = viewBottom - viewTop;
+
+	const int contentLeft = shell.left + insetH;
+	const int contentRight = shell.right - insetH - 10;
+	const int labelWidth = (contentRight - contentLeft) / 2;
+	const int rowGap = 8;
+
+	target->PushAxisAlignedClip(
+		D2D1::RectF(static_cast<float>(shell.left), static_cast<float>(viewTop),
+			    static_cast<float>(shell.right), static_cast<float>(viewBottom)),
+		D2D1_ANTIALIAS_MODE_ALIASED);
+
+	int y = viewTop - m_settingsScrollOffset;
+
+	auto sectionHeader = [&](const std::wstring &title) {
+		const int h = 28;
+		RECT r = {contentLeft + 4, y, contentRight, y + h};
+		RenderText(title, r, 12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, kAccent, DWRITE_TEXT_ALIGNMENT_LEADING);
+		y += h + rowGap;
+	};
+
+	auto checkboxRow = [&](const std::wstring &label, bool value, SettingsField field) {
+		const int h = 40;
+		RECT r = {contentLeft, y, contentRight, y + h};
+		int idx = static_cast<int>(m_settingsHits.size());
+		bool hover = (idx == m_settingsHoverIndex);
+		DrawRoundedRectangle(r, 8.0f, hover ? kRowHover : kRowBg);
+		RECT lr = {r.left + 12, r.top, r.right - 60, r.bottom};
+		RenderText(label, lr, 12.0f, DWRITE_FONT_WEIGHT_NORMAL, kWhite, DWRITE_TEXT_ALIGNMENT_LEADING);
+		const int box = 22;
+		RECT br = {r.right - 12 - box, r.top + (h - box) / 2, r.right - 12, r.top + (h - box) / 2 + box};
+		DrawRoundedRectangle(br, 5.0f, value ? kAccent : kCtrlBg);
+		DrawRoundedRectangleBorder(br, 5.0f, 1.0f, kBorder);
+		if (value) {
+			RECT ck = {br.left + 5, br.top + 5, br.right - 5, br.bottom - 5};
+			DrawRoundedRectangle(ck, 3.0f, kWhite);
+		}
+		m_settingsHits.push_back({r, SettingsAction::ToggleBool, static_cast<int>(field)});
+		y += h + rowGap;
+	};
+
+	auto stepperRow = [&](const std::wstring &label, const std::wstring &value, SettingsField field) {
+		const int h = 40;
+		RECT r = {contentLeft, y, contentRight, y + h};
+		DrawRoundedRectangle(r, 8.0f, kRowBg);
+		RECT lr = {r.left + 12, r.top, r.left + labelWidth, r.bottom};
+		RenderText(label, lr, 12.0f, DWRITE_FONT_WEIGHT_NORMAL, kWhite, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+		const int btn = 28;
+		const int cy = r.top + (h - btn) / 2;
+		RECT rightBtn = {r.right - 12 - btn, cy, r.right - 12, cy + btn};
+		const int valW = 96;
+		RECT valRect = {rightBtn.left - 4 - valW, r.top, rightBtn.left - 4, r.bottom};
+		RECT leftBtn = {valRect.left - 4 - btn, cy, valRect.left - 4, cy + btn};
+
+		int idxL = static_cast<int>(m_settingsHits.size());
+		bool hovL = (idxL == m_settingsHoverIndex);
+		DrawRoundedRectangle(leftBtn, 6.0f, hovL ? kRowHover : kCtrlBg);
+		RenderText(L"\u25C0", leftBtn, 12.0f, DWRITE_FONT_WEIGHT_NORMAL, kAccent, DWRITE_TEXT_ALIGNMENT_CENTER);
+		m_settingsHits.push_back({leftBtn, SettingsAction::StepDown, static_cast<int>(field)});
+
+		RenderText(value, valRect, 12.0f, DWRITE_FONT_WEIGHT_NORMAL, kWhite, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+		int idxR = static_cast<int>(m_settingsHits.size());
+		bool hovR = (idxR == m_settingsHoverIndex);
+		DrawRoundedRectangle(rightBtn, 6.0f, hovR ? kRowHover : kCtrlBg);
+		RenderText(L"\u25B6", rightBtn, 12.0f, DWRITE_FONT_WEIGHT_NORMAL, kAccent, DWRITE_TEXT_ALIGNMENT_CENTER);
+		m_settingsHits.push_back({rightBtn, SettingsAction::StepUp, static_cast<int>(field)});
+
+		y += h + rowGap;
+	};
+
+	auto hotkeyRow = [&](const std::wstring &label, int index) {
+		const int h = 40;
+		RECT r = {contentLeft, y, contentRight, y + h};
+		DrawRoundedRectangle(r, 8.0f, kRowBg);
+		RECT lr = {r.left + 12, r.top, r.left + labelWidth, r.bottom};
+		RenderText(label, lr, 12.0f, DWRITE_FONT_WEIGHT_NORMAL, kWhite, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+		const int btnW = 150;
+		const int btn = 28;
+		const int cy = r.top + (h - btn) / 2;
+		RECT b = {r.right - 12 - btnW, cy, r.right - 12, cy + btn};
+		int idx = static_cast<int>(m_settingsHits.size());
+		bool hover = (idx == m_settingsHoverIndex);
+		bool capturing = (m_settingsCapturingHotkeyIndex == index);
+		DrawRoundedRectangle(b, 6.0f, capturing ? kAccent : (hover ? kRowHover : kCtrlBg));
+		DrawRoundedRectangleBorder(b, 6.0f, 1.0f, kBorder);
+		std::wstring t = capturing ? overlay::util::ModuleTextW("Hotkeys.PressKey")
+					   : SettingsHotkeyName(m_setHotkeyVk[index], m_setHotkeyMod[index]);
+		RenderText(t, b, 11.0f, DWRITE_FONT_WEIGHT_NORMAL, capturing ? kWhite : kDim,
+			   DWRITE_TEXT_ALIGNMENT_CENTER);
+		m_settingsHits.push_back({b, SettingsAction::HotkeyCapture, index});
+
+		y += h + rowGap;
+	};
+
+	auto pathRow = [&]() {
+		const int h = 58;
+		RECT r = {contentLeft, y, contentRight, y + h};
+		DrawRoundedRectangle(r, 8.0f, kRowBg);
+		RECT lr = {r.left + 12, r.top + 6, r.right - 12, r.top + 24};
+		RenderText(overlay::util::ModuleTextW("Gallery.ExportFolder"), lr, 12.0f, DWRITE_FONT_WEIGHT_NORMAL,
+			   kWhite, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+		const int btnW = 110;
+		const int btnH = 26;
+		const int by = r.bottom - 8 - btnH;
+		RECT browse = {r.right - 12 - btnW, by, r.right - 12, by + btnH};
+		RECT pathRect = {r.left + 12, by, browse.left - 8, by + btnH};
+		DrawRoundedRectangle(pathRect, 6.0f, kCtrlBg);
+		RECT pTextRect = {pathRect.left + 8, pathRect.top, pathRect.right - 8, pathRect.bottom};
+		std::wstring p = m_setExportPath.empty() ? overlay::util::ModuleTextW("Gallery.ExportPlaceholder")
+							 : m_setExportPath;
+		RenderText(p, pTextRect, 11.0f, DWRITE_FONT_WEIGHT_NORMAL, m_setExportPath.empty() ? kDim : kWhite,
+			   DWRITE_TEXT_ALIGNMENT_LEADING);
+
+		int idx = static_cast<int>(m_settingsHits.size());
+		bool hover = (idx == m_settingsHoverIndex);
+		DrawRoundedRectangle(browse, 6.0f, hover ? kRowHover : kCtrlBg);
+		DrawRoundedRectangleBorder(browse, 6.0f, 1.0f, kBorder);
+		RenderText(overlay::util::ModuleTextW("Gallery.Browse"), browse, 11.0f, DWRITE_FONT_WEIGHT_NORMAL,
+			   kAccent, DWRITE_TEXT_ALIGNMENT_CENTER);
+		m_settingsHits.push_back({browse, SettingsAction::Browse, 0});
+
+		y += h + rowGap;
+	};
+
+	sectionHeader(overlay::util::ModuleTextW("Tab.General"));
+	stepperRow(overlay::util::ModuleTextW("Position.Label"),
+		   overlay::util::ModuleTextW(kSettingsPositionKeys[m_setPosition]), SettingsField::Position);
+	stepperRow(overlay::util::ModuleTextW("Margin"), std::to_wstring(m_setMargin) + L" px", SettingsField::Margin);
+	stepperRow(overlay::util::ModuleTextW("Layout"),
+		   overlay::util::ModuleTextW(kSettingsOrientationKeys[m_setOrientation]), SettingsField::Orientation);
+	stepperRow(overlay::util::ModuleTextW("OverlayOpacity"), std::to_wstring(m_setOpacityPct) + L"%",
+		   SettingsField::Opacity);
+	checkboxRow(overlay::util::ModuleTextW("AutoHide.Enable"), m_setAutoHideEnabled,
+		    SettingsField::AutoHideEnabled);
+	stepperRow(overlay::util::ModuleTextW("AutoHide.Delay"), std::to_wstring(m_setAutoHideSeconds) + L" s",
+		   SettingsField::AutoHideSeconds);
+	checkboxRow(overlay::util::ModuleTextW("Gallery.InOverlay"), m_setGalleryInOverlay,
+		    SettingsField::GalleryInOverlay);
+	pathRow();
+	checkboxRow(overlay::util::ModuleTextW("CaptureFocus"), m_setCaptureFocus, SettingsField::CaptureFocus);
+
+	sectionHeader(overlay::util::ModuleTextW("Indicators"));
+	checkboxRow(overlay::util::ModuleTextW("Indicators.Show"), m_setIndicatorsEnabled,
+		    SettingsField::IndicatorsEnabled);
+	stepperRow(overlay::util::ModuleTextW("Position.Label"),
+		   overlay::util::ModuleTextW(kSettingsPositionKeys[m_setIndicatorsPosition]),
+		   SettingsField::IndicatorsPosition);
+	checkboxRow(overlay::util::ModuleTextW("Indicators.OledProtection"), m_setIndicatorsOled,
+		    SettingsField::IndicatorsOled);
+
+	sectionHeader(overlay::util::ModuleTextW("Replay"));
+	checkboxRow(overlay::util::ModuleTextW("SmartReplay"), m_setSmartReplay, SettingsField::SmartReplay);
+
+	sectionHeader(overlay::util::ModuleTextW("Tab.Hotkeys"));
+	for (int i = 0; i < 7; i++) {
+		hotkeyRow(overlay::util::ModuleTextW(kSettingsHotkeyLabelKeys[i]), i);
+	}
+
+	m_settingsContentTotalHeight = (y + m_settingsScrollOffset) - viewTop;
+
+	target->PopAxisAlignedClip();
+
+	// Scrollbar (only when content overflows the viewport).
+	if (m_settingsContentTotalHeight > viewportHeight) {
+		RECT trackRect = {shell.right - 10, viewTop, shell.right - 4, viewBottom};
+		DrawRoundedRectangle(trackRect, 3.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.06f));
+		float ratio = static_cast<float>(viewportHeight) / static_cast<float>(m_settingsContentTotalHeight);
+		int thumbH = std::max(30, static_cast<int>(viewportHeight * ratio));
+		int maxScroll = m_settingsContentTotalHeight - viewportHeight;
+		float scrollRatio = maxScroll > 0 ? static_cast<float>(m_settingsScrollOffset) / maxScroll : 0.0f;
+		int thumbTop = viewTop + static_cast<int>((viewportHeight - thumbH) * scrollRatio);
+		RECT thumbRect = {trackRect.left, thumbTop, trackRect.right, thumbTop + thumbH};
+		DrawRoundedRectangle(thumbRect, 3.0f, D2D1::ColorF(0.66f, 0.51f, 1.0f, 0.55f));
+	}
+}
+
+int OverlayRenderer::SettingsHoverIndexAt(const POINT &pt) const
+{
+	for (size_t i = 0; i < m_settingsHits.size(); i++) {
+		const SettingsHit &h = m_settingsHits[i];
+		if (!IsPointInRect(pt, h.rect))
+			continue;
+		if (h.action != SettingsAction::Close) {
+			if (h.rect.bottom <= m_settingsViewportTop || h.rect.top >= m_settingsViewportBottom)
+				continue;
+		}
+		return static_cast<int>(i);
+	}
+	return -1;
+}
+
+void OverlayRenderer::HandleSettingsClick(int x, int y)
+{
+	POINT pt = ClientToLayoutPoint(x, y);
+	int idx = SettingsHoverIndexAt(pt);
+	if (idx < 0)
+		return;
+	const SettingsHit hit = m_settingsHits[static_cast<size_t>(idx)];
+
+	// Clicking anything other than another hotkey button cancels an active capture.
+	if (m_settingsCapturingHotkeyIndex >= 0 && hit.action != SettingsAction::HotkeyCapture) {
+		m_settingsCapturingHotkeyIndex = -1;
+		m_windowManager.SetKeyboardCaptureActive(false);
+	}
+
+	switch (hit.action) {
+	case SettingsAction::Close:
+		CloseSettings();
+		return;
+	case SettingsAction::Browse: {
+		std::wstring picked;
+		if (BrowseForExportFolderNative(m_windowManager.GetHWND(), picked)) {
+			m_setExportPath = picked;
+			PersistSettingsWorkingValues();
+		}
+		Render();
+		return;
+	}
+	case SettingsAction::HotkeyCapture:
+		m_settingsCapturingHotkeyIndex = hit.field;
+		// Grab the keyboard even when focus capture is off, so the bind can be
+		// recorded without the overlay holding window focus.
+		m_windowManager.SetKeyboardCaptureActive(true);
+		Render();
+		return;
+	case SettingsAction::ToggleBool: {
+		switch (static_cast<SettingsField>(hit.field)) {
+		case SettingsField::AutoHideEnabled:
+			m_setAutoHideEnabled = !m_setAutoHideEnabled;
+			break;
+		case SettingsField::IndicatorsEnabled:
+			m_setIndicatorsEnabled = !m_setIndicatorsEnabled;
+#ifdef ENABLE_QT
+			overlay_runtime_set_indicators(m_setIndicatorsEnabled, m_setIndicatorsPosition,
+						       m_setIndicatorsOled);
+#endif
+			break;
+		case SettingsField::IndicatorsOled:
+			m_setIndicatorsOled = !m_setIndicatorsOled;
+#ifdef ENABLE_QT
+			overlay_runtime_set_indicators(m_setIndicatorsEnabled, m_setIndicatorsPosition,
+						       m_setIndicatorsOled);
+#endif
+			break;
+		case SettingsField::SmartReplay:
+			m_setSmartReplay = !m_setSmartReplay;
+#ifdef ENABLE_QT
+			overlay_runtime_set_smart_replay(m_setSmartReplay);
+#endif
+			break;
+		case SettingsField::GalleryInOverlay:
+			m_setGalleryInOverlay = !m_setGalleryInOverlay;
+			break;
+		case SettingsField::CaptureFocus:
+			m_setCaptureFocus = !m_setCaptureFocus;
+			m_captureFocus = m_setCaptureFocus;
+			m_windowManager.SetAllowActivate(m_setCaptureFocus);
+			ApplySettingsWindowSize();
+			break;
+		default:
+			break;
+		}
+		PersistSettingsWorkingValues();
+		Render();
+		return;
+	}
+	case SettingsAction::StepDown:
+	case SettingsAction::StepUp: {
+		int dir = (hit.action == SettingsAction::StepUp) ? 1 : -1;
+		switch (static_cast<SettingsField>(hit.field)) {
+		case SettingsField::Position:
+			m_setPosition = (m_setPosition + dir + 9) % 9;
+			break;
+		case SettingsField::Margin:
+			m_setMargin = ClampInt(m_setMargin + dir * 5, 0, 200);
+			break;
+		case SettingsField::Orientation:
+			m_setOrientation = (m_setOrientation + dir + 2) % 2;
+			break;
+		case SettingsField::Opacity:
+			m_setOpacityPct = ClampInt(m_setOpacityPct + dir * 2, 50, 100);
+			break;
+		case SettingsField::AutoHideSeconds:
+			m_setAutoHideSeconds = ClampInt(m_setAutoHideSeconds + dir, 1, 3600);
+			break;
+		case SettingsField::IndicatorsPosition:
+			m_setIndicatorsPosition = (m_setIndicatorsPosition + dir + 9) % 9;
+#ifdef ENABLE_QT
+			overlay_runtime_set_indicators(m_setIndicatorsEnabled, m_setIndicatorsPosition,
+						       m_setIndicatorsOled);
+#endif
+			break;
+		default:
+			break;
+		}
+		PersistSettingsWorkingValues();
+		Render();
+		return;
+	}
+	}
+}
+
+void OverlayRenderer::HandleSettingsKey(int vkCode, int mods)
+{
+	if (!m_settingsOpen)
+		return;
+
+	if (m_settingsCapturingHotkeyIndex >= 0) {
+		// Ignore standalone modifier keys; wait for a real key.
+		if (vkCode == VK_SHIFT || vkCode == VK_CONTROL || vkCode == VK_MENU || vkCode == VK_LWIN ||
+		    vkCode == VK_RWIN || (vkCode >= VK_LSHIFT && vkCode <= VK_RMENU) || vkCode == VK_CAPITAL)
+			return;
+		if (vkCode == VK_ESCAPE) {
+			m_settingsCapturingHotkeyIndex = -1;
+			m_windowManager.SetKeyboardCaptureActive(false);
+			Render();
+			return;
+		}
+		int index = m_settingsCapturingHotkeyIndex;
+		if (index >= 0 && index < 7) {
+			m_setHotkeyVk[index] = vkCode;
+			m_setHotkeyMod[index] = mods;
+		}
+		m_settingsCapturingHotkeyIndex = -1;
+		m_windowManager.SetKeyboardCaptureActive(false);
+		PersistSettingsWorkingValues();
+		Render();
+		return;
+	}
+
+	if (vkCode == VK_ESCAPE) {
+		CloseSettings();
+		return;
+	}
+}
+
+void OverlayRenderer::HandleSettingsWheel(int delta)
+{
+	if (!m_settingsOpen)
+		return;
+	int viewportHeight = m_settingsViewportBottom - m_settingsViewportTop;
+	int maxScroll = std::max(0, m_settingsContentTotalHeight - viewportHeight);
+	int step = (delta / WHEEL_DELTA) * 48;
+	if (step == 0)
+		step = (delta > 0 ? 48 : -48);
+	m_settingsScrollOffset -= step;
+	if (m_settingsScrollOffset < 0)
+		m_settingsScrollOffset = 0;
+	if (m_settingsScrollOffset > maxScroll)
+		m_settingsScrollOffset = maxScroll;
+	Render();
+}
+
 void OverlayRenderer::HandleGalleryClick(int x, int y)
 {
 	POINT pt = ClientToLayoutPoint(x, y);
@@ -2828,7 +3536,14 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 					std::string recordingPath = m_stateManager.GetRecordingPath();
 					std::wstring sharedFolder = BuildGalleryExportFolder(recordingPath);
 					if (!sharedFolder.empty()) {
-						CreateDirectoryW(sharedFolder.c_str(), NULL);
+						if (!CreateDirectoryW(sharedFolder.c_str(), NULL)) {
+							DWORD mkdirErr = GetLastError();
+							if (mkdirErr != ERROR_ALREADY_EXISTS) {
+								obs_log(LOG_ERROR,
+									"Gallery export: failed to create output folder '%s' (error %lu)",
+									overlay::util::WideToUtf8(sharedFolder).c_str(), mkdirErr);
+							}
+						}
 						std::wstring sharePath =
 							m_galleryShareCompress
 								? BuildSharedOutputPathExt(sharedFolder, item->path, L"_share",
@@ -2841,10 +3556,17 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 								streamIndicesToKeep.push_back(m_exportTrackStreamIndices[i]);
 							}
 						}
-						m_trimmer.StartExport(item->path, sharePath, start, end, m_galleryShareCompress,
-								      m_galleryShareCrf, streamIndicesToKeep,
-								      /*customFfmpegArgs=*/L"",
-								      /*useCpuEncoder=*/true);
+						if (!m_trimmer.StartExport(item->path, sharePath, start, end, m_galleryShareCompress,
+									   m_galleryShareCrf, streamIndicesToKeep,
+									   /*customFfmpegArgs=*/L"",
+									   /*useCpuEncoder=*/true)) {
+							m_sharedFolderToOpenOnSuccess.clear();
+							obs_log(LOG_WARNING,
+								"Gallery export could not start: another export is already in progress");
+						}
+					} else {
+						obs_log(LOG_ERROR,
+							"Gallery export failed: export folder path is empty (configure gallery export path or recording directory)");
 					}
 				}
 				m_galleryExportSubmenuOpen = false;
