@@ -29,169 +29,22 @@ WizardStyle=modern
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [CustomMessages]
-english.InstallModeCaption=Installation Type
-english.InstallModeDescription=Choose where the plugin should be installed.
-english.StandardInstall=Standard OBS installation (recommended)
-english.StandardInstallHint=Installs to the system plugin folder. Works for OBS installed in any location, including the default Program Files path.
-english.PortableInstall=Portable OBS installation
-english.PortableInstallHint=Installs into the selected OBS folder. Choose the folder that contains bin, data, and obs-plugins.
-english.SelectDirPortableHint=Select the root folder of your portable OBS installation (the folder that contains bin\64bit\obs64.exe).
 english.SelectDirStandardHint=Select the plugin folder. The recommended location is used by default.
-english.OBSNotFound=obs64.exe was not found in:%n%n%1\bin\64bit\obs64.exe%n%nSelect the root folder of your OBS installation.
 
 [Files]
-Source: "..\release\Package\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Check: IsStandardInstall
-Source: "..\release\Package\bin\64bit\*"; DestDir: "{app}\obs-plugins\64bit"; Flags: ignoreversion; Check: IsPortableInstall
-Source: "..\release\Package\data\*"; DestDir: "{app}\data\obs-plugins\{#MyPluginId}"; Flags: ignoreversion recursesubdirs createallsubdirs; Check: IsPortableInstall
+Source: "..\release\Package\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{cm:ProgramOnTheWeb,{#MyAppName}}"; Filename: "{#MyAppURL}"
 
 [Code]
-var
-  InstallModePage: TWizardPage;
-  StandardInstallRadio: TRadioButton;
-  PortableInstallRadio: TRadioButton;
-
-function IsPortableInstall: Boolean;
-begin
-  Result := PortableInstallRadio.Checked;
-end;
-
-function IsStandardInstall: Boolean;
-begin
-  Result := StandardInstallRadio.Checked;
-end;
-
-function FindOBSInstallPath: String;
-var
-  Path: String;
-begin
-  Result := '';
-
-  if RegQueryStringValue(HKLM, 'SOFTWARE\OBS Studio', '', Path) then
-    if FileExists(Path + '\bin\64bit\obs64.exe') then
-    begin
-      Result := Path;
-      Exit;
-    end;
-
-  if RegQueryStringValue(HKCU, 'SOFTWARE\OBS Studio', '', Path) then
-    if FileExists(Path + '\bin\64bit\obs64.exe') then
-    begin
-      Result := Path;
-      Exit;
-    end;
-
-  Path := ExpandConstant('{pf}\obs-studio');
-  if FileExists(Path + '\bin\64bit\obs64.exe') then
-  begin
-    Result := Path;
-    Exit;
-  end;
-
-  Path := ExpandConstant('{pf64}\obs-studio');
-  if FileExists(Path + '\bin\64bit\obs64.exe') then
-  begin
-    Result := Path;
-    Exit;
-  end;
-
-  Path := ExpandConstant('{localappdata}\Programs\obs-studio');
-  if FileExists(Path + '\bin\64bit\obs64.exe') then
-  begin
-    Result := Path;
-    Exit;
-  end;
-end;
-
 function GetDefaultDirName(Param: String): String;
 begin
   Result := ExpandConstant('{commonappdata}\obs-studio\plugins\{#MyPluginId}');
 end;
 
-procedure InitializeWizard;
-var
-  DescriptionLabel: TNewStaticText;
-begin
-  InstallModePage := CreateCustomPage(
-    wpSelectDir,
-    ExpandConstant('{cm:InstallModeCaption}'),
-    ExpandConstant('{cm:InstallModeDescription}')
-  );
-
-  StandardInstallRadio := TRadioButton.Create(InstallModePage);
-  StandardInstallRadio.Parent := InstallModePage.Surface;
-  StandardInstallRadio.Caption := ExpandConstant('{cm:StandardInstall}');
-  StandardInstallRadio.Left := 0;
-  StandardInstallRadio.Top := 0;
-  StandardInstallRadio.Width := InstallModePage.SurfaceWidth;
-  StandardInstallRadio.Checked := True;
-
-  DescriptionLabel := TNewStaticText.Create(InstallModePage);
-  DescriptionLabel.Parent := InstallModePage.Surface;
-  DescriptionLabel.Caption := ExpandConstant('{cm:StandardInstallHint}');
-  DescriptionLabel.Left := 20;
-  DescriptionLabel.Top := StandardInstallRadio.Top + StandardInstallRadio.Height + 4;
-  DescriptionLabel.Width := InstallModePage.SurfaceWidth - 20;
-  DescriptionLabel.AutoSize := True;
-
-  PortableInstallRadio := TRadioButton.Create(InstallModePage);
-  PortableInstallRadio.Parent := InstallModePage.Surface;
-  PortableInstallRadio.Caption := ExpandConstant('{cm:PortableInstall}');
-  PortableInstallRadio.Left := 0;
-  PortableInstallRadio.Top := DescriptionLabel.Top + DescriptionLabel.Height + 12;
-  PortableInstallRadio.Width := InstallModePage.SurfaceWidth;
-
-  DescriptionLabel := TNewStaticText.Create(InstallModePage);
-  DescriptionLabel.Parent := InstallModePage.Surface;
-  DescriptionLabel.Caption := ExpandConstant('{cm:PortableInstallHint}');
-  DescriptionLabel.Left := 20;
-  DescriptionLabel.Top := PortableInstallRadio.Top + PortableInstallRadio.Height + 4;
-  DescriptionLabel.Width := InstallModePage.SurfaceWidth - 20;
-  DescriptionLabel.AutoSize := True;
-end;
-
 procedure CurPageChanged(CurPageID: Integer);
-var
-  OBSPath: String;
 begin
   if CurPageID = wpSelectDir then
-  begin
-    if IsStandardInstall then
-    begin
-      WizardForm.DirEdit.Text := ExpandConstant('{commonappdata}\obs-studio\plugins\{#MyPluginId}');
-      WizardForm.SelectDirLabel.Caption := ExpandConstant('{cm:SelectDirStandardHint}');
-    end
-    else
-    begin
-      OBSPath := FindOBSInstallPath;
-      if OBSPath <> '' then
-        WizardForm.DirEdit.Text := OBSPath
-      else
-        WizardForm.DirEdit.Text := '';
-      WizardForm.SelectDirLabel.Caption := ExpandConstant('{cm:SelectDirPortableHint}');
-    end;
-  end;
-end;
-
-function NextButtonClick(CurPageID: Integer): Boolean;
-var
-  SelectedPath: String;
-begin
-  Result := True;
-
-  if CurPageID = wpSelectDir then
-  begin
-    SelectedPath := WizardForm.DirEdit.Text;
-
-    if IsPortableInstall then
-    begin
-      if not FileExists(SelectedPath + '\bin\64bit\obs64.exe') then
-      begin
-        MsgBox(FmtMessage(ExpandConstant('{cm:OBSNotFound}'), [SelectedPath]), mbError, MB_OK);
-        Result := False;
-      end;
-    end;
-  end;
+    WizardForm.SelectDirLabel.Caption := ExpandConstant('{cm:SelectDirStandardHint}');
 end;
