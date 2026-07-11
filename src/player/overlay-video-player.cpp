@@ -14,6 +14,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/avstring.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/channel_layout.h>
@@ -32,6 +33,7 @@ extern "C" {
 namespace {
 
 using overlay::util::WideToUtf8;
+using overlay::ffmpeg::FramePtsSeconds;
 using overlay::ffmpeg::PtsToSeconds;
 
 } // namespace
@@ -50,6 +52,9 @@ struct LibAvState {
 	AVFormatContext *fmt_ctx = nullptr;
 	AVCodecContext *video_codec_ctx = nullptr;
 	AVCodecContext *audio_codec_ctx = nullptr;
+	AVBufferRef *hw_device_ctx = nullptr;
+	AVPixelFormat hw_pix_fmt = AV_PIX_FMT_NONE;
+	bool video_hw_decode = false;
 	int video_stream_idx = -1;
 	int audio_stream_idx = -1;
 	std::string video_stream_name;
@@ -64,10 +69,114 @@ struct LibAvState {
 	{
 		avcodec_free_context(&video_codec_ctx);
 		avcodec_free_context(&audio_codec_ctx);
+		av_buffer_unref(&hw_device_ctx);
+		video_hw_decode = false;
+		hw_pix_fmt = AV_PIX_FMT_NONE;
 		avformat_close_input(&fmt_ctx);
 		audio_streams.clear();
 	}
 };
+
+namespace {
+
+static AVPixelFormat GetHwFormat(AVCodecContext *ctx, const AVPixelFormat *pix_fmts)
+{
+	auto *av = static_cast<LibAvState *>(ctx->opaque);
+	for (const AVPixelFormat *p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+		if (*p == av->hw_pix_fmt) {
+			return *p;
+		}
+	}
+	return AV_PIX_FMT_NONE;
+}
+
+static bool TransferHwFrameToCpu(const AVFrame *hw_frame, AVFrame *cpu_frame)
+{
+	if (!hw_frame || !cpu_frame) {
+		return false;
+	}
+	if (hw_frame->format != AV_PIX_FMT_CUDA) {
+		return av_frame_ref(cpu_frame, hw_frame) >= 0;
+	}
+	av_frame_unref(cpu_frame);
+	if (av_hwframe_transfer_data(cpu_frame, hw_frame, 0) < 0) {
+		return false;
+	}
+	return true;
+}
+
+static bool OpenSwVideoDecoder(LibAvState *av, AVStream *stream, const std::string &pathUtf8)
+{
+	av->video_hw_decode = false;
+	const AVCodec *codec = avcodec_find_decoder(stream->codecpar->codec_id);
+	if (!codec) {
+		obs_log(LOG_WARNING, "[OverlayVideoPlayer] No decoder for video codec_id=%d (path: %s)",
+			stream->codecpar->codec_id, pathUtf8.c_str());
+		return false;
+	}
+
+	AVCodecContext *ctx = avcodec_alloc_context3(codec);
+	if (!ctx) {
+		return false;
+	}
+	avcodec_parameters_to_context(ctx, stream->codecpar);
+	ctx->thread_count = 0;
+	ctx->thread_type = FF_THREAD_FRAME;
+	if (avcodec_open2(ctx, codec, nullptr) < 0) {
+		obs_log(LOG_WARNING, "[OverlayVideoPlayer] avcodec_open2 failed for video decoder %s",
+			codec->name);
+		avcodec_free_context(&ctx);
+		return false;
+	}
+
+	av->video_codec_ctx = ctx;
+	av->video_time_base = stream->time_base;
+	return true;
+}
+
+static bool OpenHwAv1Decoder(LibAvState *av, AVStream *stream)
+{
+	const AVCodec *codec = avcodec_find_decoder_by_name("av1_cuvid");
+	if (!codec) {
+		return false;
+	}
+
+	av_buffer_unref(&av->hw_device_ctx);
+	if (av_hwdevice_ctx_create(&av->hw_device_ctx, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0) < 0) {
+		return false;
+	}
+
+	AVCodecContext *ctx = avcodec_alloc_context3(codec);
+	if (!ctx) {
+		return false;
+	}
+	avcodec_parameters_to_context(ctx, stream->codecpar);
+	ctx->opaque = av;
+	ctx->hw_device_ctx = av_buffer_ref(av->hw_device_ctx);
+	av->hw_pix_fmt = AV_PIX_FMT_CUDA;
+	ctx->get_format = GetHwFormat;
+	ctx->thread_count = 1;
+
+	if (avcodec_open2(ctx, codec, nullptr) < 0) {
+		avcodec_free_context(&ctx);
+		return false;
+	}
+
+	av->video_codec_ctx = ctx;
+	av->video_time_base = stream->time_base;
+	av->video_hw_decode = true;
+	return true;
+}
+
+static bool OpenVideoDecoder(LibAvState *av, AVStream *stream, const std::string &pathUtf8)
+{
+	if (stream->codecpar->codec_id == AV_CODEC_ID_AV1 && OpenHwAv1Decoder(av, stream)) {
+		return true;
+	}
+	return OpenSwVideoDecoder(av, stream, pathUtf8);
+}
+
+} // namespace
 
 // --- Three-thread playback: packet queue item and state ---
 struct PacketQueueItem {
@@ -299,20 +408,9 @@ static bool OpenAvFormat(LibAvState *av, const std::wstring &path)
 				av->video_stream_name = "Video";
 			}
 		}
-		const AVCodec *codec = avcodec_find_decoder(stream->codecpar->codec_id);
-		if (codec) {
-			AVCodecContext *ctx = avcodec_alloc_context3(codec);
-			if (ctx) {
-				avcodec_parameters_to_context(ctx, stream->codecpar);
-				ctx->thread_count = 0;
-				ctx->thread_type = FF_THREAD_FRAME;
-				if (avcodec_open2(ctx, codec, nullptr) >= 0) {
-					av->video_codec_ctx = ctx;
-					av->video_time_base = stream->time_base;
-				} else {
-					avcodec_free_context(&ctx);
-				}
-			}
+		if (!OpenVideoDecoder(av, stream, pathUtf8)) {
+			obs_log(LOG_WARNING, "[OverlayVideoPlayer] Failed to open video decoder (path: %s)",
+				pathUtf8.c_str());
 		}
 	}
 
@@ -848,8 +946,12 @@ void OverlayVideoPlayer::StartThreeThreadPlayback(double startTime)
 			return;
 
 		AVFrame *frame = av_frame_alloc();
-		if (!frame)
+		AVFrame *cpu_frame = av_frame_alloc();
+		if (!frame || !cpu_frame) {
+			av_frame_free(&frame);
+			av_frame_free(&cpu_frame);
 			return;
+		}
 
 		SwsContext *sws = nullptr;
 		int swsSrcW = 0, swsSrcH = 0, swsDstW = 0, swsDstH = 0;
@@ -860,6 +962,8 @@ void OverlayVideoPlayer::StartThreeThreadPlayback(double startTime)
 		const double displayFps = 60.0;
 		const double minFrameInterval = (m_videoFps > displayFps) ? (1.0 / displayFps) : 0.0;
 		double lastDisplayedElapsed = -1.0;
+		bool acceptNextFrame = true;
+		AVStream *video_stream = av->fmt_ctx->streams[av->video_stream_idx];
 
 		while (!m_videoStop.load() && m_tt) {
 			PacketQueueItem item;
@@ -870,6 +974,7 @@ void OverlayVideoPlayer::StartThreeThreadPlayback(double startTime)
 				avcodec_flush_buffers(video_ctx);
 				startTick = std::chrono::steady_clock::now();
 				lastDisplayedElapsed = -1.0;
+				acceptNextFrame = true;
 				continue;
 			}
 
@@ -878,17 +983,26 @@ void OverlayVideoPlayer::StartThreeThreadPlayback(double startTime)
 				continue;
 
 			while (avcodec_receive_frame(video_ctx, frame) == 0) {
-				double ptsSec = PtsToSeconds(frame->pts, av->video_time_base);
+				AVFrame *display_frame = frame;
+				if (av->video_hw_decode) {
+					if (!TransferHwFrameToCpu(frame, cpu_frame))
+						continue;
+					display_frame = cpu_frame;
+				}
+				double ptsSec = FramePtsSeconds(frame, video_stream);
 				// Keyframe seeks can land early; suppress frames before the target time.
 				double seekTarget = m_playStartTime;
 				const double halfFrame = (m_videoFps > 0.0) ? (0.5 / m_videoFps) : 0.017;
-				if (ptsSec < seekTarget - halfFrame)
+				if (acceptNextFrame) {
+					acceptNextFrame = false;
+				} else if (ptsSec < seekTarget - halfFrame) {
 					continue;
+				}
 
 				m_currentTime.store(ptsSec);
 
-				int srcW = frame->width, srcH = frame->height;
-				AVPixelFormat srcFmt = static_cast<AVPixelFormat>(frame->format);
+				int srcW = display_frame->width, srcH = display_frame->height;
+				AVPixelFormat srcFmt = static_cast<AVPixelFormat>(display_frame->format);
 				if (!sws || swsSrcW != srcW || swsSrcH != srcH || swsSrcFmt != srcFmt ||
 				    swsDstW != m_frameWidth || swsDstH != m_frameHeight) {
 					sws_freeContext(sws);
@@ -906,7 +1020,8 @@ void OverlayVideoPlayer::StartThreeThreadPlayback(double startTime)
 				if (sws) {
 					uint8_t *dst[1] = {buffer.data()};
 					int dstStride[1] = {m_frameWidth * 4};
-					sws_scale(sws, frame->data, frame->linesize, 0, frame->height, dst, dstStride);
+					sws_scale(sws, display_frame->data, display_frame->linesize, 0, display_frame->height,
+						  dst, dstStride);
 					{
 						std::lock_guard<std::mutex> lock(m_frameMutex);
 						m_frameData.swap(buffer);
@@ -955,6 +1070,7 @@ void OverlayVideoPlayer::StartThreeThreadPlayback(double startTime)
 		}
 
 		sws_freeContext(sws);
+		av_frame_free(&cpu_frame);
 		av_frame_free(&frame);
 	});
 
@@ -1057,6 +1173,11 @@ void OverlayVideoPlayer::StartDecodeThread(double startTime, bool singleFrame)
 
 	UpdateOutputSize();
 
+	m_videoStop.store(true);
+	m_audioStop.store(true);
+	if (m_decodeThread.joinable()) {
+		m_decodeThread.join();
+	}
 	m_videoStop.store(false);
 	m_audioStop.store(false);
 	m_decodeThread = std::thread([this, startTime, singleFrame]() {
@@ -1078,9 +1199,11 @@ void OverlayVideoPlayer::StartDecodeThread(double startTime, bool singleFrame)
 
 		AVPacket *pkt = av_packet_alloc();
 		AVFrame *frame = av_frame_alloc();
-		if (!pkt || !frame) {
+		AVFrame *cpu_frame = av_frame_alloc();
+		if (!pkt || !frame || !cpu_frame) {
 			av_packet_free(&pkt);
 			av_frame_free(&frame);
+			av_frame_free(&cpu_frame);
 			return;
 		}
 
@@ -1096,6 +1219,8 @@ void OverlayVideoPlayer::StartDecodeThread(double startTime, bool singleFrame)
 		const double displayFps = 60.0;
 		const double minFrameInterval = (m_videoFps > displayFps) ? (1.0 / displayFps) : 0.0;
 		double lastDisplayedElapsed = -1.0;
+		bool acceptNextFrame = true;
+		AVStream *video_stream = m_av->fmt_ctx->streams[video_idx];
 
 		// Mute is applied in the WASAPI loop, but audio still decodes during playback.
 	bool useAudio = !singleFrame && audio_ctx;
@@ -1115,16 +1240,6 @@ void OverlayVideoPlayer::StartDecodeThread(double startTime, bool singleFrame)
 
 		const size_t chunkSize = m_av->audio_sample_rate * 4 / 50;
 		bool gotFirstFrame = false;
-		unsigned audioChunksPushed = 0;
-		bool audioFirstChunkLogged = false;
-		auto lastAudioLogTick = std::chrono::steady_clock::now();
-
-		if (useAudio) {
-			obs_log(LOG_INFO,
-				"[OverlayVideoPlayer] Audio decode: sampleRate=%d channels=%d chunkSize=%zu bytes (%.2f ms)",
-				m_av->audio_sample_rate, m_av->audio_channels, chunkSize,
-				1000.0 * chunkSize / (m_av->audio_sample_rate * 4));
-		}
 
 		while (!m_videoStop.load() && !m_audioStop.load()) {
 			int ret = av_read_frame(fmt_ctx, pkt);
@@ -1138,6 +1253,7 @@ void OverlayVideoPlayer::StartDecodeThread(double startTime, bool singleFrame)
 					if (audio_ctx)
 						avcodec_flush_buffers(audio_ctx);
 					startTick = std::chrono::steady_clock::now();
+					acceptNextFrame = true;
 				}
 				av_packet_unref(pkt);
 				continue;
@@ -1150,21 +1266,30 @@ void OverlayVideoPlayer::StartDecodeThread(double startTime, bool singleFrame)
 				}
 				ret = avcodec_send_packet(video_ctx, pkt);
 				av_packet_unref(pkt);
+				if (ret != 0 && ret != AVERROR(EAGAIN))
+					continue;
 				if (ret == 0 || ret == AVERROR(EAGAIN)) {
 					while (avcodec_receive_frame(video_ctx, frame) == 0) {
-						double ptsSec = PtsToSeconds(frame->pts, m_av->video_time_base);
+						AVFrame *display_frame = frame;
+						if (m_av->video_hw_decode) {
+							if (!TransferHwFrameToCpu(frame, cpu_frame))
+								continue;
+							display_frame = cpu_frame;
+						}
+						double ptsSec = FramePtsSeconds(frame, video_stream);
 						// Keyframe seeks can land early; suppress frames before the target time.
 						const double halfFrame = (m_videoFps > 0.0) ? (0.5 / m_videoFps)
 											    : 0.017;
-						if (singleFrame && ptsSec < startTime - halfFrame)
+						if (acceptNextFrame) {
+							acceptNextFrame = false;
+						} else if (ptsSec < startTimeSec - halfFrame) {
 							continue;
-						if (!singleFrame && ptsSec < startTimeSec - halfFrame)
-							continue;
+						}
 
 						m_currentTime.store(ptsSec);
 
-						int srcW = frame->width, srcH = frame->height;
-						AVPixelFormat srcFmt = static_cast<AVPixelFormat>(frame->format);
+						int srcW = display_frame->width, srcH = display_frame->height;
+						AVPixelFormat srcFmt = static_cast<AVPixelFormat>(display_frame->format);
 						if (!sws || swsSrcW != srcW || swsSrcH != srcH || swsSrcFmt != srcFmt ||
 						    swsDstW != m_frameWidth || swsDstH != m_frameHeight) {
 							sws_freeContext(sws);
@@ -1183,8 +1308,8 @@ void OverlayVideoPlayer::StartDecodeThread(double startTime, bool singleFrame)
 						if (sws) {
 							uint8_t *dst[1] = {buffer.data()};
 							int dstStride[1] = {m_frameWidth * 4};
-							sws_scale(sws, frame->data, frame->linesize, 0, frame->height,
-								  dst, dstStride);
+							sws_scale(sws, display_frame->data, display_frame->linesize, 0,
+								  display_frame->height, dst, dstStride);
 							{
 								std::lock_guard<std::mutex> lock(m_frameMutex);
 								m_frameData.swap(buffer);
@@ -1258,9 +1383,6 @@ void OverlayVideoPlayer::StartDecodeThread(double startTime, bool singleFrame)
 					if (aframe && avcodec_receive_frame(audio_ctx, aframe) == 0) {
 						double audioPtsSec = PtsToSeconds(aframe->pts, m_av->audio_time_base);
 						if (audioPtsSec < startTimeSec) {
-							obs_log(LOG_DEBUG,
-								"[OverlayVideoPlayer] Audio frame skipped PTS=%.3f < start=%.3f",
-								audioPtsSec, startTimeSec);
 							av_frame_free(&aframe);
 							continue;
 						}
@@ -1287,22 +1409,6 @@ void OverlayVideoPlayer::StartDecodeThread(double startTime, bool singleFrame)
 								m_audioQueue.push(std::move(chunk));
 								m_audioQueueCond.notify_one();
 							}
-							++audioChunksPushed;
-							if (!audioFirstChunkLogged) {
-								audioFirstChunkLogged = true;
-								obs_log(LOG_INFO,
-									"[OverlayVideoPlayer] First audio chunk pushed at PTS=%.3f, chunk#=%u",
-									audioPtsSec, audioChunksPushed);
-							}
-							auto now = std::chrono::steady_clock::now();
-							if (std::chrono::duration<double>(now - lastAudioLogTick)
-								    .count() >= 2.0) {
-								lastAudioLogTick = now;
-								std::lock_guard<std::mutex> lock(m_audioQueueMutex);
-								obs_log(LOG_INFO,
-									"[OverlayVideoPlayer] Audio decode: chunks_pushed=%u queue_size=%zu",
-									audioChunksPushed, m_audioQueue.size());
-							}
 						}
 						av_frame_free(&aframe);
 					}
@@ -1314,7 +1420,6 @@ void OverlayVideoPlayer::StartDecodeThread(double startTime, bool singleFrame)
 
 	cleanup:
 		if (!audioAccum.empty()) {
-			size_t flushBytes = audioAccum.size();
 			std::unique_lock<std::mutex> lock(m_audioQueueMutex);
 			while (m_audioQueue.size() >= 48 && !m_audioStop.load()) {
 				m_audioQueueCond.wait_for(lock, std::chrono::milliseconds(20));
@@ -1323,19 +1428,12 @@ void OverlayVideoPlayer::StartDecodeThread(double startTime, bool singleFrame)
 				m_audioQueue.push(std::move(audioAccum));
 				m_audioQueueCond.notify_one();
 			}
-			lock.unlock();
-			obs_log(LOG_INFO,
-				"[OverlayVideoPlayer] Decode cleanup: flushed %zu bytes, total chunks pushed=%u",
-				flushBytes, audioChunksPushed);
-		}
-		if (useAudio) {
-			obs_log(LOG_INFO, "[OverlayVideoPlayer] Decode thread exit: audio chunks_pushed=%u",
-				audioChunksPushed);
 		}
 		sws_freeContext(sws);
 		swr_free(&swr);
 		StopAudioPlayback();
 		av_packet_free(&pkt);
+		av_frame_free(&cpu_frame);
 		av_frame_free(&frame);
 	});
 }
@@ -1363,11 +1461,6 @@ void OverlayVideoPlayer::StartAudioThread(int sampleRate, int channels)
 		const size_t bytesPerFrame = static_cast<size_t>(channels) * 2;
 		std::vector<uint8_t> pending;
 		size_t pendingOffset = 0;
-		size_t queueSizeAtStart = 0;
-		double bufferMs = 0.0;
-		unsigned underrunCount = 0;
-		unsigned totalFramesWritten = 0;
-		auto lastWasapiLogTick = std::chrono::steady_clock::now();
 
 		hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
 				      (void **)&enumerator);
@@ -1402,16 +1495,9 @@ void OverlayVideoPlayer::StartAudioThread(int sampleRate, int channels)
 			goto wasapi_cleanup;
 
 		{
-			auto prebufStart = std::chrono::steady_clock::now();
 			std::unique_lock<std::mutex> lock(m_audioQueueMutex);
 			m_audioQueueCond.wait_for(lock, std::chrono::milliseconds(500),
 						  [this] { return m_audioQueue.size() >= 8 || m_audioStop.load(); });
-			queueSizeAtStart = m_audioQueue.size();
-			auto prebufMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-										  prebufStart)
-						.count();
-			obs_log(LOG_INFO, "[OverlayVideoPlayer] WASAPI prebuffer: waited %.1f ms, queue_size=%zu",
-				prebufMs, queueSizeAtStart);
 		}
 
 		hr = client->Start();
@@ -1421,9 +1507,6 @@ void OverlayVideoPlayer::StartAudioThread(int sampleRate, int channels)
 		}
 
 		client->GetBufferSize(&bufferFrames);
-		bufferMs = 1000.0 * (double)bufferFrames / (double)sampleRate;
-		obs_log(LOG_INFO, "[OverlayVideoPlayer] WASAPI started: bufferFrames=%u (%.1f ms), sampleRate=%d",
-			(unsigned)bufferFrames, bufferMs, sampleRate);
 
 		while (!m_audioStop.load()) {
 			UINT32 padding = 0;
@@ -1436,10 +1519,8 @@ void OverlayVideoPlayer::StartAudioThread(int sampleRate, int channels)
 
 			while (available > 0 && !m_audioStop.load()) {
 				if (pendingOffset >= pending.size()) {
-					size_t queueSizeBeforeWait = 0;
 					{
 						std::unique_lock<std::mutex> lock(m_audioQueueMutex);
-						queueSizeBeforeWait = m_audioQueue.size();
 						m_audioQueueCond.wait_for(lock, std::chrono::milliseconds(50), [this] {
 							return !m_audioQueue.empty() || m_audioStop.load();
 						});
@@ -1448,13 +1529,8 @@ void OverlayVideoPlayer::StartAudioThread(int sampleRate, int channels)
 						break;
 					{
 						std::lock_guard<std::mutex> lock(m_audioQueueMutex);
-						if (m_audioQueue.empty()) {
-							++underrunCount;
-							obs_log(LOG_WARNING,
-								"[OverlayVideoPlayer] WASAPI underrun #%u (queue empty after wait, had %zu before wait)",
-								underrunCount, queueSizeBeforeWait);
+						if (m_audioQueue.empty())
 							break;
-						}
 						pending = std::move(m_audioQueue.front());
 						m_audioQueue.pop();
 						m_audioQueueCond.notify_one();
@@ -1494,26 +1570,11 @@ void OverlayVideoPlayer::StartAudioThread(int sampleRate, int channels)
 				}
 				render->ReleaseBuffer(framesToWrite, 0);
 
-				totalFramesWritten += framesToWrite;
 				pendingOffset += framesToWrite * bytesPerFrame;
 				available -= framesToWrite;
-
-				auto now = std::chrono::steady_clock::now();
-				if (std::chrono::duration<double>(now - lastWasapiLogTick).count() >= 2.0) {
-					lastWasapiLogTick = now;
-					UINT32 pad = 0;
-					client->GetCurrentPadding(&pad);
-					std::lock_guard<std::mutex> lock(m_audioQueueMutex);
-					obs_log(LOG_INFO,
-						"[OverlayVideoPlayer] WASAPI: padding=%u available=%u queue_size=%zu total_frames_written=%u underruns=%u",
-						(unsigned)pad, (unsigned)(bufferFrames - pad),
-						(unsigned)m_audioQueue.size(), totalFramesWritten, underrunCount);
-				}
 			}
 		}
 
-		obs_log(LOG_INFO, "[OverlayVideoPlayer] WASAPI thread exit: total_frames_written=%u underruns=%u",
-			totalFramesWritten, underrunCount);
 		if (client)
 			client->Stop();
 

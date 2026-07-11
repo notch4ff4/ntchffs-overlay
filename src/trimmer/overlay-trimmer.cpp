@@ -2,6 +2,7 @@
 
 #include "overlay-trimmer.h"
 #include "overlay-ffmpeg-time-utils.h"
+#include "overlay-ffmpeg-video-decode.h"
 #include "overlay-string-utils.h"
 #include <obs-module.h>
 #include <plugin-support.h>
@@ -22,6 +23,7 @@ extern "C" {
 #include <libavutil/avstring.h>
 #include <libavutil/audio_fifo.h>
 #include <libavutil/samplefmt.h>
+#include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 }
@@ -32,6 +34,10 @@ using overlay::util::Utf8ToWide;
 using overlay::util::WideToUtf8;
 using overlay::ffmpeg::PtsToSeconds;
 using overlay::ffmpeg::SecondsToTimestamp;
+using overlay::ffmpeg::OpenVideoDecoder;
+using overlay::ffmpeg::ReleaseVideoHwDecodeState;
+using overlay::ffmpeg::TransferHwFrameToCpu;
+using overlay::ffmpeg::VideoHwDecodeState;
 
 struct InterruptCtx {
 	std::atomic<bool> *cancel = nullptr;
@@ -232,25 +238,28 @@ static bool transcode_trim_mp4(const std::wstring &inputPath, const std::wstring
 
 	// --- Decoders ---
 	std::unique_ptr<AVCodecContext, CodecCtxDeleter> vdec;
+	VideoHwDecodeState vdec_hw;
+	struct VideoHwReleaseGuard {
+		VideoHwDecodeState *hw = nullptr;
+		~VideoHwReleaseGuard()
+		{
+			if (hw) {
+				ReleaseVideoHwDecodeState(hw);
+			}
+		}
+	} vdec_hw_guard{&vdec_hw};
 	std::vector<std::unique_ptr<AVCodecContext, CodecCtxDeleter>> adec;
 
 	if (video_in >= 0) {
 		AVStream *st = ifmt->streams[video_in];
-		const AVCodec *dec = avcodec_find_decoder(st->codecpar->codec_id);
-		if (!dec) {
-			outError = L"FFmpeg: video decoder not found";
-			return false;
-		}
-		AVCodecContext *ctx = avcodec_alloc_context3(dec);
-		if (!ctx) {
-			outError = L"FFmpeg: avcodec_alloc_context3(video) failed";
-			return false;
-		}
-		avcodec_parameters_to_context(ctx, st->codecpar);
-		ret = avcodec_open2(ctx, dec, nullptr);
-		if (ret < 0) {
-			set_err(outError, L"FFmpeg: avcodec_open2(video) failed: ", ret);
-			avcodec_free_context(&ctx);
+		AVCodecContext *ctx = nullptr;
+		const bool is_av1 = st->codecpar->codec_id == AV_CODEC_ID_AV1;
+		if (!OpenVideoDecoder(&ctx, st, &vdec_hw, /*allow_av1_sw_fallback=*/!is_av1)) {
+			if (is_av1) {
+				outError = L"FFmpeg: AV1 export requires NVIDIA GPU decoder (av1_cuvid)";
+			} else {
+				outError = L"FFmpeg: video decoder not found";
+			}
 			return false;
 		}
 		vdec.reset(ctx);
@@ -305,8 +314,8 @@ static bool transcode_trim_mp4(const std::wstring &inputPath, const std::wstring
 			outError = L"FFmpeg: avcodec_alloc_context3(video enc) failed";
 			return false;
 		}
-		ctx->width = vdec->width;
-		ctx->height = vdec->height;
+		ctx->width = vdec->width > 0 ? vdec->width : static_cast<int>(in_st->codecpar->width);
+		ctx->height = vdec->height > 0 ? vdec->height : static_cast<int>(in_st->codecpar->height);
 		ctx->time_base = pick_fps_timebase(in_st);
 		ctx->framerate = av_inv_q(ctx->time_base);
 		ctx->gop_size = 60;
@@ -344,17 +353,6 @@ static bool transcode_trim_mp4(const std::wstring &inputPath, const std::wstring
 			return false;
 		}
 		out_st->time_base = venc->time_base;
-
-		if (vdec->pix_fmt != venc->pix_fmt) {
-			SwsContext *raw = sws_getContext(vdec->width, vdec->height, vdec->pix_fmt, venc->width,
-							 venc->height, venc->pix_fmt, SWS_BILINEAR, nullptr, nullptr,
-							 nullptr);
-			if (!raw) {
-				outError = L"FFmpeg: sws_getContext failed";
-				return false;
-			}
-			sws.reset(raw);
-		}
 	}
 
 	const AVCodec *aenc_codec = find_audio_encoder();
@@ -534,7 +532,18 @@ static bool transcode_trim_mp4(const std::wstring &inputPath, const std::wstring
 
 		AVFrame *vf = inFrame;
 		std::unique_ptr<AVFrame, FrameDeleter> conv;
-		if (sws) {
+		const AVPixelFormat srcFmt = static_cast<AVPixelFormat>(inFrame->format);
+		if (srcFmt != venc->pix_fmt) {
+			if (!sws) {
+				SwsContext *raw = sws_getContext(inFrame->width, inFrame->height, srcFmt, venc->width,
+								 venc->height, venc->pix_fmt, SWS_BILINEAR, nullptr,
+								 nullptr, nullptr);
+				if (!raw) {
+					outError = L"FFmpeg: sws_getContext failed";
+					return false;
+				}
+				sws.reset(raw);
+			}
 			conv.reset(av_frame_alloc());
 			if (!conv) {
 				outError = L"FFmpeg: av_frame_alloc failed";
@@ -724,6 +733,21 @@ static bool transcode_trim_mp4(const std::wstring &inputPath, const std::wstring
 		return encode_audio_chunks(ai);
 	};
 
+	auto process_video_frame = [&](AVFrame *frame) -> bool {
+		if (vdec_hw.active) {
+			std::unique_ptr<AVFrame, FrameDeleter> cpu(av_frame_alloc());
+			if (!cpu) {
+				outError = L"FFmpeg: av_frame_alloc failed";
+				return false;
+			}
+			if (!TransferHwFrameToCpu(frame, cpu.get())) {
+				return true;
+			}
+			return handle_video_frame(cpu.get());
+		}
+		return handle_video_frame(frame);
+	};
+
 	AVPacket ipkt = {};
 	while (true) {
 		if (cancelRequested.load()) {
@@ -759,7 +783,7 @@ static bool transcode_trim_mp4(const std::wstring &inputPath, const std::wstring
 					set_err(outError, L"FFmpeg: avcodec_receive_frame(video) failed: ", ret);
 					return false;
 				}
-				if (!handle_video_frame(f.get()))
+				if (!process_video_frame(f.get()))
 					return false;
 			}
 			continue;
@@ -816,7 +840,7 @@ static bool transcode_trim_mp4(const std::wstring &inputPath, const std::wstring
 				set_err(outError, L"FFmpeg: avcodec_receive_frame(video) failed: ", ret);
 				return false;
 			}
-			if (!handle_video_frame(f.get()))
+			if (!process_video_frame(f.get()))
 				return false;
 		}
 	}
