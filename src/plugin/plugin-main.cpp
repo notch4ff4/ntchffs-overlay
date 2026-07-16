@@ -32,7 +32,6 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "overlay-runtime-apply.h"
 #include "overlay-smart-replay.h"
 #include "overlay-state.h"
-#include "overlay-ui-task.h"
 #include <QAction>
 #include <QInputDialog>
 #include <QMainWindow>
@@ -128,7 +127,7 @@ static void save_replay_callback(void *data, obs_hotkey_id id,
 	if (!pressed)
 		return;
 
-	overlay_run_on_ui_thread(save_replay_hotkey_ui_task, nullptr);
+	obs_queue_task(OBS_TASK_UI, save_replay_hotkey_ui_task, nullptr, false);
 }
 
 // --- Hotkey registration ---

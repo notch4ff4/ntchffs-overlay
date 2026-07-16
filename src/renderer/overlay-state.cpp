@@ -2,7 +2,6 @@
 
 #include "overlay-state.h"
 #include "overlay-smart-replay.h"
-#include "overlay-ui-task.h"
 #include <obs-frontend-api.h>
 #include <obs-module.h>
 #include <obs-data.h>
@@ -163,15 +162,15 @@ static void save_replay_ui_task(void *param)
 }
 
 void OverlayStateManager::ToggleRecording() {
-	overlay_run_on_ui_thread(toggle_recording_ui_task, nullptr);
+	obs_queue_task(OBS_TASK_UI, toggle_recording_ui_task, nullptr, false);
 }
 
 void OverlayStateManager::ToggleReplayBuffer() {
-	overlay_run_on_ui_thread(toggle_replay_buffer_ui_task, nullptr);
+	obs_queue_task(OBS_TASK_UI, toggle_replay_buffer_ui_task, nullptr, false);
 }
 
 void OverlayStateManager::SaveReplay() {
-	overlay_run_on_ui_thread(save_replay_ui_task, nullptr);
+	obs_queue_task(OBS_TASK_UI, save_replay_ui_task, nullptr, false);
 }
 
 std::string OverlayStateManager::GetConfiguredRecordingPath() {

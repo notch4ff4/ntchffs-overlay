@@ -65,8 +65,6 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
   src/plugin/overlay-smart-replay.cpp
   src/plugin/overlay-smart-replay.h
   src/plugin/plugin-support.h
-  src/common/overlay-ui-task.cpp
-  src/common/overlay-ui-task.h
   "${CMAKE_CURRENT_BINARY_DIR}/plugin-support.c"
 )
 
@@ -81,6 +79,8 @@ if(WIN32)
     src/common/overlay-string-utils.cpp
     src/common/overlay-string-utils.h
     src/common/overlay-ffmpeg-time-utils.h
+    src/common/overlay-mp4-box-reader.cpp
+    src/common/overlay-mp4-box-reader.h
     src/player/overlay-video-player.cpp
     src/player/overlay-video-player.h
     src/trimmer/overlay-trimmer.cpp

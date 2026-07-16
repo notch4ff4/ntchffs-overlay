@@ -2,6 +2,7 @@
 
 #include "overlay-video-player.h"
 #include "overlay-ffmpeg-time-utils.h"
+#include "overlay-mp4-box-reader.h"
 #include "overlay-string-utils.h"
 #include <obs-module.h>
 #include <plugin-support.h>
@@ -455,6 +456,19 @@ static bool OpenAvFormat(LibAvState *av, const std::wstring &path)
 									    : 0;
 		av->audio_streams.push_back(info);
 	}
+
+	// Prefer OBS trak/udta/name atoms (not exposed by FFmpeg mov demuxer).
+	{
+		const auto boxNames = overlay::mp4::ReadMp4AudioTrackNames(path);
+		if (boxNames.size() == av->audio_streams.size()) {
+			for (size_t i = 0; i < boxNames.size(); i++) {
+				if (boxNames[i].has_value() && !boxNames[i]->empty()) {
+					av->audio_streams[i].name = *boxNames[i];
+				}
+			}
+		}
+	}
+
 	av->current_audio_index = 0;
 	if (!av->audio_streams.empty()) {
 		av->audio_stream_idx = av->audio_streams[0].stream_index;
