@@ -74,4 +74,16 @@ private:
 	std::thread m_worker;
 };
 
+// Lossless stream-copy trim used by smart replay overlap removal.
+bool overlay_replay_lossless_trim(const std::wstring &inputPath, const std::wstring &outputPath,
+				  double startSeconds, std::wstring &outError);
+// Reads playback range in seconds for overlap trim calculations.
+bool overlay_replay_probe_playback_range(const std::wstring &inputPath, double &outStartSeconds,
+					 double &outEndSeconds, std::wstring &outError,
+					 int *outRefStreamIndex = nullptr, int *outVideoPacketCount = nullptr,
+					 double *outContainerDurationSeconds = nullptr);
+// Keeps the last keepSeconds of media via stream-copy trim.
+bool overlay_replay_lossless_trim_keep_last(const std::wstring &inputPath, const std::wstring &outputPath,
+					    double keepSeconds, std::wstring &outError);
+
 #endif // _WIN32

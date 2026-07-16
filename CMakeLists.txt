@@ -62,7 +62,11 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
   src/plugin/plugin-main.cpp
   src/plugin/overlay-settings-storage.cpp
   src/plugin/overlay-settings-storage.h
+  src/plugin/overlay-smart-replay.cpp
+  src/plugin/overlay-smart-replay.h
   src/plugin/plugin-support.h
+  src/common/overlay-ui-task.cpp
+  src/common/overlay-ui-task.h
   "${CMAKE_CURRENT_BINARY_DIR}/plugin-support.c"
 )
 

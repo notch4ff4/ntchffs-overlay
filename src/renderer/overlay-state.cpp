@@ -1,6 +1,8 @@
 #ifdef _WIN32
 
 #include "overlay-state.h"
+#include "overlay-smart-replay.h"
+#include "overlay-ui-task.h"
 #include <obs-frontend-api.h>
 #include <obs-module.h>
 #include <obs-data.h>
@@ -110,9 +112,12 @@ void OverlayStateManager::UpdateStatus(OverlayState &state) {
 	UpdateStats(state);
 }
 
-void OverlayStateManager::ToggleRecording() {
+static void toggle_recording_ui_task(void *param)
+{
+	UNUSED_PARAMETER(param);
+
 	try {
-		bool recording_active = obs_frontend_recording_active();
+		const bool recording_active = obs_frontend_recording_active();
 		if (recording_active) {
 			obs_frontend_recording_stop();
 		} else {
@@ -123,9 +128,12 @@ void OverlayStateManager::ToggleRecording() {
 	}
 }
 
-void OverlayStateManager::ToggleReplayBuffer() {
+static void toggle_replay_buffer_ui_task(void *param)
+{
+	UNUSED_PARAMETER(param);
+
 	try {
-		bool replay_active = obs_frontend_replay_buffer_active();
+		const bool replay_active = obs_frontend_replay_buffer_active();
 		if (replay_active) {
 			obs_frontend_replay_buffer_stop();
 		} else {
@@ -136,15 +144,34 @@ void OverlayStateManager::ToggleReplayBuffer() {
 	}
 }
 
-void OverlayStateManager::SaveReplay() {
+static void save_replay_ui_task(void *param)
+{
+	UNUSED_PARAMETER(param);
+
 	try {
-		if (obs_frontend_replay_buffer_active()) {
-			obs_frontend_replay_buffer_save();
-			SetReplaySaving(true);
+		if (!obs_frontend_replay_buffer_active()) {
+			return;
 		}
+
+		if (!overlay_smart_replay_request_save()) {
+			obs_frontend_replay_buffer_save();
+		}
+		OverlayStateManager::SetReplaySaving(true);
 	} catch (...) {
 		obs_log(LOG_ERROR, "Failed to save replay buffer");
 	}
+}
+
+void OverlayStateManager::ToggleRecording() {
+	overlay_run_on_ui_thread(toggle_recording_ui_task, nullptr);
+}
+
+void OverlayStateManager::ToggleReplayBuffer() {
+	overlay_run_on_ui_thread(toggle_replay_buffer_ui_task, nullptr);
+}
+
+void OverlayStateManager::SaveReplay() {
+	overlay_run_on_ui_thread(save_replay_ui_task, nullptr);
 }
 
 std::string OverlayStateManager::GetConfiguredRecordingPath() {

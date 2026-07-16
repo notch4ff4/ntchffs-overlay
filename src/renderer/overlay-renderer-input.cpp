@@ -1,13 +1,9 @@
 #ifdef _WIN32
 
 #include "overlay-renderer.h"
-#include <obs-frontend-api.h>
+#include "overlay-ui-task.h"
 #include <obs-module.h>
 #include <plugin-support.h>
-#ifdef ENABLE_QT
-#include <QMetaObject>
-#include <QWidget>
-#endif
 
 bool OverlayRenderer::IsPointInRect(const POINT &pt, const RECT &rect) const
 {
@@ -72,40 +68,7 @@ void OverlayRenderer::HandleClick(int x, int y)
 	}
 
 	if (IsPointInRect(pt, m_layout.showOBSButtonRect)) {
-		try {
-#ifdef ENABLE_QT
-			QWidget *mainWindow = static_cast<QWidget *>(obs_frontend_get_main_window());
-			if (mainWindow) {
-				if (!QMetaObject::invokeMethod(mainWindow, "ToggleShowHide", Qt::QueuedConnection)) {
-					const bool isVisible = mainWindow->isVisible();
-					const bool isMinimized = mainWindow->isMinimized();
-					if (isVisible && !isMinimized) {
-						mainWindow->hide();
-					} else {
-						mainWindow->show();
-						mainWindow->raise();
-						mainWindow->activateWindow();
-						HWND obsHwnd = (HWND)mainWindow->winId();
-						if (obsHwnd && IsWindow(obsHwnd)) {
-							ShowWindow(obsHwnd, SW_RESTORE);
-							SetForegroundWindow(obsHwnd);
-						}
-					}
-				}
-			}
-#else
-			void *mainWindow = obs_frontend_get_main_window();
-			if (mainWindow) {
-				HWND obsHwnd = (HWND)mainWindow;
-				if (obsHwnd && IsWindow(obsHwnd)) {
-					ShowWindow(obsHwnd, SW_RESTORE);
-					SetForegroundWindow(obsHwnd);
-				}
-			}
-#endif
-		} catch (...) {
-			obs_log(LOG_ERROR, "Failed to show OBS window");
-		}
+		overlay_toggle_obs_main_window();
 		Hide();
 		return;
 	}

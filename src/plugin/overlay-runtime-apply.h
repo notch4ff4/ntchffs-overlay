@@ -11,6 +11,7 @@ extern "C" {
 // reach directly.
 void overlay_runtime_set_indicators(bool enabled, int position, bool oledProtection);
 void overlay_runtime_set_smart_replay(bool enabled);
+void overlay_runtime_set_smart_replay_mode(int mode);
 
 #ifdef __cplusplus
 }

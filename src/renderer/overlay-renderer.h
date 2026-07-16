@@ -240,6 +240,7 @@ private:
 		IndicatorsEnabled,
 		IndicatorsOled,
 		SmartReplay,
+		SmartReplayMode,
 		GalleryInOverlay,
 		CaptureFocus,
 		// numeric/enum fields (StepDown / StepUp)
@@ -278,6 +279,7 @@ private:
 	int m_setIndicatorsPosition;
 	bool m_setIndicatorsOled;
 	bool m_setSmartReplay;
+	int m_setSmartReplayMode;
 	bool m_setGalleryInOverlay;
 	bool m_setCaptureFocus;
 	std::wstring m_setExportPath;

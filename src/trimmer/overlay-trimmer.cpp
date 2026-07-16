@@ -8,6 +8,7 @@
 #include <plugin-support.h>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <sstream>
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -1044,7 +1045,8 @@ static bool remux_trim(const std::wstring &inputPath, const std::wstring &output
 
 	const double eps = 0.001;
 
-	// Align the cut to the first keyframe so playback starts with a decodable frame.
+	// After AVSEEK_FLAG_BACKWARD, align to the nearest preceding keyframe so the kept
+	// segment is as close as possible to the requested duration (lossless stream copy).
 	double cutStartSeconds = std::max(0.0, startSeconds);
 	bool needKeyframeAlign = (cutStartSeconds > 0.0);
 	bool waitingForFirstKeyframe = false;
@@ -1090,10 +1092,10 @@ static bool remux_trim(const std::wstring &inputPath, const std::wstring &output
 		int64_t ts = (pkt.pts != AV_NOPTS_VALUE) ? pkt.pts : pkt.dts;
 		double t = PtsToSeconds(ts, in_stream->time_base);
 
-		// Drop pre-keyframe packets so the output starts on a decodable frame.
+		// Start on the first keyframe after the backward seek (at or before startSeconds).
 		if (waitingForFirstKeyframe) {
 			if (in_idx == ref_in_stream && (pkt.flags & AV_PKT_FLAG_KEY)) {
-				cutStartSeconds = std::max(0.0, t);
+				cutStartSeconds = t;
 				waitingForFirstKeyframe = false;
 			} else {
 				av_packet_unref(&pkt);
@@ -1180,6 +1182,204 @@ static bool remux_trim(const std::wstring &inputPath, const std::wstring &output
 }
 
 } // namespace
+
+bool overlay_replay_probe_playback_range(const std::wstring &inputPath, double &outStartSeconds,
+					 double &outEndSeconds, std::wstring &outError,
+					 int *outRefStreamIndex, int *outVideoPacketCount,
+					 double *outContainerDurationSeconds)
+{
+	outStartSeconds = 0.0;
+	outEndSeconds = 0.0;
+	outError.clear();
+	if (outRefStreamIndex)
+		*outRefStreamIndex = -1;
+	if (outVideoPacketCount)
+		*outVideoPacketCount = 0;
+	if (outContainerDurationSeconds)
+		*outContainerDurationSeconds = -1.0;
+
+	const std::string inUtf8 = WideToUtf8(inputPath);
+	if (inUtf8.empty()) {
+		outError = L"Invalid input path";
+		return false;
+	}
+
+	AVFormatContext *ifmt = avformat_alloc_context();
+	if (!ifmt) {
+		outError = L"FFmpeg: avformat_alloc_context failed";
+		return false;
+	}
+
+	int ret = avformat_open_input(&ifmt, inUtf8.c_str(), nullptr, nullptr);
+	if (ret < 0) {
+		char errbuf[256];
+		av_strerror(ret, errbuf, sizeof(errbuf));
+		outError = L"FFmpeg: failed to open input: " + Utf8ToWide(errbuf);
+		avformat_free_context(ifmt);
+		return false;
+	}
+
+	ret = avformat_find_stream_info(ifmt, nullptr);
+	if (ret < 0) {
+		char errbuf[256];
+		av_strerror(ret, errbuf, sizeof(errbuf));
+		outError = L"FFmpeg: failed to read stream info: " + Utf8ToWide(errbuf);
+		avformat_close_input(&ifmt);
+		return false;
+	}
+
+	int ref_stream = -1;
+	for (unsigned i = 0; i < ifmt->nb_streams; i++) {
+		AVStream *st = ifmt->streams[i];
+		if (st && st->codecpar && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+			ref_stream = static_cast<int>(i);
+			break;
+		}
+	}
+	if (ref_stream < 0) {
+		for (unsigned i = 0; i < ifmt->nb_streams; i++) {
+			if (ifmt->streams[i]) {
+				ref_stream = static_cast<int>(i);
+				break;
+			}
+		}
+	}
+
+	double min_pts = std::numeric_limits<double>::infinity();
+	double max_pts = 0.0;
+	bool found_packet = false;
+	int video_packet_count = 0;
+
+	if (ref_stream >= 0) {
+		if (outRefStreamIndex)
+			*outRefStreamIndex = ref_stream;
+
+		AVPacket pkt = {};
+		while ((ret = av_read_frame(ifmt, &pkt)) >= 0) {
+			if (pkt.stream_index != ref_stream) {
+				av_packet_unref(&pkt);
+				continue;
+			}
+
+			++video_packet_count;
+
+			AVStream *st = ifmt->streams[ref_stream];
+			int64_t ts = (pkt.pts != AV_NOPTS_VALUE) ? pkt.pts : pkt.dts;
+			if (ts == AV_NOPTS_VALUE) {
+				av_packet_unref(&pkt);
+				continue;
+			}
+
+			const double t = PtsToSeconds(ts, st->time_base);
+			double packet_end = t;
+			if (pkt.duration > 0) {
+				packet_end += static_cast<double>(pkt.duration) * av_q2d(st->time_base);
+			}
+
+			min_pts = std::min(min_pts, t);
+			max_pts = std::max(max_pts, packet_end);
+			found_packet = true;
+			av_packet_unref(&pkt);
+		}
+		av_packet_unref(&pkt);
+	}
+
+	if (outVideoPacketCount)
+		*outVideoPacketCount = video_packet_count;
+
+	const double container_duration_sec =
+		(ifmt->duration != AV_NOPTS_VALUE && ifmt->duration > 0)
+			? static_cast<double>(ifmt->duration) / static_cast<double>(AV_TIME_BASE)
+			: -1.0;
+	if (outContainerDurationSeconds)
+		*outContainerDurationSeconds = container_duration_sec;
+
+	if (found_packet && max_pts > min_pts) {
+		outStartSeconds = min_pts;
+		outEndSeconds = max_pts;
+		avformat_close_input(&ifmt);
+		return true;
+	}
+
+	if (container_duration_sec > 0.0) {
+		outStartSeconds = 0.0;
+		outEndSeconds = container_duration_sec;
+		avformat_close_input(&ifmt);
+		return true;
+	}
+
+	double max_stream_end = 0.0;
+	for (unsigned i = 0; i < ifmt->nb_streams; i++) {
+		AVStream *st = ifmt->streams[i];
+		if (!st || !st->codecpar)
+			continue;
+		if (st->duration > 0) {
+			const double stream_duration = static_cast<double>(st->duration) * av_q2d(st->time_base);
+			max_stream_end = std::max(max_stream_end, stream_duration);
+		}
+	}
+
+	avformat_close_input(&ifmt);
+
+	if (max_stream_end <= 0.0) {
+		outError = L"FFmpeg: duration not found";
+		return false;
+	}
+
+	outStartSeconds = 0.0;
+	outEndSeconds = max_stream_end;
+	return true;
+}
+
+bool overlay_replay_probe_duration_seconds(const std::wstring &inputPath, double &outDurationSeconds,
+					   std::wstring &outError)
+{
+	double start_seconds = 0.0;
+	double end_seconds = 0.0;
+	if (!overlay_replay_probe_playback_range(inputPath, start_seconds, end_seconds, outError)) {
+		return false;
+	}
+	outDurationSeconds = std::max(0.0, end_seconds - start_seconds);
+	return outDurationSeconds > 0.0;
+}
+
+bool overlay_replay_lossless_trim(const std::wstring &inputPath, const std::wstring &outputPath,
+				  double startSeconds, std::wstring &outError)
+{
+	std::atomic<bool> cancelRequested{false};
+	std::atomic<double> progress{0.0};
+	return remux_trim(inputPath, outputPath, startSeconds, 0.0, {}, cancelRequested, progress, outError);
+}
+
+bool overlay_replay_lossless_trim_keep_last(const std::wstring &inputPath, const std::wstring &outputPath,
+					    double keepSeconds, std::wstring &outError)
+{
+	outError.clear();
+	if (keepSeconds <= 0.0) {
+		outError = L"Invalid keep duration";
+		return false;
+	}
+
+	double playback_start_sec = 0.0;
+	double playback_end_sec = 0.0;
+	if (!overlay_replay_probe_playback_range(inputPath, playback_start_sec, playback_end_sec, outError)) {
+		return false;
+	}
+
+	const double file_duration_sec = std::max(0.0, playback_end_sec - playback_start_sec);
+
+	constexpr double kTailEpsilon = 0.05;
+	if (keepSeconds + kTailEpsilon >= file_duration_sec) {
+		return true;
+	}
+
+	const double startSeconds = std::max(playback_start_sec, playback_end_sec - keepSeconds);
+	obs_log(LOG_INFO,
+		"[SmartReplay] trim keep-last path=%s playback=[%.3f..%.3f] span=%.3f keep=%.3f start=%.3f",
+		overlay::util::WideToUtf8(inputPath).c_str(), playback_start_sec, playback_end_sec,
+		file_duration_sec, keepSeconds, startSeconds);
+	return overlay_replay_lossless_trim(inputPath, outputPath, startSeconds, outError);
+}
 
 OverlayTrimmer::OverlayTrimmer()
 	: m_status(Status::Idle),

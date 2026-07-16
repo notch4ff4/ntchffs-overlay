@@ -194,6 +194,7 @@ OverlayRenderer::OverlayRenderer()
 	m_setIndicatorsPosition = 5;
 	m_setIndicatorsOled = false;
 	m_setSmartReplay = true;
+	m_setSmartReplayMode = 0;
 	m_setGalleryInOverlay = false;
 	m_setCaptureFocus = true;
 	for (int i = 0; i < 7; i++) {
@@ -2805,13 +2806,8 @@ void OverlayRenderer::HandleGalleryKey(int vkCode, int mods)
 	}
 }
 
-// ============================================================================
-// In-overlay settings panel
-// ============================================================================
-
 namespace {
 
-// Storage keys for the 7 gallery hotkeys, in panel display order.
 const char *const kSettingsHotkeyKeys[7] = {
 	"hotkey_play",         "hotkey_seek_forward_5", "hotkey_seek_back_5", "hotkey_frame_forward",
 	"hotkey_frame_back",   "hotkey_go_in",          "hotkey_go_out"};
@@ -2825,14 +2821,14 @@ const char *const kSettingsPositionKeys[9] = {
 	"Position.Right",      "Position.TopLeft",    "Position.TopRight",
 	"Position.BottomLeft", "Position.BottomRight", "Position.Center"};
 const char *const kSettingsOrientationKeys[2] = {"Orientation.Horizontal", "Orientation.Vertical"};
+const char *const kSettingsSmartReplayModeKeys[2] = {"SmartReplay.Mode.Legacy", "SmartReplay.Mode.TimestampTrim"};
 
-// Native folder picker so the panel does not depend on Qt for the export path.
 bool BrowseForExportFolderNative(HWND owner, std::wstring &out)
 {
 	bool didInit = false;
 	HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 	if (SUCCEEDED(hrInit))
-		didInit = true; // balanced with CoUninitialize below
+		didInit = true;
 
 	bool result = false;
 	IFileOpenDialog *dlg = nullptr;
@@ -2915,6 +2911,7 @@ void OverlayRenderer::LoadSettingsWorkingValues()
 	m_setIndicatorsPosition = ClampInt(getIntDef("indicators_position", 5), 0, 8);
 	m_setIndicatorsOled = getBoolDef("indicators_oled_protection", false);
 	m_setSmartReplay = getBoolDef("smart_replay", true);
+	m_setSmartReplayMode = ClampInt(getIntDef("smart_replay_mode", 0), 0, 1);
 	m_setGalleryInOverlay = getBoolDef("gallery_in_overlay", false);
 	m_setCaptureFocus = getBoolDef("capture_focus", true);
 	if (d && obs_data_has_user_value(d, "gallery_export_path"))
@@ -2946,6 +2943,7 @@ void OverlayRenderer::PersistSettingsWorkingValues()
 	obs_data_set_int(d, "indicators_position", m_setIndicatorsPosition);
 	obs_data_set_bool(d, "indicators_oled_protection", m_setIndicatorsOled);
 	obs_data_set_bool(d, "smart_replay", m_setSmartReplay);
+	obs_data_set_int(d, "smart_replay_mode", m_setSmartReplayMode);
 	obs_data_set_bool(d, "gallery_in_overlay", m_setGalleryInOverlay);
 	obs_data_set_bool(d, "capture_focus", m_setCaptureFocus);
 	obs_data_set_string(d, "gallery_export_path", overlay::util::WideToUtf8(m_setExportPath).c_str());
@@ -3008,8 +3006,6 @@ void OverlayRenderer::CloseSettings()
 	m_windowManager.SetKeyHandler(nullptr, nullptr);
 	m_windowManager.SetWheelHandler(nullptr, nullptr);
 
-	// Flush working values to disk and apply overlay-geometry settings (only
-	// visible on the small overlay, so deferred until the panel closes).
 	PersistSettingsWorkingValues();
 	if (!overlay_settings_save())
 		obs_log(LOG_ERROR, "Overlay settings not saved to disk");
@@ -3278,6 +3274,9 @@ void OverlayRenderer::RenderSettingsPanel()
 
 	sectionHeader(overlay::util::ModuleTextW("Replay"));
 	checkboxRow(overlay::util::ModuleTextW("SmartReplay"), m_setSmartReplay, SettingsField::SmartReplay);
+	stepperRow(overlay::util::ModuleTextW("SmartReplay.Mode"),
+		   overlay::util::ModuleTextW(kSettingsSmartReplayModeKeys[m_setSmartReplayMode]),
+		   SettingsField::SmartReplayMode);
 
 	sectionHeader(overlay::util::ModuleTextW("Tab.Hotkeys"));
 	for (int i = 0; i < 7; i++) {
@@ -3288,7 +3287,6 @@ void OverlayRenderer::RenderSettingsPanel()
 
 	target->PopAxisAlignedClip();
 
-	// Scrollbar (only when content overflows the viewport).
 	if (m_settingsContentTotalHeight > viewportHeight) {
 		RECT trackRect = {shell.right - 10, viewTop, shell.right - 4, viewBottom};
 		DrawRoundedRectangle(trackRect, 3.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.06f));
@@ -3325,7 +3323,6 @@ void OverlayRenderer::HandleSettingsClick(int x, int y)
 		return;
 	const SettingsHit hit = m_settingsHits[static_cast<size_t>(idx)];
 
-	// Clicking anything other than another hotkey button cancels an active capture.
 	if (m_settingsCapturingHotkeyIndex >= 0 && hit.action != SettingsAction::HotkeyCapture) {
 		m_settingsCapturingHotkeyIndex = -1;
 		m_windowManager.SetKeyboardCaptureActive(false);
@@ -3416,6 +3413,12 @@ void OverlayRenderer::HandleSettingsClick(int x, int y)
 #ifdef ENABLE_QT
 			overlay_runtime_set_indicators(m_setIndicatorsEnabled, m_setIndicatorsPosition,
 						       m_setIndicatorsOled);
+#endif
+			break;
+		case SettingsField::SmartReplayMode:
+			m_setSmartReplayMode = (m_setSmartReplayMode + dir + 2) % 2;
+#ifdef ENABLE_QT
+			overlay_runtime_set_smart_replay_mode(m_setSmartReplayMode);
 #endif
 			break;
 		default:

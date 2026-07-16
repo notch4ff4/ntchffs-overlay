@@ -30,7 +30,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "overlay-window-c.h"
 #include "overlay-indicators-c.h"
 #include "overlay-runtime-apply.h"
+#include "overlay-smart-replay.h"
 #include "overlay-state.h"
+#include "overlay-ui-task.h"
 #include <QAction>
 #include <QInputDialog>
 #include <QMainWindow>
@@ -55,88 +57,6 @@ static bool hotkeys_loaded = false;
 #ifdef ENABLE_QT
 static void *overlay_window = NULL;
 static void *overlay_indicators = NULL;
-static bool replay_restart_pending = false;
-static int replay_restart_attempts = 0;
-static bool smart_replay_enabled = true;
-static constexpr int kSmartReplayStartDelayMs = 500;
-static constexpr int kSmartReplayVerifyDelayMs = 700;
-static constexpr int kSmartReplayMaxRestartAttempts = 4;
-
-static void set_smart_replay_enabled(bool enabled)
-{
-	smart_replay_enabled = enabled;
-	if (!enabled) {
-		replay_restart_pending = false;
-		replay_restart_attempts = 0;
-	}
-	obs_log(LOG_INFO, "Smart replay %s", enabled ? "enabled" : "disabled");
-}
-
-static void schedule_smart_replay_buffer_start(void)
-{
-	QTimer::singleShot(kSmartReplayStartDelayMs, []() {
-		if (!smart_replay_enabled) {
-			replay_restart_pending = false;
-			replay_restart_attempts = 0;
-			obs_log(LOG_INFO, "Smart replay: start cancelled (disabled)");
-			return;
-		}
-
-		if (obs_frontend_replay_buffer_active()) {
-			obs_log(LOG_INFO, "Smart replay: replay buffer already active");
-			replay_restart_pending = false;
-			replay_restart_attempts = 0;
-			return;
-		}
-
-		++replay_restart_attempts;
-		obs_log(LOG_INFO, "Smart replay: starting replay buffer (attempt %d/%d)",
-			replay_restart_attempts, kSmartReplayMaxRestartAttempts);
-		obs_frontend_replay_buffer_start();
-
-		QTimer::singleShot(kSmartReplayVerifyDelayMs, []() {
-			if (obs_frontend_replay_buffer_active()) {
-				obs_log(LOG_INFO, "Smart replay: replay buffer restart confirmed");
-				replay_restart_pending = false;
-				replay_restart_attempts = 0;
-				return;
-			}
-
-			if (!replay_restart_pending)
-				return;
-
-			if (replay_restart_attempts >= kSmartReplayMaxRestartAttempts) {
-				obs_log(LOG_WARNING,
-					"Smart replay: failed to restart replay buffer after %d attempts",
-					replay_restart_attempts);
-				replay_restart_pending = false;
-				replay_restart_attempts = 0;
-				return;
-			}
-
-			obs_log(LOG_WARNING, "Smart replay: replay buffer did not start, retrying");
-			schedule_smart_replay_buffer_start();
-		});
-	});
-}
-
-static void restart_smart_replay_buffer_after_save(void)
-{
-	if (!smart_replay_enabled)
-		return;
-
-	replay_restart_pending = true;
-	replay_restart_attempts = 0;
-
-	if (obs_frontend_replay_buffer_active()) {
-		obs_log(LOG_INFO, "Smart replay: stopping replay buffer for reset after save");
-		obs_frontend_replay_buffer_stop();
-		return;
-	}
-
-	obs_log(LOG_INFO, "Smart replay: replay buffer inactive after save completed");
-	schedule_smart_replay_buffer_start();
-}
 
 static void handle_replay_saved_event(void)
 {
@@ -152,7 +72,7 @@ static void handle_replay_saved_event(void)
 			"Replay buffer saved event without a valid file path");
 	}
 
-	restart_smart_replay_buffer_after_save();
+	overlay_smart_replay_on_save_completed(replay_path);
 }
 
 static void frontend_event_callback(enum obs_frontend_event event, void *priv_data);
@@ -178,15 +98,9 @@ static void toggle_overlay_callback(void *data, obs_hotkey_id id,
 #endif
 }
 
-static void save_replay_callback(void *data, obs_hotkey_id id,
-				 obs_hotkey_t *hotkey, bool pressed)
+static void save_replay_hotkey_ui_task(void *param)
 {
-	UNUSED_PARAMETER(data);
-	UNUSED_PARAMETER(id);
-	UNUSED_PARAMETER(hotkey);
-
-	if (!pressed)
-		return;
+	UNUSED_PARAMETER(param);
 
 	if (!obs_frontend_replay_buffer_active()) {
 		obs_log(LOG_WARNING, "Save replay hotkey: replay buffer not active");
@@ -198,8 +112,23 @@ static void save_replay_callback(void *data, obs_hotkey_id id,
 	}
 
 	obs_log(LOG_INFO, "Save replay hotkey: saving replay buffer");
+	if (!overlay_smart_replay_request_save()) {
+		obs_frontend_replay_buffer_save();
+	}
 	OverlayStateManager::SetReplaySaving(true);
-	obs_frontend_replay_buffer_save();
+}
+
+static void save_replay_callback(void *data, obs_hotkey_id id,
+				 obs_hotkey_t *hotkey, bool pressed)
+{
+	UNUSED_PARAMETER(data);
+	UNUSED_PARAMETER(id);
+	UNUSED_PARAMETER(hotkey);
+
+	if (!pressed)
+		return;
+
+	overlay_run_on_ui_thread(save_replay_hotkey_ui_task, nullptr);
 }
 
 // --- Hotkey registration ---
@@ -329,7 +258,12 @@ extern "C" void overlay_runtime_set_indicators(bool enabled, int position, bool 
 
 extern "C" void overlay_runtime_set_smart_replay(bool enabled)
 {
-	set_smart_replay_enabled(enabled);
+	overlay_smart_replay_set_enabled(enabled);
+}
+
+extern "C" void overlay_runtime_set_smart_replay_mode(int mode)
+{
+	overlay_smart_replay_set_mode(mode);
 }
 
 static void frontend_event_callback(enum obs_frontend_event event, void *priv_data)
@@ -393,11 +327,7 @@ static void frontend_event_callback(enum obs_frontend_event event, void *priv_da
 	} else if (event == OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVED) {
 		handle_replay_saved_event();
 	} else if (event == OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED) {
-		if (replay_restart_pending) {
-			obs_log(LOG_INFO,
-				"Smart replay: replay buffer stopped, restarting after save completed");
-			schedule_smart_replay_buffer_start();
-		}
+		overlay_smart_replay_on_replay_buffer_stopped();
 	}
 }
 #endif
@@ -414,9 +344,15 @@ bool obs_module_load(void)
 	const bool hasSmartReplay =
 		saved_settings_data &&
 		obs_data_has_user_value(saved_settings_data, "smart_replay");
-	set_smart_replay_enabled(!saved_settings_data || !hasSmartReplay
+	overlay_smart_replay_set_enabled(!saved_settings_data || !hasSmartReplay
 		? true
 		: obs_data_get_bool(saved_settings_data, "smart_replay"));
+
+	int smartReplayMode = OVERLAY_SMART_REPLAY_LEGACY;
+	if (saved_settings_data && obs_data_has_user_value(saved_settings_data, "smart_replay_mode")) {
+		smartReplayMode = static_cast<int>(obs_data_get_int(saved_settings_data, "smart_replay_mode"));
+	}
+	overlay_smart_replay_set_mode(smartReplayMode);
 #endif
 
 	// Frontend callbacks persist hotkey bindings in the OBS profile.
