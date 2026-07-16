@@ -3559,6 +3559,7 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 								streamIndicesToKeep.push_back(m_exportTrackStreamIndices[i]);
 							}
 						}
+						m_videoPlayer.SetPlaying(false);
 						if (!m_trimmer.StartExport(item->path, sharePath, start, end, m_galleryShareCompress,
 									   m_galleryShareCrf, streamIndicesToKeep,
 									   /*customFfmpegArgs=*/L"",
