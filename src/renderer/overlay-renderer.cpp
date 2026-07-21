@@ -176,6 +176,7 @@ OverlayRenderer::OverlayRenderer()
 	}
 
 	m_settingsOpen = false;
+	m_settingsPage = SettingsPage::Categories;
 	m_settingsContentWidth = 0;
 	m_settingsContentHeight = 0;
 	m_settingsScrollOffset = 0;
@@ -2961,6 +2962,7 @@ void OverlayRenderer::OpenSettings()
 		CloseGallery();
 
 	m_settingsOpen = true;
+	m_settingsPage = SettingsPage::Categories;
 	m_settingsScrollOffset = 0;
 	m_settingsCapturingHotkeyIndex = -1;
 	m_settingsHoverIndex = -1;
@@ -2999,6 +3001,7 @@ void OverlayRenderer::CloseSettings()
 	if (!m_settingsOpen)
 		return;
 	m_settingsOpen = false;
+	m_settingsPage = SettingsPage::Categories;
 	m_settingsCapturingHotkeyIndex = -1;
 	m_settingsHoverIndex = -1;
 	m_settingsHits.clear();
@@ -3097,8 +3100,27 @@ void OverlayRenderer::RenderSettingsPanel()
 	const int headerTop = shell.top + 12;
 	const int headerH = 34;
 	RECT headerRect = {shell.left + insetH, headerTop, shell.right - insetH, headerTop + headerH};
-	RenderText(overlay::util::ModuleTextW("OverlaySettings"),
-		   {headerRect.left, headerRect.top, headerRect.right - 40, headerRect.bottom}, 15.0f,
+
+	const bool onRoot = (m_settingsPage == SettingsPage::Categories);
+	std::wstring headerTitle = overlay::util::ModuleTextW("OverlaySettings");
+	switch (m_settingsPage) {
+	case SettingsPage::General:
+		headerTitle = overlay::util::ModuleTextW("Tab.General");
+		break;
+	case SettingsPage::Indicators:
+		headerTitle = overlay::util::ModuleTextW("Indicators");
+		break;
+	case SettingsPage::Replay:
+		headerTitle = overlay::util::ModuleTextW("Replay");
+		break;
+	case SettingsPage::Hotkeys:
+		headerTitle = overlay::util::ModuleTextW("Tab.Hotkeys");
+		break;
+	case SettingsPage::Categories:
+	default:
+		break;
+	}
+	RenderText(headerTitle, {headerRect.left, headerRect.top, headerRect.right - 40, headerRect.bottom}, 15.0f,
 		   DWRITE_FONT_WEIGHT_BOLD, kWhite, DWRITE_TEXT_ALIGNMENT_LEADING);
 
 	const int closeSize = 30;
@@ -3111,7 +3133,8 @@ void OverlayRenderer::RenderSettingsPanel()
 			DrawRoundedRectangle(closeRect, 8.0f, kRowHover);
 		D2D1_COLOR_F tint = hover ? kAccent : kDim;
 		DrawGalleryIcon(closeRect, 7, &tint); // icon 7 = back/close
-		m_settingsHits.push_back({closeRect, SettingsAction::Close, 0});
+		m_settingsHits.push_back(
+			{closeRect, onRoot ? SettingsAction::Close : SettingsAction::Back, 0});
 	}
 
 	const int viewTop = headerRect.bottom + 10;
@@ -3132,10 +3155,17 @@ void OverlayRenderer::RenderSettingsPanel()
 
 	int y = viewTop - m_settingsScrollOffset;
 
-	auto sectionHeader = [&](const std::wstring &title) {
-		const int h = 28;
-		RECT r = {contentLeft + 4, y, contentRight, y + h};
-		RenderText(title, r, 12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, kAccent, DWRITE_TEXT_ALIGNMENT_LEADING);
+	auto categoryRow = [&](const std::wstring &title, SettingsPage page) {
+		const int h = 44;
+		RECT r = {contentLeft, y, contentRight, y + h};
+		int idx = static_cast<int>(m_settingsHits.size());
+		bool hover = (idx == m_settingsHoverIndex);
+		DrawRoundedRectangle(r, 8.0f, hover ? kRowHover : kRowBg);
+		RECT lr = {r.left + 12, r.top, r.right - 36, r.bottom};
+		RenderText(title, lr, 13.0f, DWRITE_FONT_WEIGHT_NORMAL, kWhite, DWRITE_TEXT_ALIGNMENT_LEADING);
+		RECT chevron = {r.right - 28, r.top, r.right - 8, r.bottom};
+		RenderText(L"\u25B6", chevron, 11.0f, DWRITE_FONT_WEIGHT_NORMAL, kAccent, DWRITE_TEXT_ALIGNMENT_CENTER);
+		m_settingsHits.push_back({r, SettingsAction::OpenCategory, static_cast<int>(page)});
 		y += h + rowGap;
 	};
 
@@ -3246,41 +3276,52 @@ void OverlayRenderer::RenderSettingsPanel()
 		y += h + rowGap;
 	};
 
-	sectionHeader(overlay::util::ModuleTextW("Tab.General"));
-	stepperRow(overlay::util::ModuleTextW("Position.Label"),
-		   overlay::util::ModuleTextW(kSettingsPositionKeys[m_setPosition]), SettingsField::Position);
-	stepperRow(overlay::util::ModuleTextW("Margin"), std::to_wstring(m_setMargin) + L" px", SettingsField::Margin);
-	stepperRow(overlay::util::ModuleTextW("Layout"),
-		   overlay::util::ModuleTextW(kSettingsOrientationKeys[m_setOrientation]), SettingsField::Orientation);
-	stepperRow(overlay::util::ModuleTextW("OverlayOpacity"), std::to_wstring(m_setOpacityPct) + L"%",
-		   SettingsField::Opacity);
-	checkboxRow(overlay::util::ModuleTextW("AutoHide.Enable"), m_setAutoHideEnabled,
-		    SettingsField::AutoHideEnabled);
-	stepperRow(overlay::util::ModuleTextW("AutoHide.Delay"), std::to_wstring(m_setAutoHideSeconds) + L" s",
-		   SettingsField::AutoHideSeconds);
-	checkboxRow(overlay::util::ModuleTextW("Gallery.InOverlay"), m_setGalleryInOverlay,
-		    SettingsField::GalleryInOverlay);
-	pathRow();
-	checkboxRow(overlay::util::ModuleTextW("CaptureFocus"), m_setCaptureFocus, SettingsField::CaptureFocus);
-
-	sectionHeader(overlay::util::ModuleTextW("Indicators"));
-	checkboxRow(overlay::util::ModuleTextW("Indicators.Show"), m_setIndicatorsEnabled,
-		    SettingsField::IndicatorsEnabled);
-	stepperRow(overlay::util::ModuleTextW("Position.Label"),
-		   overlay::util::ModuleTextW(kSettingsPositionKeys[m_setIndicatorsPosition]),
-		   SettingsField::IndicatorsPosition);
-	checkboxRow(overlay::util::ModuleTextW("Indicators.OledProtection"), m_setIndicatorsOled,
-		    SettingsField::IndicatorsOled);
-
-	sectionHeader(overlay::util::ModuleTextW("Replay"));
-	checkboxRow(overlay::util::ModuleTextW("SmartReplay"), m_setSmartReplay, SettingsField::SmartReplay);
-	stepperRow(overlay::util::ModuleTextW("SmartReplay.Mode"),
-		   overlay::util::ModuleTextW(kSettingsSmartReplayModeKeys[m_setSmartReplayMode]),
-		   SettingsField::SmartReplayMode);
-
-	sectionHeader(overlay::util::ModuleTextW("Tab.Hotkeys"));
-	for (int i = 0; i < 7; i++) {
-		hotkeyRow(overlay::util::ModuleTextW(kSettingsHotkeyLabelKeys[i]), i);
+	switch (m_settingsPage) {
+	case SettingsPage::Categories:
+		categoryRow(overlay::util::ModuleTextW("Tab.General"), SettingsPage::General);
+		categoryRow(overlay::util::ModuleTextW("Indicators"), SettingsPage::Indicators);
+		categoryRow(overlay::util::ModuleTextW("Replay"), SettingsPage::Replay);
+		categoryRow(overlay::util::ModuleTextW("Tab.Hotkeys"), SettingsPage::Hotkeys);
+		break;
+	case SettingsPage::General:
+		stepperRow(overlay::util::ModuleTextW("Position.Label"),
+			   overlay::util::ModuleTextW(kSettingsPositionKeys[m_setPosition]), SettingsField::Position);
+		stepperRow(overlay::util::ModuleTextW("Margin"), std::to_wstring(m_setMargin) + L" px",
+			   SettingsField::Margin);
+		stepperRow(overlay::util::ModuleTextW("Layout"),
+			   overlay::util::ModuleTextW(kSettingsOrientationKeys[m_setOrientation]),
+			   SettingsField::Orientation);
+		stepperRow(overlay::util::ModuleTextW("OverlayOpacity"), std::to_wstring(m_setOpacityPct) + L"%",
+			   SettingsField::Opacity);
+		checkboxRow(overlay::util::ModuleTextW("AutoHide.Enable"), m_setAutoHideEnabled,
+			    SettingsField::AutoHideEnabled);
+		stepperRow(overlay::util::ModuleTextW("AutoHide.Delay"), std::to_wstring(m_setAutoHideSeconds) + L" s",
+			   SettingsField::AutoHideSeconds);
+		checkboxRow(overlay::util::ModuleTextW("Gallery.InOverlay"), m_setGalleryInOverlay,
+			    SettingsField::GalleryInOverlay);
+		pathRow();
+		checkboxRow(overlay::util::ModuleTextW("CaptureFocus"), m_setCaptureFocus, SettingsField::CaptureFocus);
+		break;
+	case SettingsPage::Indicators:
+		checkboxRow(overlay::util::ModuleTextW("Indicators.Show"), m_setIndicatorsEnabled,
+			    SettingsField::IndicatorsEnabled);
+		stepperRow(overlay::util::ModuleTextW("Position.Label"),
+			   overlay::util::ModuleTextW(kSettingsPositionKeys[m_setIndicatorsPosition]),
+			   SettingsField::IndicatorsPosition);
+		checkboxRow(overlay::util::ModuleTextW("Indicators.OledProtection"), m_setIndicatorsOled,
+			    SettingsField::IndicatorsOled);
+		break;
+	case SettingsPage::Replay:
+		checkboxRow(overlay::util::ModuleTextW("SmartReplay"), m_setSmartReplay, SettingsField::SmartReplay);
+		stepperRow(overlay::util::ModuleTextW("SmartReplay.Mode"),
+			   overlay::util::ModuleTextW(kSettingsSmartReplayModeKeys[m_setSmartReplayMode]),
+			   SettingsField::SmartReplayMode);
+		break;
+	case SettingsPage::Hotkeys:
+		for (int i = 0; i < 7; i++) {
+			hotkeyRow(overlay::util::ModuleTextW(kSettingsHotkeyLabelKeys[i]), i);
+		}
+		break;
 	}
 
 	m_settingsContentTotalHeight = (y + m_settingsScrollOffset) - viewTop;
@@ -3306,7 +3347,7 @@ int OverlayRenderer::SettingsHoverIndexAt(const POINT &pt) const
 		const SettingsHit &h = m_settingsHits[i];
 		if (!IsPointInRect(pt, h.rect))
 			continue;
-		if (h.action != SettingsAction::Close) {
+		if (h.action != SettingsAction::Close && h.action != SettingsAction::Back) {
 			if (h.rect.bottom <= m_settingsViewportTop || h.rect.top >= m_settingsViewportBottom)
 				continue;
 		}
@@ -3332,6 +3373,26 @@ void OverlayRenderer::HandleSettingsClick(int x, int y)
 	case SettingsAction::Close:
 		CloseSettings();
 		return;
+	case SettingsAction::Back:
+		m_settingsPage = SettingsPage::Categories;
+		m_settingsScrollOffset = 0;
+		m_settingsHoverIndex = -1;
+		m_settingsCapturingHotkeyIndex = -1;
+		m_windowManager.SetKeyboardCaptureActive(false);
+		Render();
+		return;
+	case SettingsAction::OpenCategory: {
+		SettingsPage page = static_cast<SettingsPage>(hit.field);
+		if (page == SettingsPage::Categories)
+			return;
+		m_settingsPage = page;
+		m_settingsScrollOffset = 0;
+		m_settingsHoverIndex = -1;
+		m_settingsCapturingHotkeyIndex = -1;
+		m_windowManager.SetKeyboardCaptureActive(false);
+		Render();
+		return;
+	}
 	case SettingsAction::Browse: {
 		std::wstring picked;
 		if (BrowseForExportFolderNative(m_windowManager.GetHWND(), picked)) {
@@ -3460,6 +3521,13 @@ void OverlayRenderer::HandleSettingsKey(int vkCode, int mods)
 	}
 
 	if (vkCode == VK_ESCAPE) {
+		if (m_settingsPage != SettingsPage::Categories) {
+			m_settingsPage = SettingsPage::Categories;
+			m_settingsScrollOffset = 0;
+			m_settingsHoverIndex = -1;
+			Render();
+			return;
+		}
 		CloseSettings();
 		return;
 	}

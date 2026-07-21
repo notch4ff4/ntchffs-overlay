@@ -233,7 +233,17 @@ private:
 	std::vector<std::wstring> m_exportTrackLabels;
 
 	// --- Settings panel state ---
-	enum class SettingsAction { ToggleBool, StepDown, StepUp, HotkeyCapture, Browse, Close };
+	enum class SettingsPage { Categories, General, Indicators, Replay, Hotkeys };
+	enum class SettingsAction {
+		ToggleBool,
+		StepDown,
+		StepUp,
+		HotkeyCapture,
+		Browse,
+		OpenCategory,
+		Back,
+		Close
+	};
 	enum class SettingsField {
 		// bool fields (ToggleBool)
 		AutoHideEnabled,
@@ -254,10 +264,11 @@ private:
 	struct SettingsHit {
 		RECT rect;
 		SettingsAction action;
-		int field; // SettingsField for Toggle/Step, hotkey index for HotkeyCapture
+		int field; // SettingsField for Toggle/Step, hotkey index, or SettingsPage for OpenCategory
 	};
 
 	bool m_settingsOpen;
+	SettingsPage m_settingsPage;
 	int m_settingsContentWidth;
 	int m_settingsContentHeight;
 	int m_settingsScrollOffset;
