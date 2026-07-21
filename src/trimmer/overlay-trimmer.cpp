@@ -3,6 +3,7 @@
 #include "overlay-trimmer.h"
 #include "overlay-ffmpeg-time-utils.h"
 #include "overlay-ffmpeg-video-decode.h"
+#include "overlay-mp4-box-reader.h"
 #include "overlay-string-utils.h"
 #include <obs-module.h>
 #include <plugin-support.h>
@@ -110,6 +111,44 @@ static AVRational pick_fps_timebase(const AVStream *st)
 	if (fps.num <= 0 || fps.den <= 0)
 		return AVRational{1, 30};
 	return av_inv_q(fps);
+}
+
+// Copies disposition/metadata and restores OBS audio names from trak/udta/name
+// (FFmpeg mov demuxer does not expose them; mov muxer writes title as that atom).
+static void apply_output_stream_metadata(AVStream *out_st, const AVStream *in_st,
+					 const std::vector<std::optional<std::string>> &mp4AudioNames,
+					 size_t audioOrdinal)
+{
+	if (!out_st || !in_st)
+		return;
+
+	out_st->disposition = in_st->disposition;
+	av_dict_copy(&out_st->metadata, in_st->metadata, 0);
+
+	if (!in_st->codecpar || in_st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)
+		return;
+	if (audioOrdinal >= mp4AudioNames.size() || !mp4AudioNames[audioOrdinal].has_value())
+		return;
+	const std::string &name = *mp4AudioNames[audioOrdinal];
+	if (!name.empty()) {
+		av_dict_set(&out_st->metadata, "title", name.c_str(), 0);
+	}
+}
+
+static size_t audio_stream_ordinal(const AVFormatContext *ifmt, int streamIndex)
+{
+	size_t ordinal = 0;
+	if (!ifmt)
+		return 0;
+	for (unsigned i = 0; i < ifmt->nb_streams; i++) {
+		const AVStream *st = ifmt->streams[i];
+		if (!st || !st->codecpar || st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)
+			continue;
+		if (static_cast<int>(i) == streamIndex)
+			return ordinal;
+		++ordinal;
+	}
+	return ordinal;
 }
 
 struct CodecCtxDeleter {
@@ -237,6 +276,9 @@ static bool transcode_trim_mp4(const std::wstring &inputPath, const std::wstring
 		return false;
 	}
 
+	const std::vector<std::optional<std::string>> mp4AudioNames =
+		overlay::mp4::ReadMp4AudioTrackNames(inputPath);
+
 	// --- Decoders ---
 	std::unique_ptr<AVCodecContext, CodecCtxDeleter> vdec;
 	VideoHwDecodeState vdec_hw;
@@ -354,6 +396,7 @@ static bool transcode_trim_mp4(const std::wstring &inputPath, const std::wstring
 			return false;
 		}
 		out_st->time_base = venc->time_base;
+		apply_output_stream_metadata(out_st, in_st, mp4AudioNames, 0);
 	}
 
 	const AVCodec *aenc_codec = find_audio_encoder();
@@ -405,6 +448,8 @@ static bool transcode_trim_mp4(const std::wstring &inputPath, const std::wstring
 			return false;
 		}
 		out_st->time_base = ctx->time_base;
+		apply_output_stream_metadata(out_st, ifmt->streams[audio_in[i]], mp4AudioNames,
+					     audio_stream_ordinal(ifmt.get(), audio_in[i]));
 
 		SwrContext *raw = nullptr;
 		ret = swr_alloc_set_opts2(&raw, &ctx->ch_layout, ctx->sample_fmt, ctx->sample_rate, &dec->ch_layout,
@@ -957,12 +1002,22 @@ static bool remux_trim(const std::wstring &inputPath, const std::wstring &output
 		}
 	}
 
+	const std::vector<std::optional<std::string>> mp4AudioNames =
+		overlay::mp4::ReadMp4AudioTrackNames(inputPath);
+
 	std::vector<int> stream_mapping(static_cast<size_t>(ifmt->nb_streams), -1);
 	int ref_in_stream = -1;
+	size_t audio_ordinal = 0;
 	for (unsigned i = 0; i < ifmt->nb_streams; i++) {
+		AVStream *in_stream = ifmt->streams[i];
+		const bool is_audio =
+			in_stream && in_stream->codecpar && in_stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO;
+		const size_t this_audio_ordinal = audio_ordinal;
+		if (is_audio)
+			++audio_ordinal;
+
 		if (!keep[i])
 			continue;
-		AVStream *in_stream = ifmt->streams[i];
 		if (!in_stream || !in_stream->codecpar)
 			continue;
 
@@ -985,6 +1040,7 @@ static bool remux_trim(const std::wstring &inputPath, const std::wstring &output
 		}
 		out_stream->codecpar->codec_tag = 0;
 		out_stream->time_base = in_stream->time_base;
+		apply_output_stream_metadata(out_stream, in_stream, mp4AudioNames, this_audio_ordinal);
 	}
 
 	if (ref_in_stream < 0) {
