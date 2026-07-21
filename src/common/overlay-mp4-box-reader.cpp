@@ -1,4 +1,4 @@
-// Adapted from Segra Mp4BoxReader (Segra.Backend.Media):
+// Adapted from Segra Mp4BoxReader https://github.com/Segergren/Segra/blob/main/Backend%2FMedia%2FMp4BoxReader.cs
 // walks ISO-BMFF moov/trak to read OBS audio encoder names from trak/udta/name,
 // which FFmpeg's mov demuxer does not surface.
 
