@@ -2,10 +2,12 @@
 
 #ifdef _WIN32
 #include "overlay-indicators.h"
+#include "overlay-string-utils.h"
 #include <obs-module.h>
 #include <windows.h>
 #include <util/base.h>
 #include <exception>
+#include <string>
 
 extern "C" {
 #include <plugin-support.h>
@@ -82,6 +84,35 @@ void overlay_indicators_set_oled_protection(void *indicators, bool enabled)
 	}
 	OverlayIndicators *renderer = static_cast<OverlayIndicators *>(indicators);
 	renderer->SetOledProtection(enabled);
+}
+
+void overlay_indicators_set_scale(void *indicators, int scalePercent)
+{
+	if (!indicators) {
+		return;
+	}
+	OverlayIndicators *renderer = static_cast<OverlayIndicators *>(indicators);
+	renderer->SetScalePercent(scalePercent);
+}
+
+void overlay_indicators_set_custom(void *indicators, int slot, const char *pathUtf8, bool tintEnabled, int colorRgb)
+{
+	if (!indicators) {
+		return;
+	}
+	OverlayIndicators *renderer = static_cast<OverlayIndicators *>(indicators);
+	std::wstring path = pathUtf8 ? overlay::util::Utf8ToWide(pathUtf8) : std::wstring();
+	renderer->SetCustom(slot, path.c_str(), tintEnabled, colorRgb);
+}
+
+void overlay_indicators_set_sound(void *indicators, int eventIndex, const char *pathUtf8)
+{
+	if (!indicators) {
+		return;
+	}
+	OverlayIndicators *renderer = static_cast<OverlayIndicators *>(indicators);
+	std::wstring path = pathUtf8 ? overlay::util::Utf8ToWide(pathUtf8) : std::wstring();
+	renderer->SetSoundPath(eventIndex, path.c_str());
 }
 
 void overlay_indicators_notify_replay_saved(void *indicators)

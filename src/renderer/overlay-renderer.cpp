@@ -4,6 +4,7 @@
 #include "overlay-icons-resource.h"
 #include "overlay-string-utils.h"
 #include "overlay-indicators-c.h"
+#include "overlay-svg-rasterize.h"
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 #include <util/platform.h>
@@ -13,11 +14,13 @@
 #include <objbase.h>
 #include <shlobj.h>
 #include <comdef.h>
+#include <commdlg.h>
 #include <vector>
 #include <string>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cwctype>
 
 #ifdef ENABLE_QT
 #include <QMetaObject>
@@ -194,6 +197,14 @@ OverlayRenderer::OverlayRenderer()
 	m_setIndicatorsEnabled = true;
 	m_setIndicatorsPosition = 5;
 	m_setIndicatorsOled = false;
+	m_setIndicatorsScale = 100;
+	for (int i = 0; i < INDICATOR_SOUND_EVENT_COUNT; i++)
+		m_setIndicatorSoundPath[i].clear();
+	for (int i = 0; i < INDICATOR_CUSTOM_SLOT_COUNT; i++) {
+		m_setIndicatorIconPath[i].clear();
+		m_setIndicatorTint[i] = false;
+		m_setIndicatorColor[i] = 0xFFFFFF;
+	}
 	m_setSmartReplay = true;
 	m_setSmartReplayMode = 0;
 	m_setGalleryInOverlay = false;
@@ -812,6 +823,11 @@ void OverlayRenderer::Render()
 		}
 	}
 
+	if (m_settingsOpen && m_settingsPage == SettingsPage::Indicators) {
+		for (int i = 0; i < INDICATOR_CUSTOM_SLOT_COUNT; i++)
+			EnsureIndicatorPreview(i);
+	}
+
 	m_bitmapRenderTarget->BeginDraw();
 	m_bitmapRenderTarget->SetTransform(D2D1::Matrix3x2F::Identity());
 
@@ -1225,6 +1241,346 @@ void OverlayRenderer::ReleaseIconBitmaps()
 		}
 		m_iconMasks[i] = IconMask{};
 	}
+	ReleaseIndicatorPreviews();
+}
+
+void OverlayRenderer::ReleaseIndicatorPreviews()
+{
+	for (int i = 0; i < INDICATOR_CUSTOM_SLOT_COUNT; i++) {
+		InvalidateIndicatorPreview(i);
+	}
+}
+
+void OverlayRenderer::InvalidateIndicatorPreview(int slot)
+{
+	if (slot < 0 || slot >= INDICATOR_CUSTOM_SLOT_COUNT)
+		return;
+	IndicatorPreviewCache &p = m_indicatorPreview[slot];
+	if (p.original) {
+		p.original->Release();
+		p.original = nullptr;
+	}
+	if (p.tinted) {
+		p.tinted->Release();
+		p.tinted = nullptr;
+	}
+	p.alpha.clear();
+	p.maskW = 0;
+	p.maskH = 0;
+	p.loadAttempted = false;
+	p.loadFailed = false;
+	p.path.clear();
+	p.tintEnabled = false;
+	p.colorRgb = 0xFFFFFF;
+}
+
+void OverlayRenderer::RebuildIndicatorPreviewTint(int slot)
+{
+	if (slot < 0 || slot >= INDICATOR_CUSTOM_SLOT_COUNT)
+		return;
+	ID2D1RenderTarget *target = m_bitmapRenderTarget ? m_bitmapRenderTarget : m_renderTarget;
+	if (!target)
+		return;
+
+	IndicatorPreviewCache &p = m_indicatorPreview[slot];
+	if (p.tinted) {
+		p.tinted->Release();
+		p.tinted = nullptr;
+	}
+	if (!p.tintEnabled || p.alpha.empty() || p.maskW == 0 || p.maskH == 0)
+		return;
+
+	const float cr = ((p.colorRgb >> 16) & 0xFF) / 255.0f;
+	const float cg = ((p.colorRgb >> 8) & 0xFF) / 255.0f;
+	const float cb = (p.colorRgb & 0xFF) / 255.0f;
+	const UINT stride = p.maskW * 4;
+	std::vector<uint8_t> bgra(static_cast<size_t>(stride) * static_cast<size_t>(p.maskH));
+	for (UINT y = 0; y < p.maskH; y++) {
+		for (UINT x = 0; x < p.maskW; x++) {
+			const size_t idx = static_cast<size_t>(y) * p.maskW + x;
+			const float af = p.alpha[idx] / 255.0f;
+			const uint8_t A = static_cast<uint8_t>(af * 255.0f + 0.5f);
+			const uint8_t B = static_cast<uint8_t>(cb * 255.0f * af + 0.5f);
+			const uint8_t G = static_cast<uint8_t>(cg * 255.0f * af + 0.5f);
+			const uint8_t R = static_cast<uint8_t>(cr * 255.0f * af + 0.5f);
+			const size_t o = static_cast<size_t>(y) * stride + static_cast<size_t>(x) * 4;
+			bgra[o + 0] = B;
+			bgra[o + 1] = G;
+			bgra[o + 2] = R;
+			bgra[o + 3] = A;
+		}
+	}
+
+	D2D1_BITMAP_PROPERTIES props =
+		D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+	ID2D1Bitmap *bmp = nullptr;
+	if (SUCCEEDED(target->CreateBitmap(D2D1::SizeU(p.maskW, p.maskH), bgra.data(), stride, &props, &bmp)) && bmp)
+		p.tinted = bmp;
+}
+
+bool OverlayRenderer::CreateIndicatorPreviewFromPixels(int slot, UINT w, UINT h, const uint8_t *bgra, UINT stride)
+{
+	if (slot < 0 || slot >= INDICATOR_CUSTOM_SLOT_COUNT || !bgra || w == 0 || h == 0)
+		return false;
+	ID2D1RenderTarget *target = m_bitmapRenderTarget ? m_bitmapRenderTarget : m_renderTarget;
+	if (!target)
+		return false;
+
+	IndicatorPreviewCache &p = m_indicatorPreview[slot];
+	if (p.original) {
+		p.original->Release();
+		p.original = nullptr;
+	}
+	if (p.tinted) {
+		p.tinted->Release();
+		p.tinted = nullptr;
+	}
+
+	p.maskW = w;
+	p.maskH = h;
+	p.alpha.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
+	for (UINT y = 0; y < h; y++) {
+		for (UINT x = 0; x < w; x++) {
+			const size_t src = static_cast<size_t>(y) * stride + static_cast<size_t>(x) * 4;
+			p.alpha[static_cast<size_t>(y) * w + x] = bgra[src + 3];
+		}
+	}
+
+	D2D1_BITMAP_PROPERTIES props =
+		D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+	ID2D1Bitmap *bmp = nullptr;
+	if (FAILED(target->CreateBitmap(D2D1::SizeU(w, h), bgra, stride, &props, &bmp)) || !bmp)
+		return false;
+	p.original = bmp;
+	RebuildIndicatorPreviewTint(slot);
+	return true;
+}
+
+bool OverlayRenderer::LoadIndicatorPreviewRaster(int slot, const std::wstring &path)
+{
+	if (!m_wicFactory)
+		return false;
+
+	IWICBitmapDecoder *decoder = nullptr;
+	HRESULT hr = m_wicFactory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+							     WICDecodeMetadataCacheOnLoad, &decoder);
+	if (FAILED(hr) || !decoder)
+		return false;
+
+	IWICBitmapFrameDecode *frame = nullptr;
+	hr = decoder->GetFrame(0, &frame);
+	decoder->Release();
+	if (FAILED(hr) || !frame)
+		return false;
+
+	IWICFormatConverter *converter = nullptr;
+	hr = m_wicFactory->CreateFormatConverter(&converter);
+	if (FAILED(hr) || !converter) {
+		frame->Release();
+		return false;
+	}
+	hr = converter->Initialize(frame, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0f,
+				   WICBitmapPaletteTypeCustom);
+	frame->Release();
+	if (FAILED(hr)) {
+		converter->Release();
+		return false;
+	}
+
+	UINT w = 0, h = 0;
+	converter->GetSize(&w, &h);
+	if (w == 0 || h == 0) {
+		converter->Release();
+		return false;
+	}
+	const UINT stride = w * 4;
+	std::vector<uint8_t> pixels(static_cast<size_t>(stride) * static_cast<size_t>(h));
+	hr = converter->CopyPixels(nullptr, stride, static_cast<UINT>(pixels.size()), pixels.data());
+	converter->Release();
+	if (FAILED(hr))
+		return false;
+	return CreateIndicatorPreviewFromPixels(slot, w, h, pixels.data(), stride);
+}
+
+bool OverlayRenderer::LoadIndicatorPreviewSvg(int slot, const std::wstring &path)
+{
+	if (!m_wicFactory || !m_d2dFactory)
+		return false;
+
+	std::vector<uint8_t> bgra;
+	UINT w = 0, h = 0, stride = 0;
+	if (!overlay::svg::RasterizeFile(m_wicFactory, m_d2dFactory, path, 64, bgra, w, h, stride))
+		return false;
+	return CreateIndicatorPreviewFromPixels(slot, w, h, bgra.data(), stride);
+}
+
+bool OverlayRenderer::EnsureIndicatorPreview(int slot)
+{
+	if (slot < 0 || slot >= INDICATOR_CUSTOM_SLOT_COUNT)
+		return false;
+
+	const std::wstring &wantPath = m_setIndicatorIconPath[slot];
+	const bool wantTint = m_setIndicatorTint[slot];
+	const int wantColor = m_setIndicatorColor[slot] & 0xFFFFFF;
+	IndicatorPreviewCache &p = m_indicatorPreview[slot];
+
+	const bool pathChanged = (p.path != wantPath);
+	const bool tintChanged = (p.tintEnabled != wantTint) || (p.colorRgb != wantColor);
+
+	if (pathChanged) {
+		if (p.original) {
+			p.original->Release();
+			p.original = nullptr;
+		}
+		if (p.tinted) {
+			p.tinted->Release();
+			p.tinted = nullptr;
+		}
+		p.alpha.clear();
+		p.maskW = 0;
+		p.maskH = 0;
+		p.path = wantPath;
+		p.tintEnabled = wantTint;
+		p.colorRgb = wantColor;
+		p.loadAttempted = false;
+		p.loadFailed = false;
+	} else if (tintChanged) {
+		p.tintEnabled = wantTint;
+		p.colorRgb = wantColor;
+		if (p.original)
+			RebuildIndicatorPreviewTint(slot);
+	}
+
+	if (wantPath.empty())
+		return false;
+	if (p.original)
+		return true;
+	if (p.loadAttempted)
+		return false;
+
+	p.loadAttempted = true;
+	auto hasExt = [](const std::wstring &path, const wchar_t *ext) {
+		const size_t n = wcslen(ext);
+		return path.size() >= n && _wcsicmp(path.c_str() + path.size() - n, ext) == 0;
+	};
+	const bool isSvg = hasExt(wantPath, L".svg");
+	const bool ok = isSvg ? LoadIndicatorPreviewSvg(slot, wantPath) : LoadIndicatorPreviewRaster(slot, wantPath);
+	if (!ok)
+		p.loadFailed = true;
+	return ok && p.original != nullptr;
+}
+
+void OverlayRenderer::DrawBuiltinIndicatorPreview(int slot, const RECT &rect, D2D1_COLOR_F color)
+{
+	ID2D1RenderTarget *target = m_bitmapRenderTarget ? m_bitmapRenderTarget : m_renderTarget;
+	if (!target || !m_textBrush || !m_d2dFactory)
+		return;
+
+	m_textBrush->SetColor(color);
+	const float strokeWidth = 2.0f;
+	auto getCenter = [](const RECT &r) {
+		return D2D1_POINT_2F{(r.left + r.right) / 2.0f, (r.top + r.bottom) / 2.0f};
+	};
+	auto pointOnCircle = [](const D2D1_POINT_2F &center, float radius, float angleRad) {
+		return D2D1_POINT_2F{center.x + radius * std::cos(angleRad),
+				     center.y + radius * std::sin(angleRad)};
+	};
+
+	if (slot == 0) {
+		D2D1_POINT_2F center = getCenter(rect);
+		float radius = (rect.right - rect.left) * 0.32f;
+		target->DrawEllipse(D2D1::Ellipse(center, radius, radius), m_textBrush, strokeWidth);
+		return;
+	}
+	if (slot == 1) {
+		D2D1_POINT_2F center = getCenter(rect);
+		float radius = (rect.right - rect.left) * 0.34f;
+		float startAngle = -0.25f * 3.14159265f;
+		float endAngle = 1.25f * 3.14159265f;
+		D2D1_POINT_2F startPt = pointOnCircle(center, radius, startAngle);
+		D2D1_POINT_2F endPt = pointOnCircle(center, radius, endAngle);
+		ID2D1PathGeometry *geometry = nullptr;
+		if (SUCCEEDED(m_d2dFactory->CreatePathGeometry(&geometry)) && geometry) {
+			ID2D1GeometrySink *sink = nullptr;
+			if (SUCCEEDED(geometry->Open(&sink)) && sink) {
+				sink->BeginFigure(startPt, D2D1_FIGURE_BEGIN_HOLLOW);
+				D2D1_ARC_SEGMENT arc = {};
+				arc.point = endPt;
+				arc.size = D2D1::SizeF(radius, radius);
+				arc.rotationAngle = 0.0f;
+				arc.sweepDirection = D2D1_SWEEP_DIRECTION_CLOCKWISE;
+				arc.arcSize = D2D1_ARC_SIZE_LARGE;
+				sink->AddArc(arc);
+				sink->EndFigure(D2D1_FIGURE_END_OPEN);
+				sink->Close();
+				sink->Release();
+			}
+			target->DrawGeometry(geometry, m_textBrush, strokeWidth);
+			geometry->Release();
+		}
+		float arrowAngle = endAngle + 0.5f;
+		D2D1_POINT_2F arrowPt1 = pointOnCircle(center, radius * 0.85f, arrowAngle);
+		float arrowAngle2 = endAngle - 0.4f;
+		D2D1_POINT_2F arrowPt2 = pointOnCircle(center, radius * 0.85f, arrowAngle2);
+		target->DrawLine(arrowPt1, endPt, m_textBrush, strokeWidth);
+		target->DrawLine(arrowPt2, endPt, m_textBrush, strokeWidth);
+		return;
+	}
+	if (slot == 2) {
+		const float s = static_cast<float>(rect.right - rect.left);
+		const float inset = s * 0.20f;
+		const float labelInset = s * 0.15f;
+		const float labelH = s * 0.30f;
+		D2D1_RECT_F outer = D2D1::RectF((float)rect.left + inset, (float)rect.top + inset,
+						(float)rect.right - inset, (float)rect.bottom - inset);
+		D2D1_RECT_F label = D2D1::RectF(outer.left + labelInset, outer.top + labelInset,
+						outer.right - labelInset, outer.top + labelInset + labelH);
+		target->DrawRectangle(outer, m_textBrush, strokeWidth);
+		target->DrawRectangle(label, m_textBrush, strokeWidth);
+		return;
+	}
+	if (slot == 3) {
+		const float w = (float)(rect.right - rect.left);
+		const float h = (float)(rect.bottom - rect.top);
+		D2D1_POINT_2F p1 = {(float)rect.left + w * 0.22f, (float)rect.top + h * 0.52f};
+		D2D1_POINT_2F p2 = {(float)rect.left + w * 0.42f, (float)rect.top + h * 0.72f};
+		D2D1_POINT_2F p3 = {(float)rect.left + w * 0.78f, (float)rect.top + h * 0.30f};
+		target->DrawLine(p1, p2, m_textBrush, strokeWidth);
+		target->DrawLine(p2, p3, m_textBrush, strokeWidth);
+	}
+}
+
+void OverlayRenderer::DrawIndicatorPreview(int slot, const RECT &rect)
+{
+	ID2D1RenderTarget *target = m_bitmapRenderTarget ? m_bitmapRenderTarget : m_renderTarget;
+	if (!target || slot < 0 || slot >= INDICATOR_CUSTOM_SLOT_COUNT)
+		return;
+
+	DrawRoundedRectangle(rect, 6.0f, D2D1::ColorF(0.12f, 0.12f, 0.15f, 1.0f));
+	DrawRoundedRectangleBorder(rect, 6.0f, 1.0f, D2D1::ColorF(58.0f / 255.0f, 58.0f / 255.0f, 69.0f / 255.0f, 1.0f));
+
+	const int pad = 4;
+	RECT iconRect = {rect.left + pad, rect.top + pad, rect.right - pad, rect.bottom - pad};
+	const int rgb = m_setIndicatorColor[slot] & 0xFFFFFF;
+	D2D1_COLOR_F color =
+		m_setIndicatorTint[slot]
+			? D2D1::ColorF(((rgb >> 16) & 0xFF) / 255.0f, ((rgb >> 8) & 0xFF) / 255.0f,
+					(rgb & 0xFF) / 255.0f, 1.0f)
+			: D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f);
+
+	if (EnsureIndicatorPreview(slot)) {
+		IndicatorPreviewCache &p = m_indicatorPreview[slot];
+		ID2D1Bitmap *bmp = (p.tintEnabled && p.tinted) ? p.tinted : p.original;
+		if (bmp) {
+			D2D1_RECT_F dest =
+				D2D1::RectF((float)iconRect.left, (float)iconRect.top, (float)iconRect.right,
+					    (float)iconRect.bottom);
+			target->DrawBitmap(bmp, dest, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+			return;
+		}
+	}
+
+	DrawBuiltinIndicatorPreview(slot, iconRect, color);
 }
 
 uint64_t OverlayRenderer::MakeTintKey(int iconType, const D2D1_COLOR_F &tint) const
@@ -2824,6 +3180,15 @@ const char *const kSettingsPositionKeys[9] = {
 const char *const kSettingsOrientationKeys[2] = {"Orientation.Horizontal", "Orientation.Vertical"};
 const char *const kSettingsSmartReplayModeKeys[2] = {"SmartReplay.Mode.Legacy", "SmartReplay.Mode.TimestampTrim"};
 
+const char *const kIndicatorSlotKeys[4] = {"recording", "replay", "saving", "saved"};
+const char *const kIndicatorSlotLabelKeys[4] = {"Indicators.Recording", "Indicators.Replay", "Indicators.Saving",
+						"Indicators.Saved"};
+const char *const kIndicatorSoundKeys[5] = {"recording_on", "recording_off", "replay_on", "replay_off",
+					    "replay_saved"};
+const char *const kIndicatorSoundLabelKeys[5] = {
+	"Indicators.Sound.RecordingOn", "Indicators.Sound.RecordingOff", "Indicators.Sound.ReplayOn",
+	"Indicators.Sound.ReplayOff", "Indicators.Sound.ReplaySaved"};
+
 bool BrowseForExportFolderNative(HWND owner, std::wstring &out)
 {
 	bool didInit = false;
@@ -2838,6 +3203,226 @@ bool BrowseForExportFolderNative(HWND owner, std::wstring &out)
 		DWORD opts = 0;
 		dlg->GetOptions(&opts);
 		dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+		if (SUCCEEDED(dlg->Show(owner))) {
+			IShellItem *item = nullptr;
+			if (SUCCEEDED(dlg->GetResult(&item)) && item) {
+				PWSTR path = nullptr;
+				if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+					out = path;
+					result = true;
+					CoTaskMemFree(path);
+				}
+				item->Release();
+			}
+		}
+		dlg->Release();
+	}
+
+	if (didInit)
+		CoUninitialize();
+	return result;
+}
+
+bool BrowseForIndicatorIconNative(HWND owner, std::wstring &out)
+{
+	bool didInit = false;
+	HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+	if (SUCCEEDED(hrInit))
+		didInit = true;
+
+	bool result = false;
+	IFileOpenDialog *dlg = nullptr;
+	HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
+	if (SUCCEEDED(hr) && dlg) {
+		COMDLG_FILTERSPEC filters[] = {
+			{L"Images (PNG, SVG, JPEG)", L"*.png;*.svg;*.jpeg;*.jpg"},
+			{L"PNG", L"*.png"},
+			{L"SVG", L"*.svg"},
+			{L"JPEG", L"*.jpeg;*.jpg"},
+			{L"All files", L"*.*"},
+		};
+		dlg->SetFileTypes(ARRAYSIZE(filters), filters);
+		dlg->SetFileTypeIndex(1);
+		dlg->SetTitle(overlay::util::ModuleTextW("Indicators.SelectIcon").c_str());
+		DWORD opts = 0;
+		dlg->GetOptions(&opts);
+		dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_FILEMUSTEXIST);
+		if (SUCCEEDED(dlg->Show(owner))) {
+			IShellItem *item = nullptr;
+			if (SUCCEEDED(dlg->GetResult(&item)) && item) {
+				PWSTR path = nullptr;
+				if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+					out = path;
+					result = true;
+					CoTaskMemFree(path);
+				}
+				item->Release();
+			}
+		}
+		dlg->Release();
+	}
+
+	if (didInit)
+		CoUninitialize();
+	return result;
+}
+
+bool PickIndicatorColorNative(HWND owner, int &rgb)
+{
+	static COLORREF customColors[16] = {};
+	CHOOSECOLOR cc = {};
+	cc.lStructSize = sizeof(cc);
+	cc.hwndOwner = owner;
+	cc.lpCustColors = customColors;
+	cc.rgbResult = RGB((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+	cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+	if (!ChooseColor(&cc))
+		return false;
+	rgb = ((GetRValue(cc.rgbResult) & 0xFF) << 16) | ((GetGValue(cc.rgbResult) & 0xFF) << 8) |
+	      (GetBValue(cc.rgbResult) & 0xFF);
+	return true;
+}
+
+std::wstring IndicatorIconFileNameOnly(const std::wstring &path)
+{
+	if (path.empty())
+		return path;
+	size_t pos = path.find_last_of(L"\\/");
+	if (pos == std::wstring::npos)
+		return path;
+	return path.substr(pos + 1);
+}
+
+std::wstring IndicatorIconExtension(const std::wstring &path)
+{
+	size_t dot = path.find_last_of(L'.');
+	size_t slash = path.find_last_of(L"\\/");
+	if (dot == std::wstring::npos || (slash != std::wstring::npos && dot < slash))
+		return L".png";
+	std::wstring ext = path.substr(dot);
+	for (wchar_t &c : ext)
+		c = static_cast<wchar_t>(towlower(c));
+	if (ext == L".png" || ext == L".svg" || ext == L".jpeg" || ext == L".jpg")
+		return ext;
+	return L".png";
+}
+
+bool EnsureIndicatorIconsConfigDir(std::wstring &outDirWide)
+{
+	char *dirUtf8 = obs_module_config_path("indicators");
+	if (!dirUtf8)
+		return false;
+	const int mk = os_mkdirs(dirUtf8);
+	outDirWide = overlay::util::Utf8ToWide(dirUtf8);
+	bfree(dirUtf8);
+	if (mk == MKDIR_ERROR)
+		return false;
+	if (!outDirWide.empty() && outDirWide.back() != L'\\' && outDirWide.back() != L'/')
+		outDirWide += L'\\';
+	return true;
+}
+
+void DeleteStoredIndicatorIcons(int slot)
+{
+	if (slot < 0 || slot >= 4)
+		return;
+	std::wstring dir;
+	if (!EnsureIndicatorIconsConfigDir(dir))
+		return;
+	static const wchar_t *const exts[] = {L".png", L".svg", L".jpeg", L".jpg"};
+	const std::wstring base = overlay::util::Utf8ToWide(kIndicatorSlotKeys[slot]);
+	for (const wchar_t *ext : exts) {
+		const std::wstring path = dir + base + ext;
+		DeleteFileW(path.c_str());
+	}
+}
+
+bool CopyIndicatorIconIntoConfig(int slot, const std::wstring &sourcePath, std::wstring &outStoredPath)
+{
+	if (slot < 0 || slot >= 4 || sourcePath.empty())
+		return false;
+
+	std::wstring dir;
+	if (!EnsureIndicatorIconsConfigDir(dir))
+		return false;
+
+	DeleteStoredIndicatorIcons(slot);
+
+	const std::wstring ext = IndicatorIconExtension(sourcePath);
+	const std::wstring dest = dir + overlay::util::Utf8ToWide(kIndicatorSlotKeys[slot]) + ext;
+	if (!CopyFileW(sourcePath.c_str(), dest.c_str(), FALSE)) {
+		obs_log(LOG_WARNING, "Failed to copy indicator icon for slot %d (err=%lu)", slot, GetLastError());
+		return false;
+	}
+	outStoredPath = dest;
+	return true;
+}
+
+bool EnsureIndicatorSoundsConfigDir(std::wstring &outDirWide)
+{
+	char *dirUtf8 = obs_module_config_path("indicator-sounds");
+	if (!dirUtf8)
+		return false;
+	const int mk = os_mkdirs(dirUtf8);
+	outDirWide = overlay::util::Utf8ToWide(dirUtf8);
+	bfree(dirUtf8);
+	if (mk == MKDIR_ERROR)
+		return false;
+	if (!outDirWide.empty() && outDirWide.back() != L'\\' && outDirWide.back() != L'/')
+		outDirWide += L'\\';
+	return true;
+}
+
+void DeleteStoredIndicatorSound(int eventIndex)
+{
+	if (eventIndex < 0 || eventIndex >= 5)
+		return;
+	std::wstring dir;
+	if (!EnsureIndicatorSoundsConfigDir(dir))
+		return;
+	const std::wstring path = dir + overlay::util::Utf8ToWide(kIndicatorSoundKeys[eventIndex]) + L".wav";
+	DeleteFileW(path.c_str());
+}
+
+bool CopyIndicatorSoundIntoConfig(int eventIndex, const std::wstring &sourcePath, std::wstring &outStoredPath)
+{
+	if (eventIndex < 0 || eventIndex >= 5 || sourcePath.empty())
+		return false;
+	std::wstring dir;
+	if (!EnsureIndicatorSoundsConfigDir(dir))
+		return false;
+	DeleteStoredIndicatorSound(eventIndex);
+	const std::wstring dest = dir + overlay::util::Utf8ToWide(kIndicatorSoundKeys[eventIndex]) + L".wav";
+	if (!CopyFileW(sourcePath.c_str(), dest.c_str(), FALSE)) {
+		obs_log(LOG_WARNING, "Failed to copy indicator sound for event %d (err=%lu)", eventIndex,
+			GetLastError());
+		return false;
+	}
+	outStoredPath = dest;
+	return true;
+}
+
+bool BrowseForIndicatorSoundNative(HWND owner, std::wstring &out)
+{
+	bool didInit = false;
+	HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+	if (SUCCEEDED(hrInit))
+		didInit = true;
+
+	bool result = false;
+	IFileOpenDialog *dlg = nullptr;
+	HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
+	if (SUCCEEDED(hr) && dlg) {
+		COMDLG_FILTERSPEC filters[] = {
+			{L"WAV audio", L"*.wav"},
+			{L"All files", L"*.*"},
+		};
+		dlg->SetFileTypes(ARRAYSIZE(filters), filters);
+		dlg->SetFileTypeIndex(1);
+		dlg->SetTitle(overlay::util::ModuleTextW("Indicators.SelectSound").c_str());
+		DWORD opts = 0;
+		dlg->GetOptions(&opts);
+		dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_FILEMUSTEXIST);
 		if (SUCCEEDED(dlg->Show(owner))) {
 			IShellItem *item = nullptr;
 			if (SUCCEEDED(dlg->GetResult(&item)) && item) {
@@ -2911,6 +3496,25 @@ void OverlayRenderer::LoadSettingsWorkingValues()
 	m_setIndicatorsEnabled = getBoolDef("indicators_enabled", true);
 	m_setIndicatorsPosition = ClampInt(getIntDef("indicators_position", 5), 0, 8);
 	m_setIndicatorsOled = getBoolDef("indicators_oled_protection", false);
+	m_setIndicatorsScale = ClampInt(getIntDef("indicators_scale", 100), 50, 300);
+	for (int i = 0; i < INDICATOR_SOUND_EVENT_COUNT; i++) {
+		std::string key = std::string("indicators_sound_") + kIndicatorSoundKeys[i];
+		if (d && obs_data_has_user_value(d, key.c_str()))
+			m_setIndicatorSoundPath[i] = overlay::util::Utf8ToWide(obs_data_get_string(d, key.c_str()));
+		else
+			m_setIndicatorSoundPath[i].clear();
+	}
+	for (int i = 0; i < INDICATOR_CUSTOM_SLOT_COUNT; i++) {
+		std::string iconKey = std::string("indicators_") + kIndicatorSlotKeys[i] + "_icon";
+		std::string tintKey = std::string("indicators_") + kIndicatorSlotKeys[i] + "_tint";
+		std::string colorKey = std::string("indicators_") + kIndicatorSlotKeys[i] + "_color";
+		if (d && obs_data_has_user_value(d, iconKey.c_str()))
+			m_setIndicatorIconPath[i] = overlay::util::Utf8ToWide(obs_data_get_string(d, iconKey.c_str()));
+		else
+			m_setIndicatorIconPath[i].clear();
+		m_setIndicatorTint[i] = getBoolDef(tintKey.c_str(), false);
+		m_setIndicatorColor[i] = getIntDef(colorKey.c_str(), 0xFFFFFF) & 0xFFFFFF;
+	}
 	m_setSmartReplay = getBoolDef("smart_replay", true);
 	m_setSmartReplayMode = ClampInt(getIntDef("smart_replay_mode", 0), 0, 1);
 	m_setGalleryInOverlay = getBoolDef("gallery_in_overlay", false);
@@ -2943,6 +3547,19 @@ void OverlayRenderer::PersistSettingsWorkingValues()
 	obs_data_set_bool(d, "indicators_enabled", m_setIndicatorsEnabled);
 	obs_data_set_int(d, "indicators_position", m_setIndicatorsPosition);
 	obs_data_set_bool(d, "indicators_oled_protection", m_setIndicatorsOled);
+	obs_data_set_int(d, "indicators_scale", m_setIndicatorsScale);
+	for (int i = 0; i < INDICATOR_SOUND_EVENT_COUNT; i++) {
+		std::string key = std::string("indicators_sound_") + kIndicatorSoundKeys[i];
+		obs_data_set_string(d, key.c_str(), overlay::util::WideToUtf8(m_setIndicatorSoundPath[i]).c_str());
+	}
+	for (int i = 0; i < INDICATOR_CUSTOM_SLOT_COUNT; i++) {
+		std::string iconKey = std::string("indicators_") + kIndicatorSlotKeys[i] + "_icon";
+		std::string tintKey = std::string("indicators_") + kIndicatorSlotKeys[i] + "_tint";
+		std::string colorKey = std::string("indicators_") + kIndicatorSlotKeys[i] + "_color";
+		obs_data_set_string(d, iconKey.c_str(), overlay::util::WideToUtf8(m_setIndicatorIconPath[i]).c_str());
+		obs_data_set_bool(d, tintKey.c_str(), m_setIndicatorTint[i]);
+		obs_data_set_int(d, colorKey.c_str(), m_setIndicatorColor[i] & 0xFFFFFF);
+	}
 	obs_data_set_bool(d, "smart_replay", m_setSmartReplay);
 	obs_data_set_int(d, "smart_replay_mode", m_setSmartReplayMode);
 	obs_data_set_bool(d, "gallery_in_overlay", m_setGalleryInOverlay);
@@ -2952,6 +3569,27 @@ void OverlayRenderer::PersistSettingsWorkingValues()
 		obs_data_set_int(d, (std::string(kSettingsHotkeyKeys[i]) + "_vk").c_str(), m_setHotkeyVk[i]);
 		obs_data_set_int(d, (std::string(kSettingsHotkeyKeys[i]) + "_mod").c_str(), m_setHotkeyMod[i]);
 	}
+	ApplyIndicatorCustoms();
+	ApplyIndicatorSounds();
+}
+
+void OverlayRenderer::ApplyIndicatorCustoms()
+{
+#ifdef ENABLE_QT
+	for (int i = 0; i < INDICATOR_CUSTOM_SLOT_COUNT; i++) {
+		overlay_runtime_set_indicator_custom(i, overlay::util::WideToUtf8(m_setIndicatorIconPath[i]).c_str(),
+						     m_setIndicatorTint[i], m_setIndicatorColor[i]);
+	}
+#endif
+}
+
+void OverlayRenderer::ApplyIndicatorSounds()
+{
+#ifdef ENABLE_QT
+	for (int i = 0; i < INDICATOR_SOUND_EVENT_COUNT; i++) {
+		overlay_runtime_set_indicator_sound(i, overlay::util::WideToUtf8(m_setIndicatorSoundPath[i]).c_str());
+	}
+#endif
 }
 
 void OverlayRenderer::OpenSettings()
@@ -3109,6 +3747,9 @@ void OverlayRenderer::RenderSettingsPanel()
 		break;
 	case SettingsPage::Indicators:
 		headerTitle = overlay::util::ModuleTextW("Indicators");
+		break;
+	case SettingsPage::Audio:
+		headerTitle = overlay::util::ModuleTextW("Tab.Audio");
 		break;
 	case SettingsPage::Replay:
 		headerTitle = overlay::util::ModuleTextW("Replay");
@@ -3280,6 +3921,7 @@ void OverlayRenderer::RenderSettingsPanel()
 	case SettingsPage::Categories:
 		categoryRow(overlay::util::ModuleTextW("Tab.General"), SettingsPage::General);
 		categoryRow(overlay::util::ModuleTextW("Indicators"), SettingsPage::Indicators);
+		categoryRow(overlay::util::ModuleTextW("Tab.Audio"), SettingsPage::Audio);
 		categoryRow(overlay::util::ModuleTextW("Replay"), SettingsPage::Replay);
 		categoryRow(overlay::util::ModuleTextW("Tab.Hotkeys"), SettingsPage::Hotkeys);
 		break;
@@ -3308,8 +3950,192 @@ void OverlayRenderer::RenderSettingsPanel()
 		stepperRow(overlay::util::ModuleTextW("Position.Label"),
 			   overlay::util::ModuleTextW(kSettingsPositionKeys[m_setIndicatorsPosition]),
 			   SettingsField::IndicatorsPosition);
+		stepperRow(overlay::util::ModuleTextW("Indicators.Scale"),
+			   std::to_wstring(m_setIndicatorsScale) + L"%", SettingsField::IndicatorsScale);
 		checkboxRow(overlay::util::ModuleTextW("Indicators.OledProtection"), m_setIndicatorsOled,
 			    SettingsField::IndicatorsOled);
+
+		{
+			const int previewSize = 32;
+			const int previewGap = 8;
+			const int h = 48;
+			RECT r = {contentLeft, y, contentRight, y + h};
+			DrawRoundedRectangle(r, 8.0f, kRowBg);
+			DrawRoundedRectangleBorder(r, 8.0f, 1.0f, kBorder);
+
+			const int iconsW = INDICATOR_CUSTOM_SLOT_COUNT * previewSize +
+					   (INDICATOR_CUSTOM_SLOT_COUNT - 1) * previewGap;
+			RECT lr = {r.left + 12, r.top, r.right - 12 - iconsW - 12, r.bottom};
+			RenderText(overlay::util::ModuleTextW("Indicators.Preview"), lr, 12.0f,
+				   DWRITE_FONT_WEIGHT_NORMAL, kWhite, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+			int px = r.right - 12 - iconsW;
+			const int py = r.top + (h - previewSize) / 2;
+			for (int slot = 0; slot < INDICATOR_CUSTOM_SLOT_COUNT; slot++) {
+				RECT preview = {px, py, px + previewSize, py + previewSize};
+				DrawIndicatorPreview(slot, preview);
+				px += previewSize + previewGap;
+			}
+			y += h + 14;
+		}
+
+		for (int slot = 0; slot < INDICATOR_CUSTOM_SLOT_COUNT; slot++) {
+			const int cardPad = 12;
+			const int previewSize = 40;
+			const int btnW = 90;
+			const int btnH = 26;
+			const int box = 22;
+			const int sw = 28;
+			const int innerGap = 10;
+			const int headerH = 44;
+			const int pathH = 52;
+			const int bottomH = 40;
+			const int cardH = cardPad + headerH + innerGap + pathH + innerGap + bottomH + cardPad;
+
+			RECT card = {contentLeft, y, contentRight, y + cardH};
+			DrawRoundedRectangle(card, 8.0f, kRowBg);
+			DrawRoundedRectangleBorder(card, 8.0f, 1.0f, kBorder);
+
+			const int innerLeft = card.left + cardPad;
+			const int innerRight = card.right - cardPad;
+			int cy = card.top + cardPad;
+
+			{
+				RECT header = {innerLeft, cy, innerRight, cy + headerH};
+				RECT preview = {header.right - previewSize, header.top + (headerH - previewSize) / 2,
+						header.right, header.top + (headerH - previewSize) / 2 + previewSize};
+				RECT title = {header.left, header.top, preview.left - 12, header.bottom};
+				RenderText(overlay::util::ModuleTextW(kIndicatorSlotLabelKeys[slot]), title, 13.0f,
+					   DWRITE_FONT_WEIGHT_SEMI_BOLD, kWhite, DWRITE_TEXT_ALIGNMENT_LEADING);
+				DrawIndicatorPreview(slot, preview);
+				cy += headerH + innerGap;
+			}
+
+			{
+				RECT block = {innerLeft, cy, innerRight, cy + pathH};
+				RECT label = {block.left, block.top, block.right, block.top + 20};
+				RenderText(overlay::util::ModuleTextW("Indicators.Icon"), label, 11.0f,
+					   DWRITE_FONT_WEIGHT_NORMAL, kDim, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+				const int by = block.bottom - btnH;
+				RECT clearBtn = {block.right - btnW, by, block.right, by + btnH};
+				RECT browse = {clearBtn.left - 8 - btnW, by, clearBtn.left - 8, by + btnH};
+				RECT pathRect = {block.left, by, browse.left - 8, by + btnH};
+				DrawRoundedRectangle(pathRect, 6.0f, kCtrlBg);
+				RECT pTextRect = {pathRect.left + 8, pathRect.top, pathRect.right - 8, pathRect.bottom};
+				const bool empty = m_setIndicatorIconPath[slot].empty();
+				std::wstring p =
+					empty ? overlay::util::ModuleTextW("Indicators.IconPlaceholder")
+					      : IndicatorIconFileNameOnly(m_setIndicatorIconPath[slot]);
+				RenderText(p, pTextRect, 11.0f, DWRITE_FONT_WEIGHT_NORMAL, empty ? kDim : kWhite,
+					   DWRITE_TEXT_ALIGNMENT_LEADING);
+
+				int browseIdx = static_cast<int>(m_settingsHits.size());
+				bool browseHover = (browseIdx == m_settingsHoverIndex);
+				DrawRoundedRectangle(browse, 6.0f, browseHover ? kRowHover : kCtrlBg);
+				DrawRoundedRectangleBorder(browse, 6.0f, 1.0f, kBorder);
+				RenderText(overlay::util::ModuleTextW("Indicators.Browse"), browse, 11.0f,
+					   DWRITE_FONT_WEIGHT_NORMAL, kAccent, DWRITE_TEXT_ALIGNMENT_CENTER);
+				m_settingsHits.push_back({browse, SettingsAction::BrowseIndicator, slot});
+
+				int clearIdx = static_cast<int>(m_settingsHits.size());
+				bool clearHover = (clearIdx == m_settingsHoverIndex);
+				DrawRoundedRectangle(clearBtn, 6.0f, clearHover ? kRowHover : kCtrlBg);
+				DrawRoundedRectangleBorder(clearBtn, 6.0f, 1.0f, kBorder);
+				RenderText(overlay::util::ModuleTextW("Indicators.Clear"), clearBtn, 11.0f,
+					   DWRITE_FONT_WEIGHT_NORMAL, kAccent, DWRITE_TEXT_ALIGNMENT_CENTER);
+				m_settingsHits.push_back({clearBtn, SettingsAction::ClearIndicator, slot});
+
+				cy += pathH + innerGap;
+			}
+
+			{
+				RECT row = {innerLeft, cy, innerRight, cy + bottomH};
+				const SettingsField tintField = static_cast<SettingsField>(
+					static_cast<int>(SettingsField::IndicatorsTint0) + slot);
+
+				RECT checkHit = {row.left, row.top, row.left + (row.right - row.left) / 2, row.bottom};
+				int checkIdx = static_cast<int>(m_settingsHits.size());
+				bool checkHover = (checkIdx == m_settingsHoverIndex);
+				if (checkHover)
+					DrawRoundedRectangle(checkHit, 6.0f, kRowHover);
+
+				RECT br = {checkHit.left, row.top + (bottomH - box) / 2, checkHit.left + box,
+					   row.top + (bottomH - box) / 2 + box};
+				DrawRoundedRectangle(br, 5.0f, m_setIndicatorTint[slot] ? kAccent : kCtrlBg);
+				DrawRoundedRectangleBorder(br, 5.0f, 1.0f, kBorder);
+				if (m_setIndicatorTint[slot]) {
+					RECT ck = {br.left + 5, br.top + 5, br.right - 5, br.bottom - 5};
+					DrawRoundedRectangle(ck, 3.0f, kWhite);
+				}
+				RECT tintLabel = {br.right + 10, row.top, checkHit.right - 8, row.bottom};
+				RenderText(overlay::util::ModuleTextW("Indicators.Recolor"), tintLabel, 12.0f,
+					   DWRITE_FONT_WEIGHT_NORMAL, kWhite, DWRITE_TEXT_ALIGNMENT_LEADING);
+				m_settingsHits.push_back(
+					{checkHit, SettingsAction::ToggleBool, static_cast<int>(tintField)});
+
+				RECT swatch = {row.right - sw, row.top + (bottomH - sw) / 2, row.right,
+					       row.top + (bottomH - sw) / 2 + sw};
+				RECT colorLabel = {checkHit.right + 8, row.top, swatch.left - 10, row.bottom};
+				RenderText(overlay::util::ModuleTextW("Indicators.Color"), colorLabel, 12.0f,
+					   DWRITE_FONT_WEIGHT_NORMAL, kWhite, DWRITE_TEXT_ALIGNMENT_TRAILING);
+
+				const int rgb = m_setIndicatorColor[slot];
+				D2D1_COLOR_F fill = D2D1::ColorF(((rgb >> 16) & 0xFF) / 255.0f,
+								 ((rgb >> 8) & 0xFF) / 255.0f, (rgb & 0xFF) / 255.0f,
+								 m_setIndicatorTint[slot] ? 1.0f : 0.45f);
+				int swatchIdx = static_cast<int>(m_settingsHits.size());
+				bool swatchHover = (swatchIdx == m_settingsHoverIndex);
+				DrawRoundedRectangle(swatch, 6.0f, fill);
+				DrawRoundedRectangleBorder(swatch, 6.0f, 1.0f, swatchHover ? kAccent : kBorder);
+				m_settingsHits.push_back({swatch, SettingsAction::PickIndicatorColor, slot});
+			}
+
+			y += cardH + 14;
+		}
+		break;
+	case SettingsPage::Audio:
+		for (int snd = 0; snd < INDICATOR_SOUND_EVENT_COUNT; snd++) {
+			const int h = 58;
+			RECT r = {contentLeft, y, contentRight, y + h};
+			DrawRoundedRectangle(r, 8.0f, kRowBg);
+			DrawRoundedRectangleBorder(r, 8.0f, 1.0f, kBorder);
+			RECT lr = {r.left + 12, r.top + 6, r.right - 12, r.top + 24};
+			RenderText(overlay::util::ModuleTextW(kIndicatorSoundLabelKeys[snd]), lr, 12.0f,
+				   DWRITE_FONT_WEIGHT_NORMAL, kWhite, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+			const int btnW = 90;
+			const int btnH = 26;
+			const int by = r.bottom - 8 - btnH;
+			RECT clearBtn = {r.right - 12 - btnW, by, r.right - 12, by + btnH};
+			RECT browse = {clearBtn.left - 8 - btnW, by, clearBtn.left - 8, by + btnH};
+			RECT pathRect = {r.left + 12, by, browse.left - 8, by + btnH};
+			DrawRoundedRectangle(pathRect, 6.0f, kCtrlBg);
+			RECT pTextRect = {pathRect.left + 8, pathRect.top, pathRect.right - 8, pathRect.bottom};
+			const bool empty = m_setIndicatorSoundPath[snd].empty();
+			std::wstring p = empty ? overlay::util::ModuleTextW("Indicators.SoundPlaceholder")
+					       : IndicatorIconFileNameOnly(m_setIndicatorSoundPath[snd]);
+			RenderText(p, pTextRect, 11.0f, DWRITE_FONT_WEIGHT_NORMAL, empty ? kDim : kWhite,
+				   DWRITE_TEXT_ALIGNMENT_LEADING);
+
+			int browseIdx = static_cast<int>(m_settingsHits.size());
+			bool browseHover = (browseIdx == m_settingsHoverIndex);
+			DrawRoundedRectangle(browse, 6.0f, browseHover ? kRowHover : kCtrlBg);
+			DrawRoundedRectangleBorder(browse, 6.0f, 1.0f, kBorder);
+			RenderText(overlay::util::ModuleTextW("Indicators.Browse"), browse, 11.0f,
+				   DWRITE_FONT_WEIGHT_NORMAL, kAccent, DWRITE_TEXT_ALIGNMENT_CENTER);
+			m_settingsHits.push_back({browse, SettingsAction::BrowseSound, snd});
+
+			int clearIdx = static_cast<int>(m_settingsHits.size());
+			bool clearHover = (clearIdx == m_settingsHoverIndex);
+			DrawRoundedRectangle(clearBtn, 6.0f, clearHover ? kRowHover : kCtrlBg);
+			DrawRoundedRectangleBorder(clearBtn, 6.0f, 1.0f, kBorder);
+			RenderText(overlay::util::ModuleTextW("Indicators.Clear"), clearBtn, 11.0f,
+				   DWRITE_FONT_WEIGHT_NORMAL, kAccent, DWRITE_TEXT_ALIGNMENT_CENTER);
+			m_settingsHits.push_back({clearBtn, SettingsAction::ClearSound, snd});
+
+			y += h + rowGap;
+		}
 		break;
 	case SettingsPage::Replay:
 		checkboxRow(overlay::util::ModuleTextW("SmartReplay"), m_setSmartReplay, SettingsField::SmartReplay);
@@ -3402,6 +4228,68 @@ void OverlayRenderer::HandleSettingsClick(int x, int y)
 		Render();
 		return;
 	}
+	case SettingsAction::BrowseIndicator: {
+		const int slot = hit.field;
+		if (slot < 0 || slot >= INDICATOR_CUSTOM_SLOT_COUNT)
+			return;
+		std::wstring picked;
+		if (BrowseForIndicatorIconNative(m_windowManager.GetHWND(), picked)) {
+			std::wstring stored;
+			if (CopyIndicatorIconIntoConfig(slot, picked, stored)) {
+				m_setIndicatorIconPath[slot] = stored;
+				PersistSettingsWorkingValues();
+			}
+		}
+		Render();
+		return;
+	}
+	case SettingsAction::ClearIndicator: {
+		const int slot = hit.field;
+		if (slot < 0 || slot >= INDICATOR_CUSTOM_SLOT_COUNT)
+			return;
+		DeleteStoredIndicatorIcons(slot);
+		m_setIndicatorIconPath[slot].clear();
+		PersistSettingsWorkingValues();
+		Render();
+		return;
+	}
+	case SettingsAction::BrowseSound: {
+		const int eventIndex = hit.field;
+		if (eventIndex < 0 || eventIndex >= INDICATOR_SOUND_EVENT_COUNT)
+			return;
+		std::wstring picked;
+		if (BrowseForIndicatorSoundNative(m_windowManager.GetHWND(), picked)) {
+			std::wstring stored;
+			if (CopyIndicatorSoundIntoConfig(eventIndex, picked, stored)) {
+				m_setIndicatorSoundPath[eventIndex] = stored;
+				PersistSettingsWorkingValues();
+			}
+		}
+		Render();
+		return;
+	}
+	case SettingsAction::ClearSound: {
+		const int eventIndex = hit.field;
+		if (eventIndex < 0 || eventIndex >= INDICATOR_SOUND_EVENT_COUNT)
+			return;
+		DeleteStoredIndicatorSound(eventIndex);
+		m_setIndicatorSoundPath[eventIndex].clear();
+		PersistSettingsWorkingValues();
+		Render();
+		return;
+	}
+	case SettingsAction::PickIndicatorColor: {
+		const int slot = hit.field;
+		if (slot < 0 || slot >= INDICATOR_CUSTOM_SLOT_COUNT)
+			return;
+		int rgb = m_setIndicatorColor[slot];
+		if (PickIndicatorColorNative(m_windowManager.GetHWND(), rgb)) {
+			m_setIndicatorColor[slot] = rgb & 0xFFFFFF;
+			PersistSettingsWorkingValues();
+		}
+		Render();
+		return;
+	}
 	case SettingsAction::HotkeyCapture:
 		m_settingsCapturingHotkeyIndex = hit.field;
 		// Grab the keyboard even when focus capture is off, so the bind can be
@@ -3418,16 +4306,26 @@ void OverlayRenderer::HandleSettingsClick(int x, int y)
 			m_setIndicatorsEnabled = !m_setIndicatorsEnabled;
 #ifdef ENABLE_QT
 			overlay_runtime_set_indicators(m_setIndicatorsEnabled, m_setIndicatorsPosition,
-						       m_setIndicatorsOled);
+						       m_setIndicatorsOled, m_setIndicatorsScale);
 #endif
 			break;
 		case SettingsField::IndicatorsOled:
 			m_setIndicatorsOled = !m_setIndicatorsOled;
 #ifdef ENABLE_QT
 			overlay_runtime_set_indicators(m_setIndicatorsEnabled, m_setIndicatorsPosition,
-						       m_setIndicatorsOled);
+						       m_setIndicatorsOled, m_setIndicatorsScale);
 #endif
 			break;
+		case SettingsField::IndicatorsTint0:
+		case SettingsField::IndicatorsTint1:
+		case SettingsField::IndicatorsTint2:
+		case SettingsField::IndicatorsTint3: {
+			const int slot = static_cast<int>(static_cast<SettingsField>(hit.field)) -
+					 static_cast<int>(SettingsField::IndicatorsTint0);
+			if (slot >= 0 && slot < INDICATOR_CUSTOM_SLOT_COUNT)
+				m_setIndicatorTint[slot] = !m_setIndicatorTint[slot];
+			break;
+		}
 		case SettingsField::SmartReplay:
 			m_setSmartReplay = !m_setSmartReplay;
 #ifdef ENABLE_QT
@@ -3473,7 +4371,14 @@ void OverlayRenderer::HandleSettingsClick(int x, int y)
 			m_setIndicatorsPosition = (m_setIndicatorsPosition + dir + 9) % 9;
 #ifdef ENABLE_QT
 			overlay_runtime_set_indicators(m_setIndicatorsEnabled, m_setIndicatorsPosition,
-						       m_setIndicatorsOled);
+						       m_setIndicatorsOled, m_setIndicatorsScale);
+#endif
+			break;
+		case SettingsField::IndicatorsScale:
+			m_setIndicatorsScale = ClampInt(m_setIndicatorsScale + dir * 10, 50, 300);
+#ifdef ENABLE_QT
+			overlay_runtime_set_indicators(m_setIndicatorsEnabled, m_setIndicatorsPosition,
+						       m_setIndicatorsOled, m_setIndicatorsScale);
 #endif
 			break;
 		case SettingsField::SmartReplayMode:

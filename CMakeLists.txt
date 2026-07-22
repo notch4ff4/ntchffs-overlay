@@ -78,6 +78,8 @@ if(WIN32)
     src/renderer/overlay-gallery.h
     src/common/overlay-string-utils.cpp
     src/common/overlay-string-utils.h
+    src/common/overlay-svg-rasterize.cpp
+    src/common/overlay-svg-rasterize.h
     src/common/overlay-ffmpeg-time-utils.h
     src/common/overlay-mp4-box-reader.cpp
     src/common/overlay-mp4-box-reader.h
@@ -106,6 +108,10 @@ if(WIN32)
     mf
     ole32
     winmm
+    comdlg32
+    shlwapi
+    d3d11
+    dxgi
   )
 endif()
 

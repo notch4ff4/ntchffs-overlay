@@ -233,13 +233,18 @@ private:
 	std::vector<std::wstring> m_exportTrackLabels;
 
 	// --- Settings panel state ---
-	enum class SettingsPage { Categories, General, Indicators, Replay, Hotkeys };
+	enum class SettingsPage { Categories, General, Indicators, Audio, Replay, Hotkeys };
 	enum class SettingsAction {
 		ToggleBool,
 		StepDown,
 		StepUp,
 		HotkeyCapture,
 		Browse,
+		BrowseIndicator,
+		ClearIndicator,
+		PickIndicatorColor,
+		BrowseSound,
+		ClearSound,
 		OpenCategory,
 		Back,
 		Close
@@ -249,6 +254,10 @@ private:
 		AutoHideEnabled,
 		IndicatorsEnabled,
 		IndicatorsOled,
+		IndicatorsTint0,
+		IndicatorsTint1,
+		IndicatorsTint2,
+		IndicatorsTint3,
 		SmartReplay,
 		SmartReplayMode,
 		GalleryInOverlay,
@@ -259,8 +268,11 @@ private:
 		Orientation,
 		Opacity,
 		AutoHideSeconds,
-		IndicatorsPosition
+		IndicatorsPosition,
+		IndicatorsScale
 	};
+	static const int INDICATOR_CUSTOM_SLOT_COUNT = 4;
+	static const int INDICATOR_SOUND_EVENT_COUNT = 5;
 	struct SettingsHit {
 		RECT rect;
 		SettingsAction action;
@@ -289,6 +301,33 @@ private:
 	bool m_setIndicatorsEnabled;
 	int m_setIndicatorsPosition;
 	bool m_setIndicatorsOled;
+	int m_setIndicatorsScale;
+	std::wstring m_setIndicatorSoundPath[INDICATOR_SOUND_EVENT_COUNT];
+	std::wstring m_setIndicatorIconPath[INDICATOR_CUSTOM_SLOT_COUNT];
+	bool m_setIndicatorTint[INDICATOR_CUSTOM_SLOT_COUNT];
+	int m_setIndicatorColor[INDICATOR_CUSTOM_SLOT_COUNT];
+	struct IndicatorPreviewCache {
+		std::wstring path;
+		bool tintEnabled = false;
+		int colorRgb = 0xFFFFFF;
+		ID2D1Bitmap *original = nullptr;
+		ID2D1Bitmap *tinted = nullptr;
+		std::vector<uint8_t> alpha;
+		UINT maskW = 0;
+		UINT maskH = 0;
+		bool loadAttempted = false;
+		bool loadFailed = false;
+	};
+	IndicatorPreviewCache m_indicatorPreview[INDICATOR_CUSTOM_SLOT_COUNT];
+	void ReleaseIndicatorPreviews();
+	void InvalidateIndicatorPreview(int slot);
+	bool EnsureIndicatorPreview(int slot);
+	bool LoadIndicatorPreviewRaster(int slot, const std::wstring &path);
+	bool LoadIndicatorPreviewSvg(int slot, const std::wstring &path);
+	bool CreateIndicatorPreviewFromPixels(int slot, UINT w, UINT h, const uint8_t *bgra, UINT stride);
+	void RebuildIndicatorPreviewTint(int slot);
+	void DrawIndicatorPreview(int slot, const RECT &rect);
+	void DrawBuiltinIndicatorPreview(int slot, const RECT &rect, D2D1_COLOR_F color);
 	bool m_setSmartReplay;
 	int m_setSmartReplayMode;
 	bool m_setGalleryInOverlay;
@@ -296,6 +335,9 @@ private:
 	std::wstring m_setExportPath;
 	int m_setHotkeyVk[7];
 	int m_setHotkeyMod[7];
+
+	void ApplyIndicatorCustoms();
+	void ApplyIndicatorSounds();
 
 	ID2D1PathGeometry *m_iconPlayGeometry;
 

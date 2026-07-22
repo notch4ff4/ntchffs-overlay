@@ -19,6 +19,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <obs-module.h>
 #include <plugin-support.h>
 #include <util/platform.h>
+#include <string>
 #include "overlay-settings-storage.h"
 
 #ifdef ENABLE_FRONTEND_API
@@ -246,13 +247,28 @@ static void load_hotkeys_from_saved_data(void)
 
 #ifdef ENABLE_QT
 // --- Runtime apply bridge (used by the in-overlay settings panel) ---
-extern "C" void overlay_runtime_set_indicators(bool enabled, int position, bool oledProtection)
+extern "C" void overlay_runtime_set_indicators(bool enabled, int position, bool oledProtection, int scalePercent)
 {
 	if (!overlay_indicators)
 		return;
 	overlay_indicators_set_enabled(overlay_indicators, enabled);
 	overlay_indicators_set_position(overlay_indicators, position);
 	overlay_indicators_set_oled_protection(overlay_indicators, oledProtection);
+	overlay_indicators_set_scale(overlay_indicators, scalePercent);
+}
+
+extern "C" void overlay_runtime_set_indicator_custom(int slot, const char *pathUtf8, bool tintEnabled, int colorRgb)
+{
+	if (!overlay_indicators)
+		return;
+	overlay_indicators_set_custom(overlay_indicators, slot, pathUtf8, tintEnabled, colorRgb);
+}
+
+extern "C" void overlay_runtime_set_indicator_sound(int eventIndex, const char *pathUtf8)
+{
+	if (!overlay_indicators)
+		return;
+	overlay_indicators_set_sound(overlay_indicators, eventIndex, pathUtf8);
 }
 
 extern "C" void overlay_runtime_set_smart_replay(bool enabled)
@@ -311,10 +327,52 @@ static void frontend_event_callback(enum obs_frontend_event event, void *priv_da
 							? obs_data_get_bool(saved_settings_data,
 									    "indicators_oled_protection")
 							: false;
+					int indicators_scale =
+						obs_data_has_user_value(saved_settings_data, "indicators_scale")
+							? (int)obs_data_get_int(saved_settings_data, "indicators_scale")
+							: 100;
+					if (indicators_scale < 50 || indicators_scale > 300)
+						indicators_scale = 100;
 					overlay_indicators_set_enabled(overlay_indicators, indicators_enabled);
 					overlay_indicators_set_position(overlay_indicators, indicators_position);
 					overlay_indicators_set_oled_protection(overlay_indicators,
 									       indicators_oled_protection);
+					overlay_indicators_set_scale(overlay_indicators, indicators_scale);
+					static const char *kSlots[] = {"recording", "replay", "saving", "saved"};
+					for (int i = 0; i < 4; i++) {
+						std::string iconKey = std::string("indicators_") + kSlots[i] + "_icon";
+						std::string tintKey = std::string("indicators_") + kSlots[i] + "_tint";
+						std::string colorKey =
+							std::string("indicators_") + kSlots[i] + "_color";
+						const char *path = obs_data_has_user_value(saved_settings_data,
+											  iconKey.c_str())
+									   ? obs_data_get_string(saved_settings_data,
+												 iconKey.c_str())
+									   : "";
+						bool tint =
+							obs_data_has_user_value(saved_settings_data, tintKey.c_str())
+								? obs_data_get_bool(saved_settings_data,
+										    tintKey.c_str())
+								: false;
+						int color =
+							obs_data_has_user_value(saved_settings_data, colorKey.c_str())
+								? (int)obs_data_get_int(saved_settings_data,
+											colorKey.c_str())
+								: 0xFFFFFF;
+						overlay_indicators_set_custom(overlay_indicators, i, path, tint, color);
+					}
+					static const char *kSoundKeys[] = {
+						"recording_on", "recording_off", "replay_on", "replay_off",
+						"replay_saved"};
+					for (int i = 0; i < 5; i++) {
+						std::string key =
+							std::string("indicators_sound_") + kSoundKeys[i];
+						const char *spath =
+							obs_data_has_user_value(saved_settings_data, key.c_str())
+								? obs_data_get_string(saved_settings_data, key.c_str())
+								: "";
+						overlay_indicators_set_sound(overlay_indicators, i, spath);
+					}
 				} else {
 					overlay_indicators_set_enabled(overlay_indicators, true);
 					overlay_indicators_set_position(overlay_indicators, 5);
