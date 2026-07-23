@@ -138,6 +138,9 @@ OverlayRenderer::OverlayRenderer()
 	  m_timelineDragging(false),
 	  m_suppressNextGalleryClick(false),
 	  m_overlayBackgroundAlpha(0.88f),
+	  m_overlayScalePercent(100),
+	  m_textScalePercent(100),
+	  m_accentColorRgb(0xA882FF),
 	  m_captureFocus(true),
 	  m_dimContentOffset{0, 0},
 	  m_galleryContentWidth(0),
@@ -192,6 +195,9 @@ OverlayRenderer::OverlayRenderer()
 	m_setMargin = 20;
 	m_setOrientation = 0;
 	m_setOpacityPct = 88;
+	m_setOverlayScale = 100;
+	m_setTextScale = 100;
+	m_setAccentColor = 0xA882FF;
 	m_setAutoHideEnabled = false;
 	m_setAutoHideSeconds = 5;
 	m_setIndicatorsEnabled = true;
@@ -335,6 +341,19 @@ bool OverlayRenderer::Initialize(HINSTANCE hInstance)
 			if (a >= 0.5 && a <= 1.0)
 				m_overlayBackgroundAlpha = static_cast<float>(a);
 		}
+		if (obs_data_has_user_value(saved_settings_data, "overlay_scale")) {
+			int scale = static_cast<int>(obs_data_get_int(saved_settings_data, "overlay_scale"));
+			m_overlayScalePercent = ClampInt(scale, 50, 300);
+		}
+		if (obs_data_has_user_value(saved_settings_data, "overlay_text_scale")) {
+			int textScale = static_cast<int>(obs_data_get_int(saved_settings_data, "overlay_text_scale"));
+			m_textScalePercent = ClampInt(textScale, 50, 300);
+		}
+		if (obs_data_has_user_value(saved_settings_data, "overlay_accent_color")) {
+			m_accentColorRgb = static_cast<int>(obs_data_get_int(saved_settings_data, "overlay_accent_color")) &
+					   0xFFFFFF;
+		}
+		ApplyAccentBrushes();
 	}
 
 	m_windowManager.SetClickHandler(
@@ -505,15 +524,14 @@ void OverlayRenderer::CreateDeviceResources()
 		return;
 	}
 
-	// Theme: bg #141419, accent #a882ff, border #3a3a45
-	// Theme colors for overlay UI.
+	// Theme: bg #141419, accent (user-selectable), border #3a3a45
 	D2D1_COLOR_F bgColor = D2D1::ColorF(20.0f / 255.0f, 20.0f / 255.0f, 25.0f / 255.0f, 1.0f);
 	target->CreateSolidColorBrush(bgColor, &m_backgroundBrush);
 
 	D2D1_COLOR_F textColor = D2D1::ColorF(1.0f, 1.0f, 1.0f);
 	target->CreateSolidColorBrush(textColor, &m_textBrush);
 
-	D2D1_COLOR_F activeColor = D2D1::ColorF(168.0f / 255.0f, 130.0f / 255.0f, 255.0f / 255.0f, 1.0f);
+	D2D1_COLOR_F activeColor = AccentColor();
 	target->CreateSolidColorBrush(activeColor, &m_activeBrush);
 
 	D2D1_COLOR_F borderColor = D2D1::ColorF(58.0f / 255.0f, 58.0f / 255.0f, 69.0f / 255.0f, 1.0f);
@@ -729,7 +747,8 @@ void OverlayRenderer::ApplyPosition()
 
 void OverlayRenderer::ApplyWindowGeometry()
 {
-	m_layoutManager.CalculateLayout(m_position, m_margin, m_orientation, m_state.statsVisible, m_layout);
+	m_layoutManager.CalculateLayout(m_position, m_margin, m_orientation, m_state.statsVisible,
+					m_overlayScalePercent, m_layout);
 
 	if (IsDimmingActive()) {
 		POINT normalPos = m_layoutManager.CalculateWindowPosition(m_position, m_margin, m_layout);
@@ -963,8 +982,8 @@ void OverlayRenderer::RenderSettingsContainer()
 	if (m_layout.settingsRect.right <= 0) {
 		return;
 	}
-	const D2D1_COLOR_F hoverColor = D2D1::ColorF(0.48f, 0.42f, 0.65f);
-	const D2D1_COLOR_F hoverBgColor = D2D1::ColorF(0.48f, 0.42f, 0.65f, 0.35f);
+	const D2D1_COLOR_F hoverColor = AccentHover();
+	const D2D1_COLOR_F hoverBgColor = AccentHover(0.35f);
 
 	DrawRoundedRectangle(m_layout.settingsRect, 10.0f,
 			     D2D1::ColorF(20.0f / 255.0f, 20.0f / 255.0f, 25.0f / 255.0f, 1.0f));
@@ -1007,34 +1026,33 @@ void OverlayRenderer::RenderStatsContainer()
 	DrawRoundedRectangleBorder(m_layout.statsRect, 12.0f, 1.0f,
 				   D2D1::ColorF(58.0f / 255.0f, 58.0f / 255.0f, 69.0f / 255.0f, 1.0f));
 
-	int padding = 10;
-	int lineHeight = 16;
-	int startY = m_layout.statsRect.top + 8;
+	int padding = UiPx(10);
+	int lineHeight = UiPx(16);
+	int startY = m_layout.statsRect.top + UiPx(8);
 
 	RECT titleRect = {m_layout.statsRect.left + padding, startY, m_layout.statsRect.right - padding,
 			  startY + lineHeight};
-	RenderText(overlay::util::ModuleTextW("Stats"), titleRect, 12.0f, DWRITE_FONT_WEIGHT_BOLD,
-		   D2D1::ColorF(168.0f / 255.0f, 130.0f / 255.0f, 255.0f / 255.0f, 1.0f),
-		   DWRITE_TEXT_ALIGNMENT_LEADING);
+	RenderText(overlay::util::ModuleTextW("Stats"), titleRect, 12.0f * FontScale(), DWRITE_FONT_WEIGHT_BOLD,
+		   AccentColor(), DWRITE_TEXT_ALIGNMENT_LEADING);
 
 	std::wostringstream fpsText;
 	fpsText << overlay::util::ModuleTextW("Stats.Fps") << L" " << std::fixed << std::setprecision(1) << m_state.fps;
-	RECT fpsRect = {m_layout.statsRect.left + padding, startY + lineHeight + 4, m_layout.statsRect.right - padding,
-			startY + lineHeight * 2 + 4};
-	RenderText(fpsText.str(), fpsRect, 11.0f, DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(1.0f, 1.0f, 1.0f),
+	RECT fpsRect = {m_layout.statsRect.left + padding, startY + lineHeight + UiPx(4),
+			m_layout.statsRect.right - padding, startY + lineHeight * 2 + UiPx(4)};
+	RenderText(fpsText.str(), fpsRect, 11.0f * FontScale(), DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(1.0f, 1.0f, 1.0f),
 		   DWRITE_TEXT_ALIGNMENT_LEADING);
 
 	std::wostringstream droppedText;
 	droppedText << overlay::util::ModuleTextW("Stats.Dropped") << L" " << m_state.droppedFrames;
-	RECT droppedRect = {m_layout.statsRect.left + padding, startY + lineHeight * 2 + 8,
-			    m_layout.statsRect.right - padding, startY + lineHeight * 3 + 8};
-	RenderText(droppedText.str(), droppedRect, 11.0f, DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(1.0f, 1.0f, 1.0f),
-		   DWRITE_TEXT_ALIGNMENT_LEADING);
+	RECT droppedRect = {m_layout.statsRect.left + padding, startY + lineHeight * 2 + UiPx(8),
+			    m_layout.statsRect.right - padding, startY + lineHeight * 3 + UiPx(8)};
+	RenderText(droppedText.str(), droppedRect, 11.0f * FontScale(), DWRITE_FONT_WEIGHT_NORMAL,
+		   D2D1::ColorF(1.0f, 1.0f, 1.0f), DWRITE_TEXT_ALIGNMENT_LEADING);
 
 	std::wstring freeSpaceW = overlay::util::Utf8ToWide(m_state.freeSpaceText);
-	RECT freeRect = {m_layout.statsRect.left + padding, startY + lineHeight * 3 + 12,
-			 m_layout.statsRect.right - padding, startY + lineHeight * 4 + 12};
-	RenderText(freeSpaceW, freeRect, 11.0f, DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(1.0f, 1.0f, 1.0f),
+	RECT freeRect = {m_layout.statsRect.left + padding, startY + lineHeight * 3 + UiPx(12),
+			 m_layout.statsRect.right - padding, startY + lineHeight * 4 + UiPx(12)};
+	RenderText(freeSpaceW, freeRect, 11.0f * FontScale(), DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(1.0f, 1.0f, 1.0f),
 		   DWRITE_TEXT_ALIGNMENT_LEADING);
 }
 
@@ -1042,11 +1060,11 @@ void OverlayRenderer::RenderPanels()
 {
 	RECT recRect = m_layout.recordingPanelRect;
 	const bool hoverRecording = (m_hoverTarget == HoverTarget::RecordingPanel);
-	const D2D1_COLOR_F hoverColor = D2D1::ColorF(0.48f, 0.42f, 0.65f);
+	const D2D1_COLOR_F hoverColor = AccentHover();
 
 	float centerX = (recRect.left + recRect.right) / 2.0f;
-	float centerY = recRect.top + 30.0f;
-	float radius = 18.0f;
+	float centerY = recRect.top + 30.0f * UiScale();
+	float radius = 18.0f * UiScale();
 
 	D2D1_ELLIPSE ellipse = D2D1::Ellipse(D2D1::Point2F(centerX, centerY), radius, radius);
 
@@ -1059,61 +1077,67 @@ void OverlayRenderer::RenderPanels()
 		target->FillEllipse(ellipse, m_textBrush);
 	}
 
-	RECT statusRect = {recRect.left, (int)(centerY + radius + 10), recRect.right, recRect.bottom};
+	RECT statusRect = {recRect.left, (int)(centerY + radius + 10.0f * UiScale()), recRect.right, recRect.bottom};
 	std::wstring statusText = m_state.recordingActive ? overlay::util::ModuleTextW("Recording")
 							  : overlay::util::ModuleTextW("NotRecording");
 	D2D1_COLOR_F statusColor = (m_state.recordingActive || hoverRecording)
-					   ? (m_state.recordingActive ? D2D1::ColorF(168.0f / 255.0f, 130.0f / 255.0f,
-										     255.0f / 255.0f, 1.0f)
-								      : hoverColor)
+					   ? (m_state.recordingActive ? AccentColor() : hoverColor)
 					   : D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f);
-	RenderText(statusText, statusRect, 13.0f, DWRITE_FONT_WEIGHT_NORMAL, statusColor);
+	RenderText(statusText, statusRect, 13.0f * FontScale(), DWRITE_FONT_WEIGHT_NORMAL, statusColor);
 
 	if (m_state.recordingActive || hoverRecording) {
-		RECT borderRect = {recRect.left - 3, recRect.top - 3, recRect.right + 3, recRect.bottom + 3};
-		DrawRoundedRectangleBorder(borderRect, 10.0f, 3.0f,
-					   D2D1::ColorF(168.0f / 255.0f, 130.0f / 255.0f, 255.0f / 255.0f, 1.0f));
+		const int borderPad = UiPx(3);
+		RECT borderRect = {recRect.left - borderPad, recRect.top - borderPad, recRect.right + borderPad,
+				   recRect.bottom + borderPad};
+		DrawRoundedRectangleBorder(borderRect, 10.0f * UiScale(), 3.0f * UiScale(), AccentColor());
 	}
 
 	RECT repRect = m_layout.replayPanelRect;
 	const bool hoverReplay = (m_hoverTarget == HoverTarget::ReplayPanel);
-	const D2D1_COLOR_F hoverReplayColor = D2D1::ColorF(0.48f, 0.42f, 0.65f);
+	const D2D1_COLOR_F hoverReplayColor = AccentHover();
 
 	if (m_state.replayActive) {
-		RECT borderRect = {repRect.left - 3, repRect.top - 3, repRect.right + 3, repRect.bottom + 3};
-		DrawRoundedRectangleBorder(borderRect, 10.0f, 3.0f,
-					   D2D1::ColorF(168.0f / 255.0f, 130.0f / 255.0f, 255.0f / 255.0f, 1.0f));
+		const int borderPad = UiPx(3);
+		RECT borderRect = {repRect.left - borderPad, repRect.top - borderPad, repRect.right + borderPad,
+				   repRect.bottom + borderPad};
+		DrawRoundedRectangleBorder(borderRect, 10.0f * UiScale(), 3.0f * UiScale(), AccentColor());
 
 		int halfHeight = (repRect.bottom - repRect.top) / 2;
-		RECT upperRect = {repRect.left + 5, repRect.top + 5, repRect.right - 5, repRect.top + halfHeight - 5};
-		RECT lowerRect = {repRect.left + 5, repRect.top + halfHeight + 5, repRect.right - 5,
-				  repRect.bottom - 5};
+		const int inset = UiPx(5);
+		RECT upperRect = {repRect.left + inset, repRect.top + inset, repRect.right - inset,
+				  repRect.top + halfHeight - inset};
+		RECT lowerRect = {repRect.left + inset, repRect.top + halfHeight + inset, repRect.right - inset,
+				  repRect.bottom - inset};
 
-		RenderText(overlay::util::ModuleTextW("Replay.TurnOff"), upperRect, 11.0f, DWRITE_FONT_WEIGHT_NORMAL,
-			   D2D1::ColorF(168.0f / 255.0f, 130.0f / 255.0f, 255.0f / 255.0f, 1.0f));
+		RenderText(overlay::util::ModuleTextW("Replay.TurnOff"), upperRect, 11.0f * FontScale(),
+			   DWRITE_FONT_WEIGHT_NORMAL, AccentColor());
 
 		ID2D1RenderTarget *target = m_bitmapRenderTarget ? m_bitmapRenderTarget : m_renderTarget;
-		D2D1_POINT_2F lineStart = D2D1::Point2F((float)(repRect.left + 5), (float)(repRect.top + halfHeight));
-		D2D1_POINT_2F lineEnd = D2D1::Point2F((float)(repRect.right - 5), (float)(repRect.top + halfHeight));
-		target->DrawLine(lineStart, lineEnd, m_activeBrush, 1.0f);
+		D2D1_POINT_2F lineStart =
+			D2D1::Point2F((float)(repRect.left + inset), (float)(repRect.top + halfHeight));
+		D2D1_POINT_2F lineEnd =
+			D2D1::Point2F((float)(repRect.right - inset), (float)(repRect.top + halfHeight));
+		target->DrawLine(lineStart, lineEnd, m_activeBrush, 1.0f * UiScale());
 
 		if (m_state.replaySaving) {
-			RenderText(overlay::util::ModuleTextW("Saving"), lowerRect, 11.0f, DWRITE_FONT_WEIGHT_NORMAL,
-				   D2D1::ColorF(0.6f, 0.6f, 0.6f, 1.0f));
+			RenderText(overlay::util::ModuleTextW("Saving"), lowerRect, 11.0f * FontScale(),
+				   DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(0.6f, 0.6f, 0.6f, 1.0f));
 		} else {
-			RenderText(overlay::util::ModuleTextW("Save"), lowerRect, 11.0f, DWRITE_FONT_WEIGHT_NORMAL,
-				   D2D1::ColorF(168.0f / 255.0f, 130.0f / 255.0f, 255.0f / 255.0f, 1.0f));
+			RenderText(overlay::util::ModuleTextW("Save"), lowerRect, 11.0f * FontScale(),
+				   DWRITE_FONT_WEIGHT_NORMAL, AccentColor());
 		}
 	} else {
 		float centerX = (repRect.left + repRect.right) / 2.0f;
-		float centerY = repRect.top + 30.0f;
+		float centerY = repRect.top + 30.0f * UiScale();
 		std::wstring replayIcon = L"⟲";
-		RECT iconRect = {(int)(centerX - 20), (int)(centerY - 20), (int)(centerX + 20), (int)(centerY + 20)};
-		RenderText(replayIcon, iconRect, 36.0f, DWRITE_FONT_WEIGHT_NORMAL,
+		const int iconHalf = UiPx(20);
+		RECT iconRect = {(int)(centerX - iconHalf), (int)(centerY - iconHalf), (int)(centerX + iconHalf),
+				 (int)(centerY + iconHalf)};
+		RenderText(replayIcon, iconRect, 36.0f * FontScale(), DWRITE_FONT_WEIGHT_NORMAL,
 			   hoverReplay ? hoverReplayColor : D2D1::ColorF(1.0f, 1.0f, 1.0f));
 
-		RECT statusRect = {repRect.left, (int)(centerY + 20), repRect.right, repRect.bottom};
-		RenderText(overlay::util::ModuleTextW("Off"), statusRect, 13.0f, DWRITE_FONT_WEIGHT_NORMAL,
+		RECT statusRect = {repRect.left, (int)(centerY + 20.0f * UiScale()), repRect.right, repRect.bottom};
+		RenderText(overlay::util::ModuleTextW("Off"), statusRect, 13.0f * FontScale(), DWRITE_FONT_WEIGHT_NORMAL,
 			   hoverReplay ? hoverReplayColor : D2D1::ColorF(1.0f, 1.0f, 1.0f));
 	}
 }
@@ -1123,15 +1147,16 @@ void OverlayRenderer::RenderButtons()
 	RECT folderRect = m_layout.recordFolderButtonRect;
 	const bool galleryAvailable = m_state.recordingPathConfigured;
 	const bool hoverFolder = galleryAvailable && (m_hoverTarget == HoverTarget::RecordFolderButton);
-	const D2D1_COLOR_F hoverColor = D2D1::ColorF(0.48f, 0.42f, 0.65f);
+	const D2D1_COLOR_F hoverColor = AccentHover();
 	const D2D1_COLOR_F disabledColor = D2D1::ColorF(0.45f, 0.45f, 0.45f, 1.0f);
 	const D2D1_COLOR_F folderColor =
 		!galleryAvailable ? disabledColor : (hoverFolder ? hoverColor : D2D1::ColorF(1.0f, 1.0f, 1.0f));
-	RenderText(overlay::util::ModuleTextW("Gallery"), folderRect, 10.0f, DWRITE_FONT_WEIGHT_NORMAL, folderColor);
+	RenderText(overlay::util::ModuleTextW("Gallery"), folderRect, 10.0f * FontScale(), DWRITE_FONT_WEIGHT_NORMAL,
+		   folderColor);
 
 	RECT obsRect = m_layout.showOBSButtonRect;
 	const bool hoverShowObs = (m_hoverTarget == HoverTarget::ShowOBSButton);
-	RenderText(overlay::util::ModuleTextW("ShowObs"), obsRect, 10.0f, DWRITE_FONT_WEIGHT_NORMAL,
+	RenderText(overlay::util::ModuleTextW("ShowObs"), obsRect, 10.0f * FontScale(), DWRITE_FONT_WEIGHT_NORMAL,
 		   hoverShowObs ? hoverColor : D2D1::ColorF(1.0f, 1.0f, 1.0f));
 }
 
@@ -1177,7 +1202,9 @@ void OverlayRenderer::RenderText(const std::wstring &text, const RECT &rect, flo
 	}
 
 	ID2D1SolidColorBrush *brush = nullptr;
-	if (color.r > 0.6f && color.g < 0.6f && color.b > 0.6f) {
+	const D2D1_COLOR_F accent = AccentColor();
+	if (std::fabs(color.r - accent.r) < 0.02f && std::fabs(color.g - accent.g) < 0.02f &&
+	    std::fabs(color.b - accent.b) < 0.02f && color.a > 0.9f) {
 		brush = m_activeBrush;
 	} else {
 		brush = m_textBrush;
@@ -2083,6 +2110,147 @@ void OverlayRenderer::SetOverlayBackgroundAlpha(float alpha)
 	}
 }
 
+void OverlayRenderer::SetOverlayScalePercent(int scalePercent)
+{
+	m_overlayScalePercent = ClampInt(scalePercent, 50, 300);
+	if (IsVisible())
+		ApplyPosition();
+}
+
+void OverlayRenderer::SetAccentColorRgb(int rgb)
+{
+	m_accentColorRgb = rgb & 0xFFFFFF;
+	ApplyAccentBrushes();
+}
+
+float OverlayRenderer::UiScale() const
+{
+	return m_overlayScalePercent / 100.0f;
+}
+
+float OverlayRenderer::FontScale() const
+{
+	return UiScale() * (m_textScalePercent / 100.0f);
+}
+
+int OverlayRenderer::UiPx(int value) const
+{
+	return static_cast<int>(value * UiScale() + (value >= 0 ? 0.5f : -0.5f));
+}
+
+D2D1_COLOR_F OverlayRenderer::ColorFromRgb(int rgb, float alpha)
+{
+	return D2D1::ColorF(((rgb >> 16) & 0xFF) / 255.0f, ((rgb >> 8) & 0xFF) / 255.0f, (rgb & 0xFF) / 255.0f, alpha);
+}
+
+namespace {
+
+void RgbToHsl(float r, float g, float b, float &h, float &s, float &l)
+{
+	const float maxc = std::max(r, std::max(g, b));
+	const float minc = std::min(r, std::min(g, b));
+	l = (maxc + minc) * 0.5f;
+	if (maxc == minc) {
+		h = 0.0f;
+		s = 0.0f;
+		return;
+	}
+	const float d = maxc - minc;
+	s = l > 0.5f ? d / (2.0f - maxc - minc) : d / (maxc + minc);
+	if (maxc == r)
+		h = (g - b) / d + (g < b ? 6.0f : 0.0f);
+	else if (maxc == g)
+		h = (b - r) / d + 2.0f;
+	else
+		h = (r - g) / d + 4.0f;
+	h /= 6.0f;
+}
+
+float HueToRgb(float p, float q, float t)
+{
+	if (t < 0.0f)
+		t += 1.0f;
+	if (t > 1.0f)
+		t -= 1.0f;
+	if (t < 1.0f / 6.0f)
+		return p + (q - p) * 6.0f * t;
+	if (t < 1.0f / 2.0f)
+		return q;
+	if (t < 2.0f / 3.0f)
+		return p + (q - p) * (2.0f / 3.0f - t) * 6.0f;
+	return p;
+}
+
+void HslToRgb(float h, float s, float l, float &r, float &g, float &b)
+{
+	if (s <= 0.0001f) {
+		r = g = b = l;
+		return;
+	}
+	const float q = l < 0.5f ? l * (1.0f + s) : l + s - l * s;
+	const float p = 2.0f * l - q;
+	r = HueToRgb(p, q, h + 1.0f / 3.0f);
+	g = HueToRgb(p, q, h);
+	b = HueToRgb(p, q, h - 1.0f / 3.0f);
+}
+
+D2D1_COLOR_F DeriveAccentShade(int rgb, float satMul, float lightMul, float alpha)
+{
+	float r = ((rgb >> 16) & 0xFF) / 255.0f;
+	float g = ((rgb >> 8) & 0xFF) / 255.0f;
+	float b = (rgb & 0xFF) / 255.0f;
+	float h, s, l;
+	RgbToHsl(r, g, b, h, s, l);
+	s = std::max(0.0f, std::min(1.0f, s * satMul));
+	l = std::max(0.0f, std::min(1.0f, l * lightMul));
+	HslToRgb(h, s, l, r, g, b);
+	return D2D1::ColorF(r, g, b, alpha);
+}
+
+} // namespace
+
+D2D1_COLOR_F OverlayRenderer::AccentColor(float alpha) const
+{
+	return ColorFromRgb(m_accentColorRgb, alpha);
+}
+
+D2D1_COLOR_F OverlayRenderer::AccentSoft() const
+{
+	return AccentColor(0.55f);
+}
+
+D2D1_COLOR_F OverlayRenderer::AccentMuted() const
+{
+	// Matches the previous hardcoded muted purple (~130,110,200) relative to #a882ff.
+	return DeriveAccentShade(m_accentColorRgb, 0.85f, 0.78f, 1.0f);
+}
+
+D2D1_COLOR_F OverlayRenderer::AccentHover(float alpha) const
+{
+	return DeriveAccentShade(m_accentColorRgb, 0.55f, 0.72f, alpha);
+}
+
+D2D1_COLOR_F OverlayRenderer::AccentSelected(float alpha) const
+{
+	// Dark accent fill for selected rows / primary buttons (~70,55–60,110–120).
+	return DeriveAccentShade(m_accentColorRgb, 0.70f, 0.33f, alpha);
+}
+
+D2D1_COLOR_F OverlayRenderer::AccentPanel(float alpha) const
+{
+	// Subtle accent-tinted panel background (~35,32,50).
+	return DeriveAccentShade(m_accentColorRgb, 0.45f, 0.15f, alpha);
+}
+
+void OverlayRenderer::ApplyAccentBrushes()
+{
+	const D2D1_COLOR_F accent = AccentColor();
+	if (m_activeBrush)
+		m_activeBrush->SetColor(accent);
+	if (m_statsTitleBrush)
+		m_statsTitleBrush->SetColor(accent);
+}
+
 void OverlayRenderer::UpdateAutoHide()
 {
 	if (!m_autoHideEnabled)
@@ -2575,8 +2743,8 @@ void OverlayRenderer::RenderGallery()
 		   13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, D2D1::ColorF(0.93f, 0.95f, 1.0f), DWRITE_TEXT_ALIGNMENT_LEADING);
 	// Header controls
 	const D2D1_COLOR_F headerIconColor = D2D1::ColorF(0.85f, 0.85f, 0.9f);
-	const D2D1_COLOR_F hoverColor = D2D1::ColorF(0.48f, 0.42f, 0.65f);
-	const D2D1_COLOR_F hoverBgColor = D2D1::ColorF(0.48f, 0.42f, 0.65f, 0.25f);
+	const D2D1_COLOR_F hoverColor = AccentHover();
+	const D2D1_COLOR_F hoverBgColor = AccentHover(0.25f);
 
 	const bool hoverFs = (m_hoverTarget == HoverTarget::GalleryFullscreen);
 	const bool hoverBack = (m_hoverTarget == HoverTarget::GalleryBack);
@@ -2742,8 +2910,7 @@ void OverlayRenderer::RenderGallery()
 		int trimLeft = left + static_cast<int>(trackWidth * startRatio);
 		int trimRight = left + static_cast<int>(trackWidth * endRatio);
 		RECT trimRect = {trimLeft, top, std::max(trimLeft + 4, trimRight), bottom};
-		DrawRoundedRectangle(trimRect, 4.0f,
-				     D2D1::ColorF(130.0f / 255.0f, 110.0f / 255.0f, 200.0f / 255.0f, 1.0f));
+		DrawRoundedRectangle(trimRect, 4.0f, AccentMuted());
 		int playX = left + static_cast<int>(trackWidth * curRatio);
 		RECT playRect = {playX - 2, m_galleryTimelineRect.top, playX + 2, m_galleryTimelineRect.bottom};
 		DrawRoundedRectangle(playRect, 2.0f,
@@ -2783,7 +2950,7 @@ void OverlayRenderer::RenderGalleryList(const RECT &listRect, int itemHeight, in
 		RECT itemRect = {listRect.left + 8, listRect.top + 8 + i * itemHeight, listRect.right - 8,
 				 listRect.top + 8 + (i + 1) * itemHeight - 6};
 		if (itemIndex == m_gallerySelectedIndex) {
-			DrawRoundedRectangle(itemRect, 8.0f, D2D1::ColorF(70.0f / 255.0f, 60.0f / 255.0f, 110.0f / 255.0f, 1.0f));
+			DrawRoundedRectangle(itemRect, 8.0f, AccentSelected());
 		} else {
 			DrawRoundedRectangle(itemRect, 8.0f, D2D1::ColorF(26.0f / 255.0f, 26.0f / 255.0f, 34.0f / 255.0f, 0.8f));
 		}
@@ -2880,8 +3047,7 @@ void OverlayRenderer::RenderGalleryControls(const RECT &controlsRect)
 			RECT subPanel = {subLeft, subTop, subLeft + subW,
 					 subTop + pad * 2 + audioTrackCount * (optH + 2)};
 			m_galleryAudioTrackMenuRect = subPanel;
-			DrawRoundedRectangle(subPanel, 8.0f,
-					     D2D1::ColorF(35.0f / 255.0f, 32.0f / 255.0f, 50.0f / 255.0f, 1.0f));
+			DrawRoundedRectangle(subPanel, 8.0f, AccentPanel());
 			DrawRoundedRectangleBorder(subPanel, 8.0f, 1.0f,
 						   D2D1::ColorF(58.0f / 255.0f, 58.0f / 255.0f, 69.0f / 255.0f, 1.0f));
 			for (int i = 0; i < audioTrackCount; i++) {
@@ -2890,10 +3056,10 @@ void OverlayRenderer::RenderGalleryControls(const RECT &controlsRect)
 				m_galleryAudioTrackOptionRects.push_back(optRect);
 				float radius = optH / 2.0f;
 				bool isCurrent = (i == m_videoPlayer.GetCurrentAudioTrackIndex());
-				DrawRoundedRectangle(
-					optRect, radius,
-					isCurrent ? D2D1::ColorF(70.0f / 255.0f, 55.0f / 255.0f, 120.0f / 255.0f, 1.0f)
-						  : D2D1::ColorF(45.0f / 255.0f, 42.0f / 255.0f, 58.0f / 255.0f, 1.0f));
+				DrawRoundedRectangle(optRect, radius,
+						     isCurrent ? AccentSelected()
+							       : D2D1::ColorF(45.0f / 255.0f, 42.0f / 255.0f, 58.0f / 255.0f,
+									     1.0f));
 				OverlayVideoPlayer::AudioTrackInfo info;
 				m_videoPlayer.GetAudioTrackInfo(i, info);
 				std::wstring rowLabel = std::to_wstring(i + 1) + L": " + WideFromUtf8(info.name);
@@ -2927,7 +3093,7 @@ void OverlayRenderer::RenderGalleryControls(const RECT &controlsRect)
 	m_galleryTrimRect = {rightStart, btnTop, rightStart + btnWidth, btnBottom};
 	m_galleryDeleteRect = {m_galleryTrimRect.right + btnSpacing, btnTop, controlsRect.right - sideInset, btnBottom};
 
-	const D2D1_COLOR_F hoverColor = D2D1::ColorF(0.48f, 0.42f, 0.65f);
+	const D2D1_COLOR_F hoverColor = AccentHover();
 	const D2D1_COLOR_F normalIcon = D2D1::ColorF(0.85f, 0.85f, 0.9f);
 
 	const bool hoverMute = (m_hoverTarget == HoverTarget::GalleryMute);
@@ -2939,7 +3105,7 @@ void OverlayRenderer::RenderGalleryControls(const RECT &controlsRect)
 	int volFill = static_cast<int>(volWidth * (m_galleryVolume / 100.0));
 	RECT volRect = {m_galleryVolumeRect.left + 2, m_galleryVolumeRect.top + 2,
 			m_galleryVolumeRect.left + 2 + volFill, m_galleryVolumeRect.bottom - 2};
-	DrawRoundedRectangle(volRect, 3.0f, D2D1::ColorF(130.0f / 255.0f, 110.0f / 255.0f, 200.0f / 255.0f, 1.0f));
+	DrawRoundedRectangle(volRect, 3.0f, AccentMuted());
 
 	const bool hoverPlay = (m_hoverTarget == HoverTarget::GalleryPlay);
 	const bool hoverIn = (m_hoverTarget == HoverTarget::GallerySetIn);
@@ -2976,8 +3142,7 @@ void OverlayRenderer::RenderGalleryControls(const RECT &controlsRect)
 		int panelTop = controlsRect.top - gap - boxSize;
 		RECT exportBlockRect = {panelLeft, panelTop, panelLeft + boxSize, panelTop + boxSize};
 		m_galleryExportPanelRect = exportBlockRect;
-		DrawRoundedRectangle(exportBlockRect, 10.0f,
-				     D2D1::ColorF(35.0f / 255.0f, 32.0f / 255.0f, 50.0f / 255.0f, 1.0f));
+		DrawRoundedRectangle(exportBlockRect, 10.0f, AccentPanel());
 		DrawRoundedRectangleBorder(exportBlockRect, 10.0f, 1.0f,
 					   D2D1::ColorF(58.0f / 255.0f, 58.0f / 255.0f, 69.0f / 255.0f, 1.0f));
 
@@ -2993,9 +3158,7 @@ void OverlayRenderer::RenderGalleryControls(const RECT &controlsRect)
 			if (i < m_exportTrackKeep.size() && m_exportTrackKeep[i]) {
 				RECT checkR = {keepRect.left + 2, keepRect.top + 2, keepRect.right - 2,
 					       keepRect.bottom - 2};
-				DrawRoundedRectangle(checkR, 1.0f,
-						     D2D1::ColorF(130.0f / 255.0f, 110.0f / 255.0f, 200.0f / 255.0f,
-								  1.0f));
+				DrawRoundedRectangle(checkR, 1.0f, AccentMuted());
 			}
 			RECT labelRect = {exportBlockRect.left + pad + cbSize + 4, rowTop, exportBlockRect.right - pad,
 					  rowTop + trackRowH};
@@ -3020,8 +3183,7 @@ void OverlayRenderer::RenderGalleryControls(const RECT &controlsRect)
 			RECT checkR = {exportBlockRect.left + pad + 2, contentTop + (row1H - cbSize) / 2 + 2,
 				       exportBlockRect.left + pad + cbSize - 2,
 				       contentTop + (row1H - cbSize) / 2 + cbSize - 2};
-			DrawRoundedRectangle(checkR, 2.0f,
-					     D2D1::ColorF(130.0f / 255.0f, 110.0f / 255.0f, 200.0f / 255.0f, 1.0f));
+			DrawRoundedRectangle(checkR, 2.0f, AccentMuted());
 		}
 		RenderText(overlay::util::ModuleTextW("Compress"),
 			   RECT{exportBlockRect.left + pad + cbSize + 4, contentTop, exportBlockRect.right - pad,
@@ -3057,8 +3219,7 @@ void OverlayRenderer::RenderGalleryControls(const RECT &controlsRect)
 		int exportBtnTop = exportBlockRect.bottom - pad - row3H;
 		m_galleryExportConfirmRect = {exportBlockRect.left + pad, exportBtnTop, exportBlockRect.right - pad,
 					      exportBlockRect.bottom - pad};
-		DrawRoundedRectangle(m_galleryExportConfirmRect, 6.0f,
-				     D2D1::ColorF(70.0f / 255.0f, 55.0f / 255.0f, 120.0f / 255.0f, 1.0f));
+		DrawRoundedRectangle(m_galleryExportConfirmRect, 6.0f, AccentSelected());
 		RenderText(overlay::util::ModuleTextW("Save"), m_galleryExportConfirmRect, 11.0f, DWRITE_FONT_WEIGHT_NORMAL,
 			   D2D1::ColorF(1.0f, 1.0f, 1.0f));
 	} else {
@@ -3491,6 +3652,9 @@ void OverlayRenderer::LoadSettingsWorkingValues()
 			       ? obs_data_get_double(d, "overlay_background_alpha")
 			       : 0.88;
 	m_setOpacityPct = ClampInt(static_cast<int>(alpha * 100.0 + 0.5), 50, 100);
+	m_setOverlayScale = ClampInt(getIntDef("overlay_scale", 100), 50, 300);
+	m_setTextScale = ClampInt(getIntDef("overlay_text_scale", 100), 50, 300);
+	m_setAccentColor = getIntDef("overlay_accent_color", 0xA882FF) & 0xFFFFFF;
 	m_setAutoHideEnabled = getBoolDef("auto_hide_enabled", false);
 	m_setAutoHideSeconds = ClampInt(getIntDef("auto_hide_seconds", 5), 1, 3600);
 	m_setIndicatorsEnabled = getBoolDef("indicators_enabled", true);
@@ -3542,6 +3706,9 @@ void OverlayRenderer::PersistSettingsWorkingValues()
 	obs_data_set_int(d, "margin", m_setMargin);
 	obs_data_set_int(d, "orientation", m_setOrientation);
 	obs_data_set_double(d, "overlay_background_alpha", m_setOpacityPct / 100.0);
+	obs_data_set_int(d, "overlay_scale", m_setOverlayScale);
+	obs_data_set_int(d, "overlay_text_scale", m_setTextScale);
+	obs_data_set_int(d, "overlay_accent_color", m_setAccentColor & 0xFFFFFF);
 	obs_data_set_bool(d, "auto_hide_enabled", m_setAutoHideEnabled);
 	obs_data_set_int(d, "auto_hide_seconds", m_setAutoHideSeconds);
 	obs_data_set_bool(d, "indicators_enabled", m_setIndicatorsEnabled);
@@ -3655,6 +3822,10 @@ void OverlayRenderer::CloseSettings()
 	m_margin = m_setMargin;
 	m_orientation = static_cast<OverlayOrientation>(m_setOrientation);
 	m_overlayBackgroundAlpha = static_cast<float>(m_setOpacityPct) / 100.0f;
+	m_overlayScalePercent = ClampInt(m_setOverlayScale, 50, 300);
+	m_textScalePercent = ClampInt(m_setTextScale, 50, 300);
+	m_accentColorRgb = m_setAccentColor & 0xFFFFFF;
+	ApplyAccentBrushes();
 	m_autoHideEnabled = m_setAutoHideEnabled;
 	m_autoHideSeconds = ClampInt(m_setAutoHideSeconds, 1, 3600);
 	m_galleryEnabled = m_setGalleryInOverlay;
@@ -3723,9 +3894,9 @@ void OverlayRenderer::RenderSettingsPanel()
 
 	const D2D1_COLOR_F kWhite = D2D1::ColorF(1.0f, 1.0f, 1.0f);
 	const D2D1_COLOR_F kDim = D2D1::ColorF(0.75f, 0.75f, 0.80f);
-	const D2D1_COLOR_F kAccent = D2D1::ColorF(0.66f, 0.51f, 1.0f);
+	const D2D1_COLOR_F kAccent = AccentColor();
 	const D2D1_COLOR_F kRowBg = D2D1::ColorF(30.0f / 255.0f, 30.0f / 255.0f, 38.0f / 255.0f, 0.9f);
-	const D2D1_COLOR_F kRowHover = D2D1::ColorF(0.48f, 0.42f, 0.65f, 0.30f);
+	const D2D1_COLOR_F kRowHover = AccentHover(0.30f);
 	const D2D1_COLOR_F kCtrlBg = D2D1::ColorF(0.12f, 0.12f, 0.15f, 1.0f);
 	const D2D1_COLOR_F kBorder = D2D1::ColorF(58.0f / 255.0f, 58.0f / 255.0f, 69.0f / 255.0f, 1.0f);
 
@@ -3744,6 +3915,9 @@ void OverlayRenderer::RenderSettingsPanel()
 	switch (m_settingsPage) {
 	case SettingsPage::General:
 		headerTitle = overlay::util::ModuleTextW("Tab.General");
+		break;
+	case SettingsPage::Appearance:
+		headerTitle = overlay::util::ModuleTextW("Appearance");
 		break;
 	case SettingsPage::Indicators:
 		headerTitle = overlay::util::ModuleTextW("Indicators");
@@ -3920,12 +4094,23 @@ void OverlayRenderer::RenderSettingsPanel()
 	switch (m_settingsPage) {
 	case SettingsPage::Categories:
 		categoryRow(overlay::util::ModuleTextW("Tab.General"), SettingsPage::General);
+		categoryRow(overlay::util::ModuleTextW("Appearance"), SettingsPage::Appearance);
 		categoryRow(overlay::util::ModuleTextW("Indicators"), SettingsPage::Indicators);
 		categoryRow(overlay::util::ModuleTextW("Tab.Audio"), SettingsPage::Audio);
 		categoryRow(overlay::util::ModuleTextW("Replay"), SettingsPage::Replay);
 		categoryRow(overlay::util::ModuleTextW("Tab.Hotkeys"), SettingsPage::Hotkeys);
 		break;
 	case SettingsPage::General:
+		checkboxRow(overlay::util::ModuleTextW("AutoHide.Enable"), m_setAutoHideEnabled,
+			    SettingsField::AutoHideEnabled);
+		stepperRow(overlay::util::ModuleTextW("AutoHide.Delay"), std::to_wstring(m_setAutoHideSeconds) + L" s",
+			   SettingsField::AutoHideSeconds);
+		checkboxRow(overlay::util::ModuleTextW("Gallery.InOverlay"), m_setGalleryInOverlay,
+			    SettingsField::GalleryInOverlay);
+		pathRow();
+		checkboxRow(overlay::util::ModuleTextW("CaptureFocus"), m_setCaptureFocus, SettingsField::CaptureFocus);
+		break;
+	case SettingsPage::Appearance:
 		stepperRow(overlay::util::ModuleTextW("Position.Label"),
 			   overlay::util::ModuleTextW(kSettingsPositionKeys[m_setPosition]), SettingsField::Position);
 		stepperRow(overlay::util::ModuleTextW("Margin"), std::to_wstring(m_setMargin) + L" px",
@@ -3935,14 +4120,27 @@ void OverlayRenderer::RenderSettingsPanel()
 			   SettingsField::Orientation);
 		stepperRow(overlay::util::ModuleTextW("OverlayOpacity"), std::to_wstring(m_setOpacityPct) + L"%",
 			   SettingsField::Opacity);
-		checkboxRow(overlay::util::ModuleTextW("AutoHide.Enable"), m_setAutoHideEnabled,
-			    SettingsField::AutoHideEnabled);
-		stepperRow(overlay::util::ModuleTextW("AutoHide.Delay"), std::to_wstring(m_setAutoHideSeconds) + L" s",
-			   SettingsField::AutoHideSeconds);
-		checkboxRow(overlay::util::ModuleTextW("Gallery.InOverlay"), m_setGalleryInOverlay,
-			    SettingsField::GalleryInOverlay);
-		pathRow();
-		checkboxRow(overlay::util::ModuleTextW("CaptureFocus"), m_setCaptureFocus, SettingsField::CaptureFocus);
+		stepperRow(overlay::util::ModuleTextW("OverlayScale"), std::to_wstring(m_setOverlayScale) + L"%",
+			   SettingsField::OverlayScale);
+		stepperRow(overlay::util::ModuleTextW("TextSize"), std::to_wstring(m_setTextScale) + L"%",
+			   SettingsField::TextScale);
+		{
+			const int h = 44;
+			RECT r = {contentLeft, y, contentRight, y + h};
+			DrawRoundedRectangle(r, 8.0f, kRowBg);
+			RECT lr = {r.left + 12, r.top, r.left + labelWidth, r.bottom};
+			RenderText(overlay::util::ModuleTextW("AccentColor"), lr, 12.0f, DWRITE_FONT_WEIGHT_NORMAL,
+				   kWhite, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+			const int sw = 28;
+			RECT swatch = {r.right - 12 - sw, r.top + (h - sw) / 2, r.right - 12, r.top + (h - sw) / 2 + sw};
+			DrawRoundedRectangle(swatch, 6.0f, ColorFromRgb(m_setAccentColor));
+			int swatchIdx = static_cast<int>(m_settingsHits.size());
+			bool swatchHover = (swatchIdx == m_settingsHoverIndex);
+			DrawRoundedRectangleBorder(swatch, 6.0f, 1.0f, swatchHover ? kAccent : kBorder);
+			m_settingsHits.push_back({swatch, SettingsAction::PickAccentColor, 0});
+			y += h + rowGap;
+		}
 		break;
 	case SettingsPage::Indicators:
 		checkboxRow(overlay::util::ModuleTextW("Indicators.Show"), m_setIndicatorsEnabled,
@@ -4163,7 +4361,7 @@ void OverlayRenderer::RenderSettingsPanel()
 		float scrollRatio = maxScroll > 0 ? static_cast<float>(m_settingsScrollOffset) / maxScroll : 0.0f;
 		int thumbTop = viewTop + static_cast<int>((viewportHeight - thumbH) * scrollRatio);
 		RECT thumbRect = {trackRect.left, thumbTop, trackRect.right, thumbTop + thumbH};
-		DrawRoundedRectangle(thumbRect, 3.0f, D2D1::ColorF(0.66f, 0.51f, 1.0f, 0.55f));
+		DrawRoundedRectangle(thumbRect, 3.0f, AccentSoft());
 	}
 }
 
@@ -4290,6 +4488,17 @@ void OverlayRenderer::HandleSettingsClick(int x, int y)
 		Render();
 		return;
 	}
+	case SettingsAction::PickAccentColor: {
+		int rgb = m_setAccentColor;
+		if (PickIndicatorColorNative(m_windowManager.GetHWND(), rgb)) {
+			m_setAccentColor = rgb & 0xFFFFFF;
+			m_accentColorRgb = m_setAccentColor;
+			ApplyAccentBrushes();
+			PersistSettingsWorkingValues();
+		}
+		Render();
+		return;
+	}
 	case SettingsAction::HotkeyCapture:
 		m_settingsCapturingHotkeyIndex = hit.field;
 		// Grab the keyboard even when focus capture is off, so the bind can be
@@ -4363,6 +4572,12 @@ void OverlayRenderer::HandleSettingsClick(int x, int y)
 			break;
 		case SettingsField::Opacity:
 			m_setOpacityPct = ClampInt(m_setOpacityPct + dir * 2, 50, 100);
+			break;
+		case SettingsField::OverlayScale:
+			m_setOverlayScale = ClampInt(m_setOverlayScale + dir * 10, 50, 300);
+			break;
+		case SettingsField::TextScale:
+			m_setTextScale = ClampInt(m_setTextScale + dir * 10, 50, 300);
 			break;
 		case SettingsField::AutoHideSeconds:
 			m_setAutoHideSeconds = ClampInt(m_setAutoHideSeconds + dir, 1, 3600);

@@ -42,6 +42,8 @@ public:
 	void SetGalleryEnabled(bool enabled);
 	void SetCaptureFocus(bool capture);
 	void SetOverlayBackgroundAlpha(float alpha);
+	void SetOverlayScalePercent(int scalePercent);
+	void SetAccentColorRgb(int rgb);
 
 	void UpdateStatus();
 	void Render();
@@ -233,7 +235,7 @@ private:
 	std::vector<std::wstring> m_exportTrackLabels;
 
 	// --- Settings panel state ---
-	enum class SettingsPage { Categories, General, Indicators, Audio, Replay, Hotkeys };
+	enum class SettingsPage { Categories, General, Appearance, Indicators, Audio, Replay, Hotkeys };
 	enum class SettingsAction {
 		ToggleBool,
 		StepDown,
@@ -243,6 +245,7 @@ private:
 		BrowseIndicator,
 		ClearIndicator,
 		PickIndicatorColor,
+		PickAccentColor,
 		BrowseSound,
 		ClearSound,
 		OpenCategory,
@@ -267,6 +270,8 @@ private:
 		Margin,
 		Orientation,
 		Opacity,
+		OverlayScale,
+		TextScale,
 		AutoHideSeconds,
 		IndicatorsPosition,
 		IndicatorsScale
@@ -296,6 +301,9 @@ private:
 	int m_setMargin;
 	int m_setOrientation;
 	int m_setOpacityPct;
+	int m_setOverlayScale;
+	int m_setTextScale;
+	int m_setAccentColor;
 	bool m_setAutoHideEnabled;
 	int m_setAutoHideSeconds;
 	bool m_setIndicatorsEnabled;
@@ -338,6 +346,17 @@ private:
 
 	void ApplyIndicatorCustoms();
 	void ApplyIndicatorSounds();
+	void ApplyAccentBrushes();
+	float UiScale() const;
+	float FontScale() const;
+	int UiPx(int value) const;
+	D2D1_COLOR_F AccentColor(float alpha = 1.0f) const;
+	D2D1_COLOR_F AccentSoft() const;
+	D2D1_COLOR_F AccentMuted() const;
+	D2D1_COLOR_F AccentHover(float alpha = 1.0f) const;
+	D2D1_COLOR_F AccentSelected(float alpha = 1.0f) const;
+	D2D1_COLOR_F AccentPanel(float alpha = 1.0f) const;
+	static D2D1_COLOR_F ColorFromRgb(int rgb, float alpha = 1.0f);
 
 	ID2D1PathGeometry *m_iconPlayGeometry;
 
@@ -361,6 +380,9 @@ private:
 
 	// Mica-like glass effect; 0.85–0.95 is typical.
 	float m_overlayBackgroundAlpha;
+	int m_overlayScalePercent;
+	int m_textScalePercent;
+	int m_accentColorRgb;
 	bool m_captureFocus;
 	POINT m_dimContentOffset;
 	int m_galleryContentWidth;

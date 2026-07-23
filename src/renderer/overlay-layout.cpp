@@ -3,7 +3,7 @@
 #include "overlay-layout.h"
 #include <algorithm>
 
-// --- Layout constants ---
+// --- Layout constants (at 100% scale) ---
 const int BASE_WIDTH_HORIZONTAL = 490;
 const int BASE_HEIGHT_HORIZONTAL = 140;
 const int BASE_WIDTH_VERTICAL = 180;
@@ -30,6 +30,17 @@ const int STATS_HEIGHT = 84;
 const int STATS_MARGIN = 10;
 const int STATS_WIDTH_HORIZONTAL = 200;
 const int STATS_WIDTH_VERTICAL = 160;
+
+namespace {
+
+int ScalePx(int value, int scalePercent)
+{
+	if (scalePercent == 100)
+		return value;
+	return (value * scalePercent + 50) / 100;
+}
+
+} // namespace
 
 OverlayLayoutManager::OverlayLayoutManager() {
 }
@@ -264,8 +275,14 @@ void OverlayLayoutManager::CalculatePanelRects(OverlayOrientation orientation, c
 void OverlayLayoutManager::CalculateLayout(OverlayPosition position, int margin,
                                           OverlayOrientation orientation,
                                           bool statsVisible,
+                                          int scalePercent,
                                           OverlayLayout &layout) {
 	memset(&layout, 0, sizeof(layout));
+
+	if (scalePercent < 50)
+		scalePercent = 50;
+	if (scalePercent > 300)
+		scalePercent = 300;
 
 	CalculateBaseSize(orientation, layout.baseWidth, layout.baseHeight);
 
@@ -291,6 +308,36 @@ void OverlayLayoutManager::CalculateLayout(OverlayPosition position, int margin,
 	CalculateStatsRect(position, orientation, statsVisible, layout, layout.statsRect);
 
 	CalculatePanelRects(orientation, layout);
+
+	if (scalePercent == 100)
+		return;
+
+	auto scaleRect = [&](RECT &r) {
+		if (r.right <= r.left && r.bottom <= r.top)
+			return;
+		r.left = ScalePx(r.left, scalePercent);
+		r.top = ScalePx(r.top, scalePercent);
+		r.right = ScalePx(r.right, scalePercent);
+		r.bottom = ScalePx(r.bottom, scalePercent);
+	};
+
+	layout.baseWidth = ScalePx(layout.baseWidth, scalePercent);
+	layout.baseHeight = ScalePx(layout.baseHeight, scalePercent);
+	layout.windowWidth = ScalePx(layout.windowWidth, scalePercent);
+	layout.windowHeight = ScalePx(layout.windowHeight, scalePercent);
+	layout.offsetX = ScalePx(layout.offsetX, scalePercent);
+	layout.offsetY = ScalePx(layout.offsetY, scalePercent);
+
+	scaleRect(layout.mainOverlayRect);
+	scaleRect(layout.settingsRect);
+	scaleRect(layout.statsRect);
+	scaleRect(layout.recordingPanelRect);
+	scaleRect(layout.replayPanelRect);
+	scaleRect(layout.buttonsContainerRect);
+	scaleRect(layout.recordFolderButtonRect);
+	scaleRect(layout.showOBSButtonRect);
+	scaleRect(layout.settingsButtonRect);
+	scaleRect(layout.statsButtonRect);
 }
 
 POINT OverlayLayoutManager::CalculateWindowPosition(OverlayPosition position, int margin,

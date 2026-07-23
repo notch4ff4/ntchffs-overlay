@@ -65,7 +65,8 @@ public:
 	
 	void CalculateLayout(OverlayPosition position, int margin, 
 	                     OverlayOrientation orientation, 
-	                     bool statsVisible, 
+	                     bool statsVisible,
+	                     int scalePercent,
 	                     OverlayLayout &layout);
 	
 	POINT CalculateWindowPosition(OverlayPosition position, int margin,
