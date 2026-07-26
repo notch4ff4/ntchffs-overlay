@@ -50,6 +50,7 @@ public:
 
 	// Opens the in-overlay settings panel (replaces the old Qt dialog).
 	void OpenSettings();
+	void OpenGalleryFile(const std::wstring &filePath);
 
 	void HandleClick(int x, int y);
 	void HandleMouseDown(int x, int y);
@@ -235,7 +236,7 @@ private:
 	std::vector<std::wstring> m_exportTrackLabels;
 
 	// --- Settings panel state ---
-	enum class SettingsPage { Categories, General, Appearance, Indicators, Audio, Replay, Hotkeys };
+	enum class SettingsPage { Categories, General, Appearance, Indicators, Audio, Replay, Notifications, Hotkeys };
 	enum class SettingsAction {
 		ToggleBool,
 		StepDown,
@@ -265,6 +266,10 @@ private:
 		SmartReplayMode,
 		GalleryInOverlay,
 		CaptureFocus,
+		ToastsEnabled,
+		ToastVideoSaved,
+		ToastOpenHint,
+		ToastLowDisk,
 		// numeric/enum fields (StepDown / StepUp)
 		Position,
 		Margin,
@@ -274,7 +279,9 @@ private:
 		TextScale,
 		AutoHideSeconds,
 		IndicatorsPosition,
-		IndicatorsScale
+		IndicatorsScale,
+		ToastLowDiskGb,
+		ToastDurationSec
 	};
 	static const int INDICATOR_CUSTOM_SLOT_COUNT = 4;
 	static const int INDICATOR_SOUND_EVENT_COUNT = 5;
@@ -340,12 +347,22 @@ private:
 	int m_setSmartReplayMode;
 	bool m_setGalleryInOverlay;
 	bool m_setCaptureFocus;
+	bool m_setToastsEnabled;
+	bool m_setToastVideoSaved;
+	bool m_setToastOpenHint;
+	bool m_setToastLowDisk;
+	int m_setToastLowDiskGb;
+	int m_setToastDurationSec;
 	std::wstring m_setExportPath;
-	int m_setHotkeyVk[7];
-	int m_setHotkeyMod[7];
+	static const int SETTINGS_HOTKEY_COUNT = 9;
+	int m_setHotkeyVk[SETTINGS_HOTKEY_COUNT];
+	int m_setHotkeyMod[SETTINGS_HOTKEY_COUNT];
 
 	void ApplyIndicatorCustoms();
 	void ApplyIndicatorSounds();
+	void ApplyToastActionHotkeys();
+	void ApplyToastAccentColor();
+	void ApplyToastOptions();
 	void ApplyAccentBrushes();
 	float UiScale() const;
 	float FontScale() const;

@@ -89,6 +89,8 @@ if(WIN32)
     src/trimmer/overlay-trimmer.h
     src/indicators/overlay-indicators.cpp
     src/indicators/overlay-indicators.h
+    src/toasts/overlay-toasts.cpp
+    src/toasts/overlay-toasts.h
     src/window/overlay-window-manager.cpp
     src/window/overlay-window-manager.h
     src/renderer/overlay-layout.cpp
@@ -110,6 +112,7 @@ if(WIN32)
     winmm
     comdlg32
     shlwapi
+    shell32
     d3d11
     dxgi
   )
@@ -121,6 +124,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
   src/window/overlay-window-c.h
   src/indicators/overlay-indicators-c.cpp
   src/indicators/overlay-indicators-c.h
+  src/toasts/overlay-toasts-c.cpp
+  src/toasts/overlay-toasts-c.h
 )
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
@@ -134,6 +139,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/src/player"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/trimmer"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/indicators"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/toasts"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/window"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/ui"
 )

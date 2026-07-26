@@ -37,6 +37,9 @@ public:
 	// RU: Обрабатывать клавиши только при фокусе оверлея; vkCode — виртуальная клавиша, mods: 1=Shift, 2=Ctrl, 4=Alt.
 	void SetKeyHandler(void (*handler)(int vkCode, int mods, void *userData), void *userData);
 
+	// WM_HOTKEY from RegisterHotKey; id is the hotkey id passed to RegisterHotKey.
+	void SetHotkeyHandler(void (*handler)(int id, void *userData), void *userData);
+
 	// Vertical mouse wheel; delta follows Win32 convention (positive = wheel away/up).
 	void SetWheelHandler(void (*handler)(int delta, int x, int y, void *userData), void *userData);
 
@@ -64,6 +67,8 @@ private:
 	void *m_mouseLeaveUserData;
 	void (*m_keyHandler)(int vkCode, int mods, void *userData);
 	void *m_keyHandlerUserData;
+	void (*m_hotkeyHandler)(int id, void *userData);
+	void *m_hotkeyHandlerUserData;
 	void (*m_wheelHandler)(int delta, int x, int y, void *userData);
 	void *m_wheelHandlerUserData;
 	bool m_trackingMouseLeave;

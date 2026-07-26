@@ -4,6 +4,7 @@
 #include "overlay-icons-resource.h"
 #include "overlay-string-utils.h"
 #include "overlay-indicators-c.h"
+#include "overlay-toasts-c.h"
 #include "overlay-svg-rasterize.h"
 #include <obs-module.h>
 #include <obs-frontend-api.h>
@@ -215,7 +216,13 @@ OverlayRenderer::OverlayRenderer()
 	m_setSmartReplayMode = 0;
 	m_setGalleryInOverlay = false;
 	m_setCaptureFocus = true;
-	for (int i = 0; i < 7; i++) {
+	m_setToastsEnabled = true;
+	m_setToastVideoSaved = true;
+	m_setToastOpenHint = true;
+	m_setToastLowDisk = true;
+	m_setToastLowDiskGb = 5;
+	m_setToastDurationSec = 8;
+	for (int i = 0; i < SETTINGS_HOTKEY_COUNT; i++) {
 		m_setHotkeyVk[i] = 0;
 		m_setHotkeyMod[i] = 0;
 	}
@@ -819,6 +826,7 @@ void OverlayRenderer::Render()
 	if (m_windowManager.IsVisible()) {
 		m_windowManager.EnsureTopmost();
 		overlay_indicators_raise_active_topmost();
+		overlay_toasts_raise_active_topmost();
 	}
 
 	RECT clientRect;
@@ -2619,6 +2627,90 @@ void OverlayRenderer::OpenGallery()
 	Render();
 }
 
+void OverlayRenderer::OpenGalleryFile(const std::wstring &filePath)
+{
+	if (filePath.empty())
+		return;
+	const DWORD attrs = GetFileAttributesW(filePath.c_str());
+	if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY))
+		return;
+
+	const size_t slash = filePath.find_last_of(L"\\/");
+	if (slash == std::wstring::npos)
+		return;
+	const std::wstring dir = filePath.substr(0, slash);
+	const std::wstring fileName = filePath.substr(slash + 1);
+
+	Show();
+	if (m_settingsOpen)
+		CloseSettings();
+
+	const bool alreadyOpen = m_galleryOpen;
+	m_galleryOpen = true;
+	m_galleryPage = 0;
+	m_gallerySelectedIndex = -1;
+	m_galleryTrimIn = 0.0;
+	m_galleryTrimOut = 0.0;
+	m_galleryTrimUserSet = false;
+	m_galleryExportSubmenuOpen = false;
+	m_galleryAudioTrackSubmenuOpen = false;
+	m_trimmer.Reset();
+	SetUpdateInterval(16);
+	m_videoPlayer.SetMuted(m_galleryMuted);
+	m_videoPlayer.SetVolume(static_cast<double>(m_galleryVolume) / 100.0);
+	if (!alreadyOpen) {
+		m_windowManager.SetKeyHandler(
+			[](int vkCode, int mods, void *userData) {
+				OverlayRenderer *r = static_cast<OverlayRenderer *>(userData);
+				if (r)
+					r->HandleGalleryKey(vkCode, mods);
+			},
+			this);
+		if (saved_settings_data && obs_data_has_user_value(saved_settings_data, "gallery_fullscreen")) {
+			m_galleryFullscreen = obs_data_get_bool(saved_settings_data, "gallery_fullscreen");
+		}
+	}
+	ApplyGalleryWindowSize();
+
+	m_gallery.Load(overlay::util::WideToUtf8(dir));
+
+	const std::vector<GalleryItem> &items = m_gallery.GetItems();
+	int found = -1;
+	for (size_t i = 0; i < items.size(); ++i) {
+		if (items[i].type != GalleryItem::Type::Video)
+			continue;
+		if (_wcsicmp(items[i].path.c_str(), filePath.c_str()) == 0) {
+			found = static_cast<int>(i);
+			break;
+		}
+	}
+	if (found < 0) {
+		for (size_t i = 0; i < items.size(); ++i) {
+			if (items[i].type != GalleryItem::Type::Video)
+				continue;
+			if (_wcsicmp(items[i].name.c_str(), fileName.c_str()) == 0) {
+				found = static_cast<int>(i);
+				break;
+			}
+		}
+	}
+
+	if (found >= 0) {
+		m_gallerySelectedIndex = found;
+		const GalleryItem *item = m_gallery.GetItem(static_cast<size_t>(found));
+		if (item) {
+			m_videoPlayer.Open(item->path);
+			m_galleryTrimIn = 0.0;
+			m_galleryTrimOut = m_videoPlayer.GetDuration();
+			m_galleryTrimUserSet = false;
+		}
+	} else {
+		m_videoPlayer.Close();
+	}
+
+	Render();
+}
+
 void OverlayRenderer::CloseGallery()
 {
 	m_galleryOpen = false;
@@ -3326,13 +3418,19 @@ void OverlayRenderer::HandleGalleryKey(int vkCode, int mods)
 
 namespace {
 
-const char *const kSettingsHotkeyKeys[7] = {
+const char *const kSettingsHotkeyKeys[9] = {
 	"hotkey_play",         "hotkey_seek_forward_5", "hotkey_seek_back_5", "hotkey_frame_forward",
-	"hotkey_frame_back",   "hotkey_go_in",          "hotkey_go_out"};
-const int kSettingsHotkeyDefaultVk[7] = {32, 39, 37, 190, 188, 36, 35};
-const char *const kSettingsHotkeyLabelKeys[7] = {
+	"hotkey_frame_back",   "hotkey_go_in",          "hotkey_go_out",      "hotkey_toast_view",
+	"hotkey_toast_delete"};
+const int kSettingsHotkeyDefaultVk[9] = {32, 39, 37, 190, 188, 36, 35, VK_F7, VK_F8};
+const int kSettingsHotkeyDefaultMod[9] = {0, 0, 0, 0, 0, 0, 0, 2, 2};
+const char *const kSettingsHotkeyLabelKeys[9] = {
 	"Hotkeys.PlayPause", "Hotkeys.SeekForward5", "Hotkeys.SeekBack5", "Hotkeys.FrameForward",
-	"Hotkeys.FrameBack", "Hotkeys.GoIn",         "Hotkeys.GoOut"};
+	"Hotkeys.FrameBack", "Hotkeys.GoIn",         "Hotkeys.GoOut",     "Hotkeys.ToastView",
+	"Hotkeys.ToastDelete"};
+static const int kGalleryHotkeyCount = 7;
+static const int kToastViewHotkeyIndex = 7;
+static const int kToastDeleteHotkeyIndex = 8;
 
 const char *const kSettingsPositionKeys[9] = {
 	"Position.Top",        "Position.Bottom",     "Position.Left",
@@ -3683,14 +3781,21 @@ void OverlayRenderer::LoadSettingsWorkingValues()
 	m_setSmartReplayMode = ClampInt(getIntDef("smart_replay_mode", 0), 0, 1);
 	m_setGalleryInOverlay = getBoolDef("gallery_in_overlay", false);
 	m_setCaptureFocus = getBoolDef("capture_focus", true);
+	m_setToastsEnabled = getBoolDef("toasts_enabled", true);
+	m_setToastVideoSaved = getBoolDef("toast_video_saved", true);
+	m_setToastOpenHint = getBoolDef("toast_open_hint", true);
+	m_setToastLowDisk = getBoolDef("toast_low_disk", true);
+	m_setToastLowDiskGb = ClampInt(getIntDef("toast_low_disk_gb", 5), 1, 100);
+	m_setToastDurationSec = ClampInt(getIntDef("toast_duration_sec", 8), 2, 60);
 	if (d && obs_data_has_user_value(d, "gallery_export_path"))
 		m_setExportPath = overlay::util::Utf8ToWide(obs_data_get_string(d, "gallery_export_path"));
 	else
 		m_setExportPath.clear();
 
-	for (int i = 0; i < 7; i++) {
+	for (int i = 0; i < SETTINGS_HOTKEY_COUNT; i++) {
 		int hkVk, hkMod;
-		getHotkeyVkMod(d, kSettingsHotkeyKeys[i], kSettingsHotkeyDefaultVk[i], 0, hkVk, hkMod);
+		getHotkeyVkMod(d, kSettingsHotkeyKeys[i], kSettingsHotkeyDefaultVk[i], kSettingsHotkeyDefaultMod[i],
+			       hkVk, hkMod);
 		m_setHotkeyVk[i] = hkVk;
 		m_setHotkeyMod[i] = hkMod;
 	}
@@ -3731,13 +3836,22 @@ void OverlayRenderer::PersistSettingsWorkingValues()
 	obs_data_set_int(d, "smart_replay_mode", m_setSmartReplayMode);
 	obs_data_set_bool(d, "gallery_in_overlay", m_setGalleryInOverlay);
 	obs_data_set_bool(d, "capture_focus", m_setCaptureFocus);
+	obs_data_set_bool(d, "toasts_enabled", m_setToastsEnabled);
+	obs_data_set_bool(d, "toast_video_saved", m_setToastVideoSaved);
+	obs_data_set_bool(d, "toast_open_hint", m_setToastOpenHint);
+	obs_data_set_bool(d, "toast_low_disk", m_setToastLowDisk);
+	obs_data_set_int(d, "toast_low_disk_gb", m_setToastLowDiskGb);
+	obs_data_set_int(d, "toast_duration_sec", m_setToastDurationSec);
 	obs_data_set_string(d, "gallery_export_path", overlay::util::WideToUtf8(m_setExportPath).c_str());
-	for (int i = 0; i < 7; i++) {
+	for (int i = 0; i < SETTINGS_HOTKEY_COUNT; i++) {
 		obs_data_set_int(d, (std::string(kSettingsHotkeyKeys[i]) + "_vk").c_str(), m_setHotkeyVk[i]);
 		obs_data_set_int(d, (std::string(kSettingsHotkeyKeys[i]) + "_mod").c_str(), m_setHotkeyMod[i]);
 	}
 	ApplyIndicatorCustoms();
 	ApplyIndicatorSounds();
+	ApplyToastActionHotkeys();
+	ApplyToastAccentColor();
+	ApplyToastOptions();
 }
 
 void OverlayRenderer::ApplyIndicatorCustoms()
@@ -3756,6 +3870,31 @@ void OverlayRenderer::ApplyIndicatorSounds()
 	for (int i = 0; i < INDICATOR_SOUND_EVENT_COUNT; i++) {
 		overlay_runtime_set_indicator_sound(i, overlay::util::WideToUtf8(m_setIndicatorSoundPath[i]).c_str());
 	}
+#endif
+}
+
+void OverlayRenderer::ApplyToastActionHotkeys()
+{
+#ifdef ENABLE_QT
+	overlay_runtime_set_toast_action_hotkeys(m_setHotkeyVk[kToastViewHotkeyIndex],
+						 m_setHotkeyMod[kToastViewHotkeyIndex],
+						 m_setHotkeyVk[kToastDeleteHotkeyIndex],
+						 m_setHotkeyMod[kToastDeleteHotkeyIndex]);
+#endif
+}
+
+void OverlayRenderer::ApplyToastAccentColor()
+{
+#ifdef ENABLE_QT
+	overlay_runtime_set_toast_accent_color(m_setAccentColor & 0xFFFFFF);
+#endif
+}
+
+void OverlayRenderer::ApplyToastOptions()
+{
+#ifdef ENABLE_QT
+	overlay_runtime_set_toast_options(m_setToastsEnabled, m_setToastVideoSaved, m_setToastOpenHint,
+					  m_setToastLowDisk, m_setToastLowDiskGb, m_setToastDurationSec);
 #endif
 }
 
@@ -3928,6 +4067,9 @@ void OverlayRenderer::RenderSettingsPanel()
 	case SettingsPage::Replay:
 		headerTitle = overlay::util::ModuleTextW("Replay");
 		break;
+	case SettingsPage::Notifications:
+		headerTitle = overlay::util::ModuleTextW("Notifications");
+		break;
 	case SettingsPage::Hotkeys:
 		headerTitle = overlay::util::ModuleTextW("Tab.Hotkeys");
 		break;
@@ -4098,6 +4240,7 @@ void OverlayRenderer::RenderSettingsPanel()
 		categoryRow(overlay::util::ModuleTextW("Indicators"), SettingsPage::Indicators);
 		categoryRow(overlay::util::ModuleTextW("Tab.Audio"), SettingsPage::Audio);
 		categoryRow(overlay::util::ModuleTextW("Replay"), SettingsPage::Replay);
+		categoryRow(overlay::util::ModuleTextW("Notifications"), SettingsPage::Notifications);
 		categoryRow(overlay::util::ModuleTextW("Tab.Hotkeys"), SettingsPage::Hotkeys);
 		break;
 	case SettingsPage::General:
@@ -4341,11 +4484,40 @@ void OverlayRenderer::RenderSettingsPanel()
 			   overlay::util::ModuleTextW(kSettingsSmartReplayModeKeys[m_setSmartReplayMode]),
 			   SettingsField::SmartReplayMode);
 		break;
-	case SettingsPage::Hotkeys:
-		for (int i = 0; i < 7; i++) {
+	case SettingsPage::Notifications:
+		checkboxRow(overlay::util::ModuleTextW("Notifications.Enable"), m_setToastsEnabled,
+			    SettingsField::ToastsEnabled);
+		checkboxRow(overlay::util::ModuleTextW("Notifications.VideoSaved"), m_setToastVideoSaved,
+			    SettingsField::ToastVideoSaved);
+		checkboxRow(overlay::util::ModuleTextW("Notifications.OpenHint"), m_setToastOpenHint,
+			    SettingsField::ToastOpenHint);
+		checkboxRow(overlay::util::ModuleTextW("Notifications.LowDisk"), m_setToastLowDisk,
+			    SettingsField::ToastLowDisk);
+		stepperRow(overlay::util::ModuleTextW("Notifications.Duration"),
+			   std::to_wstring(m_setToastDurationSec) + overlay::util::ModuleTextW("Notifications.Seconds"),
+			   SettingsField::ToastDurationSec);
+		stepperRow(overlay::util::ModuleTextW("Notifications.LowDiskThreshold"),
+			   std::to_wstring(m_setToastLowDiskGb) + overlay::util::ModuleTextW("Notifications.GB"),
+			   SettingsField::ToastLowDiskGb);
+		break;
+	case SettingsPage::Hotkeys: {
+		auto sectionLabel = [&](const std::wstring &text) {
+			const int h = 28;
+			RECT r = {contentLeft, y, contentRight, y + h};
+			RenderText(text, r, 12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, kDim, DWRITE_TEXT_ALIGNMENT_LEADING);
+			y += h + 4;
+		};
+		sectionLabel(overlay::util::ModuleTextW("Hotkeys.Gallery"));
+		for (int i = 0; i < kGalleryHotkeyCount; i++) {
 			hotkeyRow(overlay::util::ModuleTextW(kSettingsHotkeyLabelKeys[i]), i);
 		}
+		sectionLabel(overlay::util::ModuleTextW("Hotkeys.Toasts"));
+		hotkeyRow(overlay::util::ModuleTextW(kSettingsHotkeyLabelKeys[kToastViewHotkeyIndex]),
+			  kToastViewHotkeyIndex);
+		hotkeyRow(overlay::util::ModuleTextW(kSettingsHotkeyLabelKeys[kToastDeleteHotkeyIndex]),
+			  kToastDeleteHotkeyIndex);
 		break;
+	}
 	}
 
 	m_settingsContentTotalHeight = (y + m_settingsScrollOffset) - viewTop;
@@ -4494,6 +4666,7 @@ void OverlayRenderer::HandleSettingsClick(int x, int y)
 			m_setAccentColor = rgb & 0xFFFFFF;
 			m_accentColorRgb = m_setAccentColor;
 			ApplyAccentBrushes();
+			ApplyToastAccentColor();
 			PersistSettingsWorkingValues();
 		}
 		Render();
@@ -4550,6 +4723,22 @@ void OverlayRenderer::HandleSettingsClick(int x, int y)
 			m_windowManager.SetAllowActivate(m_setCaptureFocus);
 			ApplySettingsWindowSize();
 			break;
+		case SettingsField::ToastsEnabled:
+			m_setToastsEnabled = !m_setToastsEnabled;
+			ApplyToastOptions();
+			break;
+		case SettingsField::ToastVideoSaved:
+			m_setToastVideoSaved = !m_setToastVideoSaved;
+			ApplyToastOptions();
+			break;
+		case SettingsField::ToastOpenHint:
+			m_setToastOpenHint = !m_setToastOpenHint;
+			ApplyToastOptions();
+			break;
+		case SettingsField::ToastLowDisk:
+			m_setToastLowDisk = !m_setToastLowDisk;
+			ApplyToastOptions();
+			break;
 		default:
 			break;
 		}
@@ -4602,6 +4791,14 @@ void OverlayRenderer::HandleSettingsClick(int x, int y)
 			overlay_runtime_set_smart_replay_mode(m_setSmartReplayMode);
 #endif
 			break;
+		case SettingsField::ToastLowDiskGb:
+			m_setToastLowDiskGb = ClampInt(m_setToastLowDiskGb + dir, 1, 100);
+			ApplyToastOptions();
+			break;
+		case SettingsField::ToastDurationSec:
+			m_setToastDurationSec = ClampInt(m_setToastDurationSec + dir, 2, 60);
+			ApplyToastOptions();
+			break;
 		default:
 			break;
 		}
@@ -4629,7 +4826,7 @@ void OverlayRenderer::HandleSettingsKey(int vkCode, int mods)
 			return;
 		}
 		int index = m_settingsCapturingHotkeyIndex;
-		if (index >= 0 && index < 7) {
+		if (index >= 0 && index < SETTINGS_HOTKEY_COUNT) {
 			m_setHotkeyVk[index] = vkCode;
 			m_setHotkeyMod[index] = mods;
 		}

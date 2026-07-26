@@ -14,6 +14,10 @@ void overlay_runtime_set_indicator_custom(int slot, const char *pathUtf8, bool t
 void overlay_runtime_set_indicator_sound(int eventIndex, const char *pathUtf8);
 void overlay_runtime_set_smart_replay(bool enabled);
 void overlay_runtime_set_smart_replay_mode(int mode);
+void overlay_runtime_set_toast_action_hotkeys(int viewVk, int viewMod, int deleteVk, int deleteMod);
+void overlay_runtime_set_toast_accent_color(int colorRgb);
+void overlay_runtime_set_toast_options(bool enabled, bool videoSaved, bool openHint, bool lowDisk,
+				       int lowDiskThresholdGb, int durationSec);
 
 #ifdef __cplusplus
 }

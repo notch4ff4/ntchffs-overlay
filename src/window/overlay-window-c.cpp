@@ -2,6 +2,7 @@
 
 #ifdef _WIN32
 #include "overlay-renderer.h"
+#include "overlay-string-utils.h"
 #include <windows.h>
 
 extern "C" {
@@ -232,6 +233,15 @@ void overlay_window_open_settings(void *window)
 	}
 	OverlayRenderer *renderer = static_cast<OverlayRenderer *>(window);
 	renderer->OpenSettings();
+}
+
+void overlay_window_open_gallery_file(void *window, const char *pathUtf8)
+{
+	if (!window || !pathUtf8 || !pathUtf8[0]) {
+		return;
+	}
+	OverlayRenderer *renderer = static_cast<OverlayRenderer *>(window);
+	renderer->OpenGalleryFile(overlay::util::Utf8ToWide(pathUtf8));
 }
 
 int overlay_window_get_position(void *window)

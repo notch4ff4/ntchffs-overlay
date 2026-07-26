@@ -20,6 +20,7 @@ void overlay_window_set_gallery_enabled(void *window, bool enabled);
 void overlay_window_set_capture_focus(void *window, bool capture);
 void overlay_window_set_background_alpha(void *window, float alpha);
 void overlay_window_open_settings(void *window);
+void overlay_window_open_gallery_file(void *window, const char *pathUtf8);
 int overlay_window_get_position(void *window);
 int overlay_window_get_margin(void *window);
 int overlay_window_get_orientation(void *window);

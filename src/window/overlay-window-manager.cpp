@@ -16,6 +16,7 @@ OverlayWindowManager::OverlayWindowManager()
 	  m_mouseMoveHandler(nullptr), m_mouseMoveUserData(nullptr),
 	m_mouseLeaveHandler(nullptr), m_mouseLeaveUserData(nullptr),
 	  m_keyHandler(nullptr), m_keyHandlerUserData(nullptr),
+	  m_hotkeyHandler(nullptr), m_hotkeyHandlerUserData(nullptr),
 	  m_wheelHandler(nullptr), m_wheelHandlerUserData(nullptr),
 	  m_trackingMouseLeave(false), m_allowActivate(false),
 	  m_keyboardHook(nullptr) {
@@ -139,6 +140,13 @@ LRESULT CALLBACK OverlayWindowManager::WindowProc(HWND hwnd, UINT msg, WPARAM wP
 			if (GetKeyState(VK_MENU) & 0x8000)
 				mods |= 4;
 			manager->m_keyHandler(vk, mods, manager->m_keyHandlerUserData);
+		}
+		return 0;
+	}
+
+	case WM_HOTKEY: {
+		if (manager->m_hotkeyHandler) {
+			manager->m_hotkeyHandler(static_cast<int>(wParam), manager->m_hotkeyHandlerUserData);
 		}
 		return 0;
 	}
@@ -277,6 +285,11 @@ void OverlayWindowManager::SetMouseLeaveHandler(void (*handler)(void *userData),
 void OverlayWindowManager::SetKeyHandler(void (*handler)(int vkCode, int mods, void *userData), void *userData) {
 	m_keyHandler = handler;
 	m_keyHandlerUserData = userData;
+}
+
+void OverlayWindowManager::SetHotkeyHandler(void (*handler)(int id, void *userData), void *userData) {
+	m_hotkeyHandler = handler;
+	m_hotkeyHandlerUserData = userData;
 }
 
 void OverlayWindowManager::SetWheelHandler(void (*handler)(int delta, int x, int y, void *userData), void *userData) {
