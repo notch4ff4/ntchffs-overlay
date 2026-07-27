@@ -1,3 +1,4 @@
+// Write by AI. Should be checked. (will be removed after checking)
 #ifdef _WIN32
 
 #include "overlay-svg-rasterize.h"

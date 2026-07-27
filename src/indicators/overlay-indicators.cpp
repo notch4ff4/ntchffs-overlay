@@ -1,3 +1,4 @@
+// Should be refactored. Plan to separate into smaller files. (will be removed after checking)
 #ifdef _WIN32
 
 #include "overlay-indicators.h"

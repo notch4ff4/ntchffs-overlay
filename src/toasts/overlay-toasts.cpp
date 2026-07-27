@@ -1,3 +1,5 @@
+// Should be refactored. Plan to separate into smaller files. (will be removed after checking)
+// Some parts of this file are written by AI. Should be checked.
 #ifdef _WIN32
 
 #include "overlay-toasts.h"
