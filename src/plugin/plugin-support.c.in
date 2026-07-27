@@ -1,7 +1,7 @@
 #include <plugin-support.h>
 
 const char *PLUGIN_NAME = "@CMAKE_PROJECT_NAME@";
-const char *PLUGIN_VERSION = "@CMAKE_PROJECT_VERSION@";
+const char *PLUGIN_VERSION = "@PLUGIN_VERSION@";
 
 void obs_log(int log_level, const char *format, ...)
 {

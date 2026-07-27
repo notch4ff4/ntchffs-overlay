@@ -45,6 +45,13 @@ constexpr int kCompressQualityStrongCompression = 0;
 constexpr int kCompressQualityBalanced = 1;
 constexpr int kCompressQualityQuality = 2;
 
+constexpr const wchar_t *kAboutUrls[] = {
+	L"https://github.com/notch4ff4/ntchffs-overlay",
+	L"https://t.me/ntchff",
+	L"https://www.twitch.tv/ntchff",
+	L"https://www.donationalerts.com/r/notch4ff4",
+};
+
 int ClampInt(int v, int lo, int hi)
 {
 	if (v < lo)
@@ -1276,6 +1283,18 @@ void OverlayRenderer::ReleaseIconBitmaps()
 		}
 		m_iconMasks[i] = IconMask{};
 	}
+	if (m_aboutLogoBitmap) {
+		m_aboutLogoBitmap->Release();
+		m_aboutLogoBitmap = nullptr;
+	}
+	m_aboutLogoLoadAttempted = false;
+	for (int i = 0; i < ABOUT_SOCIAL_COUNT; i++) {
+		if (m_aboutSocialBitmaps[i]) {
+			m_aboutSocialBitmaps[i]->Release();
+			m_aboutSocialBitmaps[i] = nullptr;
+		}
+	}
+	m_aboutSocialLoadAttempted = false;
 	ReleaseIndicatorPreviews();
 }
 
@@ -1877,6 +1896,114 @@ bool OverlayRenderer::LoadIconBitmap(int iconType)
 	}
 	m_iconBitmaps[iconType] = bitmap;
 	return true;
+}
+
+bool OverlayRenderer::LoadAboutBitmapFromModuleFile(const char *relativePath, UINT svgSizePx, ID2D1Bitmap **outBitmap)
+{
+	if (!relativePath || !outBitmap || !m_wicFactory)
+		return false;
+	*outBitmap = nullptr;
+
+	char *path = obs_module_file(relativePath);
+	if (!path)
+		return false;
+	int wideLen = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+	if (wideLen <= 0) {
+		bfree(path);
+		return false;
+	}
+	std::vector<wchar_t> widePath(static_cast<size_t>(wideLen));
+	MultiByteToWideChar(CP_UTF8, 0, path, -1, widePath.data(), wideLen);
+	bfree(path);
+
+	const std::wstring wpath(widePath.data());
+	const bool isSvg = wpath.size() >= 4 &&
+			   (_wcsicmp(wpath.c_str() + (wpath.size() - 4), L".svg") == 0);
+
+	ID2D1RenderTarget *target = m_bitmapRenderTarget ? m_bitmapRenderTarget : m_renderTarget;
+	if (!target)
+		return false;
+
+	if (isSvg) {
+		if (!m_d2dFactory)
+			return false;
+		std::vector<uint8_t> bgra;
+		UINT w = 0, h = 0, stride = 0;
+		if (!overlay::svg::RasterizeFile(m_wicFactory, m_d2dFactory, wpath, svgSizePx, bgra, w, h, stride))
+			return false;
+		D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(D2D1::PixelFormat(
+			DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+		ID2D1Bitmap *bitmap = nullptr;
+		if (FAILED(target->CreateBitmap(D2D1::SizeU(w, h), bgra.data(), stride, &props, &bitmap)) || !bitmap)
+			return false;
+		*outBitmap = bitmap;
+		return true;
+	}
+
+	IWICBitmapDecoder *decoder = nullptr;
+	HRESULT hr = m_wicFactory->CreateDecoderFromFilename(wpath.c_str(), NULL, GENERIC_READ,
+							     WICDecodeMetadataCacheOnLoad, &decoder);
+	if (FAILED(hr) || !decoder)
+		return false;
+	IWICBitmapFrameDecode *frame = nullptr;
+	hr = decoder->GetFrame(0, &frame);
+	decoder->Release();
+	if (FAILED(hr) || !frame)
+		return false;
+	IWICFormatConverter *converter = nullptr;
+	hr = m_wicFactory->CreateFormatConverter(&converter);
+	if (FAILED(hr) || !converter) {
+		frame->Release();
+		return false;
+	}
+	hr = converter->Initialize(frame, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, NULL, 0.0f,
+				   WICBitmapPaletteTypeCustom);
+	frame->Release();
+	if (FAILED(hr)) {
+		converter->Release();
+		return false;
+	}
+	ID2D1Bitmap *bitmap = nullptr;
+	hr = target->CreateBitmapFromWicBitmap(converter, &bitmap);
+	converter->Release();
+	if (FAILED(hr) || !bitmap)
+		return false;
+	*outBitmap = bitmap;
+	return true;
+}
+
+bool OverlayRenderer::EnsureAboutLogoLoaded()
+{
+	if (m_aboutLogoBitmap)
+		return true;
+	if (m_aboutLogoLoadAttempted)
+		return false;
+	m_aboutLogoLoadAttempted = true;
+	return LoadAboutBitmapFromModuleFile("logo/logo.png", 0, &m_aboutLogoBitmap);
+}
+
+bool OverlayRenderer::EnsureAboutSocialIconsLoaded()
+{
+	if (m_aboutSocialLoadAttempted) {
+		for (int i = 0; i < ABOUT_SOCIAL_COUNT; i++) {
+			if (m_aboutSocialBitmaps[i])
+				return true;
+		}
+		return false;
+	}
+	m_aboutSocialLoadAttempted = true;
+	static const char *const kFiles[ABOUT_SOCIAL_COUNT] = {
+		"logo/github.svg",
+		"logo/telegram.svg",
+		"logo/twitch.svg",
+		"logo/donationalerts.svg",
+	};
+	bool any = false;
+	for (int i = 0; i < ABOUT_SOCIAL_COUNT; i++) {
+		if (LoadAboutBitmapFromModuleFile(kFiles[i], 96, &m_aboutSocialBitmaps[i]))
+			any = true;
+	}
+	return any;
 }
 
 void OverlayRenderer::DrawGalleryIcon(const RECT &rect, int iconType, const D2D1_COLOR_F *tintColor)
@@ -4073,6 +4200,9 @@ void OverlayRenderer::RenderSettingsPanel()
 	case SettingsPage::Hotkeys:
 		headerTitle = overlay::util::ModuleTextW("Tab.Hotkeys");
 		break;
+	case SettingsPage::About:
+		headerTitle = overlay::util::ModuleTextW("About");
+		break;
 	case SettingsPage::Categories:
 	default:
 		break;
@@ -4242,6 +4372,7 @@ void OverlayRenderer::RenderSettingsPanel()
 		categoryRow(overlay::util::ModuleTextW("Replay"), SettingsPage::Replay);
 		categoryRow(overlay::util::ModuleTextW("Notifications"), SettingsPage::Notifications);
 		categoryRow(overlay::util::ModuleTextW("Tab.Hotkeys"), SettingsPage::Hotkeys);
+		categoryRow(overlay::util::ModuleTextW("About"), SettingsPage::About);
 		break;
 	case SettingsPage::General:
 		checkboxRow(overlay::util::ModuleTextW("AutoHide.Enable"), m_setAutoHideEnabled,
@@ -4518,6 +4649,90 @@ void OverlayRenderer::RenderSettingsPanel()
 			  kToastDeleteHotkeyIndex);
 		break;
 	}
+	case SettingsPage::About: {
+		const int blockH = std::max(280, (viewportHeight * 75) / 100);
+		const int blockTop = viewTop + (viewportHeight - blockH) / 2;
+		y = blockTop - m_settingsScrollOffset;
+
+		const int logoSize = std::clamp(blockH * 42 / 100, 148, 240);
+		const int nameH = 34;
+		const int versionH = 26;
+		const int iconBtn = std::clamp(blockH * 10 / 100, 48, 64);
+		const int iconPad = std::max(10, iconBtn / 5);
+		const int iconGap = 18;
+		const int afterLogoGap = std::max(18, blockH * 4 / 100);
+		const int afterNameGap = std::max(10, blockH * 2 / 100);
+		const int afterVersionGap = std::max(22, blockH * 5 / 100);
+
+		const int fixedH = logoSize + afterLogoGap + nameH + afterNameGap + versionH + afterVersionGap + iconBtn;
+		const int topSlack = std::max(0, (blockH - fixedH) / 2);
+		y += topSlack;
+
+		if (EnsureAboutLogoLoaded() && m_aboutLogoBitmap) {
+			const int logoLeft = contentLeft + ((contentRight - contentLeft) - logoSize) / 2;
+			RECT logoRect = {logoLeft, y, logoLeft + logoSize, y + logoSize};
+			D2D1_SIZE_F bmpSize = m_aboutLogoBitmap->GetSize();
+			float srcAspect = bmpSize.width / (bmpSize.height > 0.0f ? bmpSize.height : 1.0f);
+			float drawW = static_cast<float>(logoSize);
+			float drawH = static_cast<float>(logoSize);
+			if (srcAspect > 1.0f)
+				drawH = drawW / srcAspect;
+			else
+				drawW = drawH * srcAspect;
+			float dx = static_cast<float>(logoRect.left) + (logoSize - drawW) * 0.5f;
+			float dy = static_cast<float>(logoRect.top) + (logoSize - drawH) * 0.5f;
+			target->DrawBitmap(m_aboutLogoBitmap,
+					   D2D1::RectF(dx, dy, dx + drawW, dy + drawH), 1.0f,
+					   D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+			y += logoSize + afterLogoGap;
+		} else {
+			y += afterLogoGap;
+		}
+
+		RECT nameRect = {contentLeft, y, contentRight, y + nameH};
+		RenderText(L"ntchff's Overlay", nameRect, 18.0f, DWRITE_FONT_WEIGHT_BOLD, kWhite,
+			   DWRITE_TEXT_ALIGNMENT_CENTER);
+		y += nameH + afterNameGap;
+
+		std::wstring versionText = overlay::util::ModuleTextW("About.Version");
+		versionText += L" ";
+		versionText += overlay::util::Utf8ToWide(PLUGIN_VERSION);
+		RECT versionRect = {contentLeft, y, contentRight, y + versionH};
+		RenderText(versionText, versionRect, 13.0f, DWRITE_FONT_WEIGHT_NORMAL, kDim,
+			   DWRITE_TEXT_ALIGNMENT_CENTER);
+		y += versionH + afterVersionGap;
+
+		EnsureAboutSocialIconsLoaded();
+		const int socialCount = ABOUT_SOCIAL_COUNT;
+		const int rowW = socialCount * iconBtn + (socialCount - 1) * iconGap;
+		int x = contentLeft + ((contentRight - contentLeft) - rowW) / 2;
+		static const wchar_t *const kSocialFallback[ABOUT_SOCIAL_COUNT] = {L"GH", L"TG", L"TW", L"DA"};
+		for (int i = 0; i < socialCount; i++) {
+			RECT r = {x, y, x + iconBtn, y + iconBtn};
+			int idx = static_cast<int>(m_settingsHits.size());
+			bool hover = (idx == m_settingsHoverIndex);
+			DrawRoundedRectangle(r, 14.0f, hover ? kRowHover : kRowBg);
+			DrawRoundedRectangleBorder(r, 14.0f, 1.0f, hover ? kAccent : kBorder);
+			ID2D1Bitmap *iconBmp = m_aboutSocialBitmaps[i];
+			if (iconBmp) {
+				RECT iconRect = {r.left + iconPad, r.top + iconPad, r.right - iconPad,
+						 r.bottom - iconPad};
+				float il = static_cast<float>(iconRect.left);
+				float it = static_cast<float>(iconRect.top);
+				float ir = static_cast<float>(iconRect.right);
+				float ib = static_cast<float>(iconRect.bottom);
+				target->DrawBitmap(iconBmp, D2D1::RectF(il, it, ir, ib), hover ? 1.0f : 0.88f,
+						   D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+			} else {
+				RenderText(kSocialFallback[i], r, 12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+					   hover ? kAccent : kWhite, DWRITE_TEXT_ALIGNMENT_CENTER);
+			}
+			m_settingsHits.push_back({r, SettingsAction::OpenUrl, i});
+			x += iconBtn + iconGap;
+		}
+		y = blockTop - m_settingsScrollOffset + blockH;
+		break;
+	}
 	}
 
 	m_settingsContentTotalHeight = (y + m_settingsScrollOffset) - viewTop;
@@ -4587,6 +4802,12 @@ void OverlayRenderer::HandleSettingsClick(int x, int y)
 		m_settingsCapturingHotkeyIndex = -1;
 		m_windowManager.SetKeyboardCaptureActive(false);
 		Render();
+		return;
+	}
+	case SettingsAction::OpenUrl: {
+		if (hit.field < 0 || hit.field >= static_cast<int>(sizeof(kAboutUrls) / sizeof(kAboutUrls[0])))
+			return;
+		ShellExecuteW(NULL, L"open", kAboutUrls[hit.field], NULL, NULL, SW_SHOWDEFAULT);
 		return;
 	}
 	case SettingsAction::Browse: {

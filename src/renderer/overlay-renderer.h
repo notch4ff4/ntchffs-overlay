@@ -236,7 +236,17 @@ private:
 	std::vector<std::wstring> m_exportTrackLabels;
 
 	// --- Settings panel state ---
-	enum class SettingsPage { Categories, General, Appearance, Indicators, Audio, Replay, Notifications, Hotkeys };
+	enum class SettingsPage {
+		Categories,
+		General,
+		Appearance,
+		Indicators,
+		Audio,
+		Replay,
+		Notifications,
+		Hotkeys,
+		About
+	};
 	enum class SettingsAction {
 		ToggleBool,
 		StepDown,
@@ -250,6 +260,7 @@ private:
 		BrowseSound,
 		ClearSound,
 		OpenCategory,
+		OpenUrl,
 		Back,
 		Close
 	};
@@ -394,6 +405,14 @@ private:
 	ID2D1Bitmap *GetTintedIconBitmap(int iconType, const D2D1_COLOR_F &tint);
 	uint64_t MakeTintKey(int iconType, const D2D1_COLOR_F &tint) const;
 	void ReleaseIconBitmaps();
+	bool EnsureAboutLogoLoaded();
+	bool EnsureAboutSocialIconsLoaded();
+	bool LoadAboutBitmapFromModuleFile(const char *relativePath, UINT svgSizePx, ID2D1Bitmap **outBitmap);
+	ID2D1Bitmap *m_aboutLogoBitmap = nullptr;
+	bool m_aboutLogoLoadAttempted = false;
+	static const int ABOUT_SOCIAL_COUNT = 4;
+	ID2D1Bitmap *m_aboutSocialBitmaps[ABOUT_SOCIAL_COUNT] = {};
+	bool m_aboutSocialLoadAttempted = false;
 
 	// Mica-like glass effect; 0.85–0.95 is typical.
 	float m_overlayBackgroundAlpha;
