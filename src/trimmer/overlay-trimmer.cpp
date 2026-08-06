@@ -34,6 +34,7 @@ namespace {
 
 using overlay::util::Utf8ToWide;
 using overlay::util::WideToUtf8;
+using overlay::ffmpeg::FramePtsSeconds;
 using overlay::ffmpeg::PtsToSeconds;
 using overlay::ffmpeg::SecondsToTimestamp;
 using overlay::ffmpeg::OpenVideoDecoder;
@@ -502,11 +503,7 @@ static bool transcode_trim_mp4(const std::wstring &inputPath, const std::wstring
 	progress.store(0.0);
 
 	auto frame_time = [&](AVFrame *f, int stream_index) -> double {
-		int64_t ts = (f->best_effort_timestamp != AV_NOPTS_VALUE) ? f->best_effort_timestamp : f->pts;
-		if (ts == AV_NOPTS_VALUE)
-			return 0.0;
-		AVStream *st = ifmt->streams[stream_index];
-		return PtsToSeconds(ts, st->time_base);
+		return FramePtsSeconds(f, ifmt->streams[stream_index]);
 	};
 
 	auto write_encoded = [&](AVCodecContext *enc_ctx, AVStream *out_st, int out_index) -> bool {

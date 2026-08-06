@@ -111,7 +111,7 @@ static bool TransferHwFrameToCpu(const AVFrame *hw_frame, AVFrame *cpu_frame)
 	if (av_hwframe_transfer_data(cpu_frame, hw_frame, 0) < 0) {
 		return false;
 	}
-	return true;
+	return av_frame_copy_props(cpu_frame, hw_frame) >= 0;
 }
 
 static bool OpenSwVideoDecoder(LibAvState *av, AVStream *stream, const std::string &pathUtf8)

@@ -54,7 +54,12 @@ inline bool TransferHwFrameToCpu(const AVFrame *hw_frame, AVFrame *cpu_frame)
 		return av_frame_ref(cpu_frame, hw_frame) >= 0;
 	}
 	av_frame_unref(cpu_frame);
-	return av_hwframe_transfer_data(cpu_frame, hw_frame, 0) >= 0;
+	// av_hwframe_transfer_data copies pixels only; PTS/side data must be restored
+	// or trim/export with startSeconds > 0 drops every AV1 frame (t == 0).
+	if (av_hwframe_transfer_data(cpu_frame, hw_frame, 0) < 0) {
+		return false;
+	}
+	return av_frame_copy_props(cpu_frame, hw_frame) >= 0;
 }
 
 // Opens a video decoder for stream. For AV1, prefers av1_cuvid when allow_av1_sw_fallback is false.
