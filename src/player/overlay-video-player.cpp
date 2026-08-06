@@ -29,6 +29,13 @@ extern "C" {
 #include <comdef.h>
 #include <timeapi.h>
 
+#ifndef AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+#define AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM 0x80000000
+#endif
+#ifndef AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
+#define AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY 0x08000000
+#endif
+
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "winmm.lib")
 
@@ -897,7 +904,7 @@ void OverlayVideoPlayer::StartThreeThreadPlayback(double startTime)
 
 	bool useAudio = (m_av->audio_codec_ctx != nullptr);
 	if (useAudio) {
-		// Output is resampled to stereo S16; WASAPI must match or shared-mode init may fail.
+		// Stereo S16 at the file rate; WASAPI AUTOCONVERTPCM maps it to the device mix format.
 		StartAudioThread(m_av->audio_sample_rate, 2);
 	}
 
@@ -1498,10 +1505,15 @@ void OverlayVideoPlayer::StartAudioThread(int sampleRate, int channels)
 		wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
 		wfx.cbSize = 0;
 
-		hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, bufDuration, 0, &wfx, NULL);
+		// Shared mode normally requires the device mix format. Without AUTOCONVERTPCM,
+		// Initialize fails when the default device rate differs from the file (e.g. 96/192 kHz).
+		hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED,
+					AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+					bufDuration, 0, &wfx, NULL);
 		if (FAILED(hr)) {
-			obs_log(LOG_WARNING, "[OverlayVideoPlayer] WASAPI Initialize failed: 0x%08lX",
-				(unsigned long)hr);
+			obs_log(LOG_WARNING,
+				"[OverlayVideoPlayer] WASAPI Initialize failed: 0x%08lX (rate=%d ch=%d)",
+				(unsigned long)hr, sampleRate, channels);
 			goto wasapi_cleanup;
 		}
 
