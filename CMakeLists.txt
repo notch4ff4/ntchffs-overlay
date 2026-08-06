@@ -17,7 +17,9 @@ find_package(libobs REQUIRED)
 
 # FFmpeg for in-process video/audio decoding (gallery playback, Windows only)
 if(WIN32)
-  list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/.deps/obs-studio-31.1.1/cmake/finders")
+  string(JSON _obs_studio_version GET ${buildspec} dependencies obs-studio version)
+  list(APPEND CMAKE_MODULE_PATH
+    "${CMAKE_CURRENT_SOURCE_DIR}/.deps/obs-studio-${_obs_studio_version}/cmake/finders")
   find_package(FFmpeg 6.1 REQUIRED avcodec avformat avutil swscale swresample)
 endif()
 
