@@ -7,6 +7,7 @@
 #include "overlay-indicators-c.h"
 #include "overlay-toasts-c.h"
 #include "overlay-svg-rasterize.h"
+#include "overlay-gif-decode.h"
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 #include <util/platform.h>
@@ -1311,17 +1312,22 @@ void OverlayRenderer::InvalidateIndicatorPreview(int slot)
 	if (slot < 0 || slot >= INDICATOR_CUSTOM_SLOT_COUNT)
 		return;
 	IndicatorPreviewCache &p = m_indicatorPreview[slot];
-	if (p.original) {
-		p.original->Release();
-		p.original = nullptr;
+	for (IndicatorPreviewFrame &frame : p.frames) {
+		if (frame.original) {
+			frame.original->Release();
+			frame.original = nullptr;
+		}
+		if (frame.tinted) {
+			frame.tinted->Release();
+			frame.tinted = nullptr;
+		}
+		frame.alpha.clear();
+		frame.maskW = 0;
+		frame.maskH = 0;
 	}
-	if (p.tinted) {
-		p.tinted->Release();
-		p.tinted = nullptr;
-	}
-	p.alpha.clear();
-	p.maskW = 0;
-	p.maskH = 0;
+	p.frames.clear();
+	p.frameIndex = 0;
+	p.frameStartTick = 0;
 	p.loadAttempted = false;
 	p.loadFailed = false;
 	p.path.clear();
@@ -1329,31 +1335,25 @@ void OverlayRenderer::InvalidateIndicatorPreview(int slot)
 	p.colorRgb = 0xFFFFFF;
 }
 
-void OverlayRenderer::RebuildIndicatorPreviewTint(int slot)
+void OverlayRenderer::RebuildIndicatorPreviewTintFrame(IndicatorPreviewFrame &frame, bool tintEnabled, int colorRgb)
 {
-	if (slot < 0 || slot >= INDICATOR_CUSTOM_SLOT_COUNT)
-		return;
 	ID2D1RenderTarget *target = m_bitmapRenderTarget ? m_bitmapRenderTarget : m_renderTarget;
-	if (!target)
-		return;
-
-	IndicatorPreviewCache &p = m_indicatorPreview[slot];
-	if (p.tinted) {
-		p.tinted->Release();
-		p.tinted = nullptr;
+	if (frame.tinted) {
+		frame.tinted->Release();
+		frame.tinted = nullptr;
 	}
-	if (!p.tintEnabled || p.alpha.empty() || p.maskW == 0 || p.maskH == 0)
+	if (!tintEnabled || frame.alpha.empty() || frame.maskW == 0 || frame.maskH == 0 || !target)
 		return;
 
-	const float cr = ((p.colorRgb >> 16) & 0xFF) / 255.0f;
-	const float cg = ((p.colorRgb >> 8) & 0xFF) / 255.0f;
-	const float cb = (p.colorRgb & 0xFF) / 255.0f;
-	const UINT stride = p.maskW * 4;
-	std::vector<uint8_t> bgra(static_cast<size_t>(stride) * static_cast<size_t>(p.maskH));
-	for (UINT y = 0; y < p.maskH; y++) {
-		for (UINT x = 0; x < p.maskW; x++) {
-			const size_t idx = static_cast<size_t>(y) * p.maskW + x;
-			const float af = p.alpha[idx] / 255.0f;
+	const float cr = ((colorRgb >> 16) & 0xFF) / 255.0f;
+	const float cg = ((colorRgb >> 8) & 0xFF) / 255.0f;
+	const float cb = (colorRgb & 0xFF) / 255.0f;
+	const UINT stride = frame.maskW * 4;
+	std::vector<uint8_t> bgra(static_cast<size_t>(stride) * static_cast<size_t>(frame.maskH));
+	for (UINT y = 0; y < frame.maskH; y++) {
+		for (UINT x = 0; x < frame.maskW; x++) {
+			const size_t idx = static_cast<size_t>(y) * frame.maskW + x;
+			const float af = frame.alpha[idx] / 255.0f;
 			const uint8_t A = static_cast<uint8_t>(af * 255.0f + 0.5f);
 			const uint8_t B = static_cast<uint8_t>(cb * 255.0f * af + 0.5f);
 			const uint8_t G = static_cast<uint8_t>(cg * 255.0f * af + 0.5f);
@@ -1369,35 +1369,45 @@ void OverlayRenderer::RebuildIndicatorPreviewTint(int slot)
 	D2D1_BITMAP_PROPERTIES props =
 		D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
 	ID2D1Bitmap *bmp = nullptr;
-	if (SUCCEEDED(target->CreateBitmap(D2D1::SizeU(p.maskW, p.maskH), bgra.data(), stride, &props, &bmp)) && bmp)
-		p.tinted = bmp;
+	if (SUCCEEDED(target->CreateBitmap(D2D1::SizeU(frame.maskW, frame.maskH), bgra.data(), stride, &props, &bmp)) &&
+	    bmp)
+		frame.tinted = bmp;
 }
 
-bool OverlayRenderer::CreateIndicatorPreviewFromPixels(int slot, UINT w, UINT h, const uint8_t *bgra, UINT stride)
+void OverlayRenderer::RebuildIndicatorPreviewTint(int slot)
 {
-	if (slot < 0 || slot >= INDICATOR_CUSTOM_SLOT_COUNT || !bgra || w == 0 || h == 0)
+	if (slot < 0 || slot >= INDICATOR_CUSTOM_SLOT_COUNT)
+		return;
+	IndicatorPreviewCache &p = m_indicatorPreview[slot];
+	for (IndicatorPreviewFrame &frame : p.frames)
+		RebuildIndicatorPreviewTintFrame(frame, p.tintEnabled, p.colorRgb);
+}
+
+bool OverlayRenderer::CreateIndicatorPreviewFrame(IndicatorPreviewFrame &frame, UINT w, UINT h, const uint8_t *bgra,
+						  UINT stride)
+{
+	if (!bgra || w == 0 || h == 0)
 		return false;
 	ID2D1RenderTarget *target = m_bitmapRenderTarget ? m_bitmapRenderTarget : m_renderTarget;
 	if (!target)
 		return false;
 
-	IndicatorPreviewCache &p = m_indicatorPreview[slot];
-	if (p.original) {
-		p.original->Release();
-		p.original = nullptr;
+	if (frame.original) {
+		frame.original->Release();
+		frame.original = nullptr;
 	}
-	if (p.tinted) {
-		p.tinted->Release();
-		p.tinted = nullptr;
+	if (frame.tinted) {
+		frame.tinted->Release();
+		frame.tinted = nullptr;
 	}
 
-	p.maskW = w;
-	p.maskH = h;
-	p.alpha.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
+	frame.maskW = w;
+	frame.maskH = h;
+	frame.alpha.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
 	for (UINT y = 0; y < h; y++) {
 		for (UINT x = 0; x < w; x++) {
 			const size_t src = static_cast<size_t>(y) * stride + static_cast<size_t>(x) * 4;
-			p.alpha[static_cast<size_t>(y) * w + x] = bgra[src + 3];
+			frame.alpha[static_cast<size_t>(y) * w + x] = bgra[src + 3];
 		}
 	}
 
@@ -1406,8 +1416,7 @@ bool OverlayRenderer::CreateIndicatorPreviewFromPixels(int slot, UINT w, UINT h,
 	ID2D1Bitmap *bmp = nullptr;
 	if (FAILED(target->CreateBitmap(D2D1::SizeU(w, h), bgra, stride, &props, &bmp)) || !bmp)
 		return false;
-	p.original = bmp;
-	RebuildIndicatorPreviewTint(slot);
+	frame.original = bmp;
 	return true;
 }
 
@@ -1416,45 +1425,47 @@ bool OverlayRenderer::LoadIndicatorPreviewRaster(int slot, const std::wstring &p
 	if (!m_wicFactory)
 		return false;
 
-	IWICBitmapDecoder *decoder = nullptr;
-	HRESULT hr = m_wicFactory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
-							     WICDecodeMetadataCacheOnLoad, &decoder);
-	if (FAILED(hr) || !decoder)
+	std::vector<overlay::gif::DecodedFrame> decoded;
+	if (!overlay::gif::DecodeFile(m_wicFactory, path, decoded) || decoded.empty())
 		return false;
 
-	IWICBitmapFrameDecode *frame = nullptr;
-	hr = decoder->GetFrame(0, &frame);
-	decoder->Release();
-	if (FAILED(hr) || !frame)
-		return false;
+	IndicatorPreviewCache &p = m_indicatorPreview[slot];
+	for (IndicatorPreviewFrame &old : p.frames) {
+		if (old.original) {
+			old.original->Release();
+			old.original = nullptr;
+		}
+		if (old.tinted) {
+			old.tinted->Release();
+			old.tinted = nullptr;
+		}
+	}
+	p.frames.clear();
+	p.frameIndex = 0;
+	p.frameStartTick = 0;
+	p.frames.reserve(decoded.size());
 
-	IWICFormatConverter *converter = nullptr;
-	hr = m_wicFactory->CreateFormatConverter(&converter);
-	if (FAILED(hr) || !converter) {
-		frame->Release();
-		return false;
+	for (const overlay::gif::DecodedFrame &src : decoded) {
+		IndicatorPreviewFrame frame;
+		frame.delayMs = src.delayMs;
+		if (!CreateIndicatorPreviewFrame(frame, src.w, src.h, src.bgra.data(), src.stride)) {
+			for (IndicatorPreviewFrame &f : p.frames) {
+				if (f.original) {
+					f.original->Release();
+					f.original = nullptr;
+				}
+				if (f.tinted) {
+					f.tinted->Release();
+					f.tinted = nullptr;
+				}
+			}
+			p.frames.clear();
+			return false;
+		}
+		RebuildIndicatorPreviewTintFrame(frame, p.tintEnabled, p.colorRgb);
+		p.frames.push_back(std::move(frame));
 	}
-	hr = converter->Initialize(frame, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0f,
-				   WICBitmapPaletteTypeCustom);
-	frame->Release();
-	if (FAILED(hr)) {
-		converter->Release();
-		return false;
-	}
-
-	UINT w = 0, h = 0;
-	converter->GetSize(&w, &h);
-	if (w == 0 || h == 0) {
-		converter->Release();
-		return false;
-	}
-	const UINT stride = w * 4;
-	std::vector<uint8_t> pixels(static_cast<size_t>(stride) * static_cast<size_t>(h));
-	hr = converter->CopyPixels(nullptr, stride, static_cast<UINT>(pixels.size()), pixels.data());
-	converter->Release();
-	if (FAILED(hr))
-		return false;
-	return CreateIndicatorPreviewFromPixels(slot, w, h, pixels.data(), stride);
+	return !p.frames.empty() && p.frames[0].original != nullptr;
 }
 
 bool OverlayRenderer::LoadIndicatorPreviewSvg(int slot, const std::wstring &path)
@@ -1466,7 +1477,28 @@ bool OverlayRenderer::LoadIndicatorPreviewSvg(int slot, const std::wstring &path
 	UINT w = 0, h = 0, stride = 0;
 	if (!overlay::svg::RasterizeFile(m_wicFactory, m_d2dFactory, path, 64, bgra, w, h, stride))
 		return false;
-	return CreateIndicatorPreviewFromPixels(slot, w, h, bgra.data(), stride);
+
+	IndicatorPreviewCache &p = m_indicatorPreview[slot];
+	for (IndicatorPreviewFrame &old : p.frames) {
+		if (old.original) {
+			old.original->Release();
+			old.original = nullptr;
+		}
+		if (old.tinted) {
+			old.tinted->Release();
+			old.tinted = nullptr;
+		}
+	}
+	p.frames.clear();
+	p.frameIndex = 0;
+	p.frameStartTick = 0;
+
+	IndicatorPreviewFrame frame;
+	if (!CreateIndicatorPreviewFrame(frame, w, h, bgra.data(), stride))
+		return false;
+	RebuildIndicatorPreviewTintFrame(frame, p.tintEnabled, p.colorRgb);
+	p.frames.push_back(std::move(frame));
+	return true;
 }
 
 bool OverlayRenderer::EnsureIndicatorPreview(int slot)
@@ -1483,17 +1515,19 @@ bool OverlayRenderer::EnsureIndicatorPreview(int slot)
 	const bool tintChanged = (p.tintEnabled != wantTint) || (p.colorRgb != wantColor);
 
 	if (pathChanged) {
-		if (p.original) {
-			p.original->Release();
-			p.original = nullptr;
+		for (IndicatorPreviewFrame &frame : p.frames) {
+			if (frame.original) {
+				frame.original->Release();
+				frame.original = nullptr;
+			}
+			if (frame.tinted) {
+				frame.tinted->Release();
+				frame.tinted = nullptr;
+			}
 		}
-		if (p.tinted) {
-			p.tinted->Release();
-			p.tinted = nullptr;
-		}
-		p.alpha.clear();
-		p.maskW = 0;
-		p.maskH = 0;
+		p.frames.clear();
+		p.frameIndex = 0;
+		p.frameStartTick = 0;
 		p.path = wantPath;
 		p.tintEnabled = wantTint;
 		p.colorRgb = wantColor;
@@ -1502,13 +1536,13 @@ bool OverlayRenderer::EnsureIndicatorPreview(int slot)
 	} else if (tintChanged) {
 		p.tintEnabled = wantTint;
 		p.colorRgb = wantColor;
-		if (p.original)
+		if (!p.frames.empty())
 			RebuildIndicatorPreviewTint(slot);
 	}
 
 	if (wantPath.empty())
 		return false;
-	if (p.original)
+	if (!p.frames.empty() && p.frames[0].original)
 		return true;
 	if (p.loadAttempted)
 		return false;
@@ -1522,7 +1556,31 @@ bool OverlayRenderer::EnsureIndicatorPreview(int slot)
 	const bool ok = isSvg ? LoadIndicatorPreviewSvg(slot, wantPath) : LoadIndicatorPreviewRaster(slot, wantPath);
 	if (!ok)
 		p.loadFailed = true;
-	return ok && p.original != nullptr;
+	return ok && !p.frames.empty() && p.frames[0].original != nullptr;
+}
+
+void OverlayRenderer::AdvanceIndicatorPreviewAnimation(int slot, ULONGLONG now)
+{
+	if (slot < 0 || slot >= INDICATOR_CUSTOM_SLOT_COUNT)
+		return;
+	IndicatorPreviewCache &p = m_indicatorPreview[slot];
+	if (p.frames.size() <= 1)
+		return;
+	if (p.frameStartTick == 0)
+		p.frameStartTick = now;
+
+	int guard = 0;
+	while (guard++ < 64) {
+		const UINT delay = p.frames[p.frameIndex].delayMs < 20 ? 20u : p.frames[p.frameIndex].delayMs;
+		if (now < p.frameStartTick + delay)
+			break;
+		p.frameStartTick += delay;
+		p.frameIndex = (p.frameIndex + 1) % p.frames.size();
+		if (now > p.frameStartTick + 2000) {
+			p.frameStartTick = now;
+			break;
+		}
+	}
 }
 
 void OverlayRenderer::DrawBuiltinIndicatorPreview(int slot, const RECT &rect, D2D1_COLOR_F color)
@@ -1625,13 +1683,19 @@ void OverlayRenderer::DrawIndicatorPreview(int slot, const RECT &rect)
 
 	if (EnsureIndicatorPreview(slot)) {
 		IndicatorPreviewCache &p = m_indicatorPreview[slot];
-		ID2D1Bitmap *bmp = (p.tintEnabled && p.tinted) ? p.tinted : p.original;
-		if (bmp) {
-			D2D1_RECT_F dest =
-				D2D1::RectF((float)iconRect.left, (float)iconRect.top, (float)iconRect.right,
-					    (float)iconRect.bottom);
-			target->DrawBitmap(bmp, dest, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-			return;
+		if (!p.frames.empty()) {
+			AdvanceIndicatorPreviewAnimation(slot, GetTickCount64());
+			if (p.frameIndex >= p.frames.size())
+				p.frameIndex = 0;
+			IndicatorPreviewFrame &frame = p.frames[p.frameIndex];
+			ID2D1Bitmap *bmp = (p.tintEnabled && frame.tinted) ? frame.tinted : frame.original;
+			if (bmp) {
+				D2D1_RECT_F dest =
+					D2D1::RectF((float)iconRect.left, (float)iconRect.top, (float)iconRect.right,
+						    (float)iconRect.bottom);
+				target->DrawBitmap(bmp, dest, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+				return;
+			}
 		}
 	}
 
@@ -3622,10 +3686,11 @@ bool BrowseForIndicatorIconNative(HWND owner, std::wstring &out)
 	HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
 	if (SUCCEEDED(hr) && dlg) {
 		COMDLG_FILTERSPEC filters[] = {
-			{L"Images (PNG, SVG, JPEG)", L"*.png;*.svg;*.jpeg;*.jpg"},
+			{L"Images (PNG, SVG, JPEG, GIF)", L"*.png;*.svg;*.jpeg;*.jpg;*.gif"},
 			{L"PNG", L"*.png"},
 			{L"SVG", L"*.svg"},
 			{L"JPEG", L"*.jpeg;*.jpg"},
+			{L"GIF", L"*.gif"},
 			{L"All files", L"*.*"},
 		};
 		dlg->SetFileTypes(ARRAYSIZE(filters), filters);
@@ -3689,7 +3754,7 @@ std::wstring IndicatorIconExtension(const std::wstring &path)
 	std::wstring ext = path.substr(dot);
 	for (wchar_t &c : ext)
 		c = static_cast<wchar_t>(towlower(c));
-	if (ext == L".png" || ext == L".svg" || ext == L".jpeg" || ext == L".jpg")
+	if (ext == L".png" || ext == L".svg" || ext == L".jpeg" || ext == L".jpg" || ext == L".gif")
 		return ext;
 	return L".png";
 }
@@ -3716,7 +3781,7 @@ void DeleteStoredIndicatorIcons(int slot)
 	std::wstring dir;
 	if (!EnsureIndicatorIconsConfigDir(dir))
 		return;
-	static const wchar_t *const exts[] = {L".png", L".svg", L".jpeg", L".jpg"};
+	static const wchar_t *const exts[] = {L".png", L".svg", L".jpeg", L".jpg", L".gif"};
 	const std::wstring base = overlay::util::Utf8ToWide(kIndicatorSlotKeys[slot]);
 	for (const wchar_t *ext : exts) {
 		const std::wstring path = dir + base + ext;

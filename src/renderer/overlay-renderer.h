@@ -332,15 +332,21 @@ private:
 	std::wstring m_setIndicatorIconPath[INDICATOR_CUSTOM_SLOT_COUNT];
 	bool m_setIndicatorTint[INDICATOR_CUSTOM_SLOT_COUNT];
 	int m_setIndicatorColor[INDICATOR_CUSTOM_SLOT_COUNT];
-	struct IndicatorPreviewCache {
-		std::wstring path;
-		bool tintEnabled = false;
-		int colorRgb = 0xFFFFFF;
+	struct IndicatorPreviewFrame {
 		ID2D1Bitmap *original = nullptr;
 		ID2D1Bitmap *tinted = nullptr;
 		std::vector<uint8_t> alpha;
 		UINT maskW = 0;
 		UINT maskH = 0;
+		UINT delayMs = 100;
+	};
+	struct IndicatorPreviewCache {
+		std::wstring path;
+		bool tintEnabled = false;
+		int colorRgb = 0xFFFFFF;
+		std::vector<IndicatorPreviewFrame> frames;
+		size_t frameIndex = 0;
+		ULONGLONG frameStartTick = 0;
 		bool loadAttempted = false;
 		bool loadFailed = false;
 	};
@@ -350,8 +356,11 @@ private:
 	bool EnsureIndicatorPreview(int slot);
 	bool LoadIndicatorPreviewRaster(int slot, const std::wstring &path);
 	bool LoadIndicatorPreviewSvg(int slot, const std::wstring &path);
-	bool CreateIndicatorPreviewFromPixels(int slot, UINT w, UINT h, const uint8_t *bgra, UINT stride);
+	bool CreateIndicatorPreviewFrame(IndicatorPreviewFrame &frame, UINT w, UINT h, const uint8_t *bgra,
+					 UINT stride);
 	void RebuildIndicatorPreviewTint(int slot);
+	void RebuildIndicatorPreviewTintFrame(IndicatorPreviewFrame &frame, bool tintEnabled, int colorRgb);
+	void AdvanceIndicatorPreviewAnimation(int slot, ULONGLONG now);
 	void DrawIndicatorPreview(int slot, const RECT &rect);
 	void DrawBuiltinIndicatorPreview(int slot, const RECT &rect, D2D1_COLOR_F color);
 	bool m_setSmartReplay;

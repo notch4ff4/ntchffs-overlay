@@ -82,6 +82,8 @@ if(WIN32)
     src/common/overlay-string-utils.h
     src/common/overlay-svg-rasterize.cpp
     src/common/overlay-svg-rasterize.h
+    src/common/overlay-gif-decode.cpp
+    src/common/overlay-gif-decode.h
     src/common/overlay-ffmpeg-time-utils.h
     src/common/overlay-mp4-box-reader.cpp
     src/common/overlay-mp4-box-reader.h

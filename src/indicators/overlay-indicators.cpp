@@ -2,6 +2,7 @@
 #ifdef _WIN32
 
 #include "overlay-indicators.h"
+#include "overlay-gif-decode.h"
 #include "overlay-svg-rasterize.h"
 #include <obs-module.h>
 
@@ -80,6 +81,7 @@ OverlayIndicators::OverlayIndicators()
 	  m_replaySavedIndicatorStartTick(0),
 	  m_replaySavedUntil(0),
 	  m_updateTimer(0),
+	  m_timerIntervalMs(500),
 	  m_windowWidth(0),
 	  m_windowHeight(0) {}
 
@@ -285,7 +287,8 @@ void OverlayIndicators::SetCustom(int slot, const wchar_t *path, bool tintEnable
 
 	if (pathChanged) {
 		InvalidateCustomSlot(slot);
-	} else if (s.original && (tintChanged || colorChanged)) {
+		SyncTimerInterval();
+	} else if (!s.frames.empty() && (tintChanged || colorChanged)) {
 		RebuildTintedBitmap(slot);
 	}
 
@@ -329,12 +332,38 @@ void OverlayIndicators::RaiseTopmost()
 	m_windowManager.EnsureTopmost();
 }
 
+bool OverlayIndicators::HasAnimatedCustom() const
+{
+	for (int i = 0; i < CUSTOM_SLOT_COUNT; i++) {
+		if (m_custom[i].frames.size() > 1)
+			return true;
+	}
+	return false;
+}
+
+void OverlayIndicators::SyncTimerInterval()
+{
+	const UINT want = HasAnimatedCustom() ? 33u : 500u;
+	if (m_updateTimer && m_timerIntervalMs == want)
+		return;
+
+	HWND hwnd = m_windowManager.GetHWND();
+	if (!hwnd)
+		return;
+
+	if (m_updateTimer) {
+		KillTimer(hwnd, m_updateTimer);
+		m_updateTimer = 0;
+	}
+
+	m_timerIntervalMs = want;
+	s_timerInstance = this;
+	m_updateTimer = SetTimer(hwnd, 2, m_timerIntervalMs, TimerProc);
+}
+
 void OverlayIndicators::EnsureTimer()
 {
-	if (!m_updateTimer) {
-		s_timerInstance = this;
-		m_updateTimer = SetTimer(m_windowManager.GetHWND(), 2, 500, TimerProc);
-	}
+	SyncTimerInterval();
 }
 
 void OverlayIndicators::UpdateStatus()
@@ -535,20 +564,7 @@ void OverlayIndicators::CreateDeviceResources()
 void OverlayIndicators::ReleaseCustomBitmaps()
 {
 	for (int i = 0; i < CUSTOM_SLOT_COUNT; i++) {
-		CustomSlot &s = m_custom[i];
-		if (s.original) {
-			s.original->Release();
-			s.original = nullptr;
-		}
-		if (s.tinted) {
-			s.tinted->Release();
-			s.tinted = nullptr;
-		}
-		s.alpha.clear();
-		s.maskW = 0;
-		s.maskH = 0;
-		s.loadAttempted = false;
-		s.loadFailed = false;
+		InvalidateCustomSlot(i);
 	}
 }
 
@@ -557,17 +573,22 @@ void OverlayIndicators::InvalidateCustomSlot(int slot)
 	if (slot < 0 || slot >= CUSTOM_SLOT_COUNT)
 		return;
 	CustomSlot &s = m_custom[slot];
-	if (s.original) {
-		s.original->Release();
-		s.original = nullptr;
+	for (CustomFrame &frame : s.frames) {
+		if (frame.original) {
+			frame.original->Release();
+			frame.original = nullptr;
+		}
+		if (frame.tinted) {
+			frame.tinted->Release();
+			frame.tinted = nullptr;
+		}
+		frame.alpha.clear();
+		frame.maskW = 0;
+		frame.maskH = 0;
 	}
-	if (s.tinted) {
-		s.tinted->Release();
-		s.tinted = nullptr;
-	}
-	s.alpha.clear();
-	s.maskW = 0;
-	s.maskH = 0;
+	s.frames.clear();
+	s.frameIndex = 0;
+	s.frameStartTick = 0;
 	s.loadAttempted = false;
 	s.loadFailed = false;
 }
@@ -596,27 +617,24 @@ D2D1_COLOR_F OverlayIndicators::SlotColor(int slot, float opacity) const
 	return D2D1::ColorF(r, g, b, opacity);
 }
 
-void OverlayIndicators::RebuildTintedBitmap(int slot)
+void OverlayIndicators::RebuildTintedFrame(CustomFrame &frame, bool tintEnabled, int colorRgb)
 {
-	if (slot < 0 || slot >= CUSTOM_SLOT_COUNT || !m_bitmapRenderTarget)
-		return;
-	CustomSlot &s = m_custom[slot];
-	if (s.tinted) {
-		s.tinted->Release();
-		s.tinted = nullptr;
+	if (frame.tinted) {
+		frame.tinted->Release();
+		frame.tinted = nullptr;
 	}
-	if (!s.tintEnabled || s.alpha.empty() || s.maskW == 0 || s.maskH == 0)
+	if (!tintEnabled || frame.alpha.empty() || frame.maskW == 0 || frame.maskH == 0 || !m_bitmapRenderTarget)
 		return;
 
-	const float cr = ((s.colorRgb >> 16) & 0xFF) / 255.0f;
-	const float cg = ((s.colorRgb >> 8) & 0xFF) / 255.0f;
-	const float cb = (s.colorRgb & 0xFF) / 255.0f;
-	const UINT stride = s.maskW * 4;
-	std::vector<uint8_t> bgra(static_cast<size_t>(stride) * static_cast<size_t>(s.maskH));
-	for (UINT y = 0; y < s.maskH; y++) {
-		for (UINT x = 0; x < s.maskW; x++) {
-			const size_t idx = static_cast<size_t>(y) * s.maskW + x;
-			const float af = s.alpha[idx] / 255.0f;
+	const float cr = ((colorRgb >> 16) & 0xFF) / 255.0f;
+	const float cg = ((colorRgb >> 8) & 0xFF) / 255.0f;
+	const float cb = (colorRgb & 0xFF) / 255.0f;
+	const UINT stride = frame.maskW * 4;
+	std::vector<uint8_t> bgra(static_cast<size_t>(stride) * static_cast<size_t>(frame.maskH));
+	for (UINT y = 0; y < frame.maskH; y++) {
+		for (UINT x = 0; x < frame.maskW; x++) {
+			const size_t idx = static_cast<size_t>(y) * frame.maskW + x;
+			const float af = frame.alpha[idx] / 255.0f;
 			const uint8_t A = static_cast<uint8_t>(af * 255.0f + 0.5f);
 			const uint8_t B = static_cast<uint8_t>(cb * 255.0f * af + 0.5f);
 			const uint8_t G = static_cast<uint8_t>(cg * 255.0f * af + 0.5f);
@@ -632,35 +650,45 @@ void OverlayIndicators::RebuildTintedBitmap(int slot)
 	D2D1_BITMAP_PROPERTIES props =
 		D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
 	ID2D1Bitmap *bmp = nullptr;
-	if (SUCCEEDED(m_bitmapRenderTarget->CreateBitmap(D2D1::SizeU(s.maskW, s.maskH), bgra.data(), stride, &props,
-							 &bmp)) &&
+	if (SUCCEEDED(m_bitmapRenderTarget->CreateBitmap(D2D1::SizeU(frame.maskW, frame.maskH), bgra.data(), stride,
+							 &props, &bmp)) &&
 	    bmp) {
-		s.tinted = bmp;
+		frame.tinted = bmp;
 	}
 }
 
-bool OverlayIndicators::CreateBitmapsFromPixels(int slot, UINT w, UINT h, const uint8_t *bgra, UINT stride)
+void OverlayIndicators::RebuildTintedBitmap(int slot)
 {
-	if (slot < 0 || slot >= CUSTOM_SLOT_COUNT || !m_bitmapRenderTarget || !bgra || w == 0 || h == 0)
+	if (slot < 0 || slot >= CUSTOM_SLOT_COUNT || !m_bitmapRenderTarget)
+		return;
+	CustomSlot &s = m_custom[slot];
+	for (CustomFrame &frame : s.frames)
+		RebuildTintedFrame(frame, s.tintEnabled, s.colorRgb);
+}
+
+bool OverlayIndicators::CreateFrameBitmaps(int slot, CustomFrame &frame, UINT w, UINT h, const uint8_t *bgra,
+					   UINT stride)
+{
+	UNUSED_PARAMETER(slot);
+	if (!m_bitmapRenderTarget || !bgra || w == 0 || h == 0)
 		return false;
 
-	CustomSlot &s = m_custom[slot];
-	if (s.original) {
-		s.original->Release();
-		s.original = nullptr;
+	if (frame.original) {
+		frame.original->Release();
+		frame.original = nullptr;
 	}
-	if (s.tinted) {
-		s.tinted->Release();
-		s.tinted = nullptr;
+	if (frame.tinted) {
+		frame.tinted->Release();
+		frame.tinted = nullptr;
 	}
 
-	s.maskW = w;
-	s.maskH = h;
-	s.alpha.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
+	frame.maskW = w;
+	frame.maskH = h;
+	frame.alpha.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
 	for (UINT y = 0; y < h; y++) {
 		for (UINT x = 0; x < w; x++) {
 			const size_t src = static_cast<size_t>(y) * stride + static_cast<size_t>(x) * 4;
-			s.alpha[static_cast<size_t>(y) * w + x] = bgra[src + 3];
+			frame.alpha[static_cast<size_t>(y) * w + x] = bgra[src + 3];
 		}
 	}
 
@@ -669,8 +697,7 @@ bool OverlayIndicators::CreateBitmapsFromPixels(int slot, UINT w, UINT h, const 
 	ID2D1Bitmap *bmp = nullptr;
 	if (FAILED(m_bitmapRenderTarget->CreateBitmap(D2D1::SizeU(w, h), bgra, stride, &props, &bmp)) || !bmp)
 		return false;
-	s.original = bmp;
-	RebuildTintedBitmap(slot);
+	frame.original = bmp;
 	return true;
 }
 
@@ -679,48 +706,39 @@ bool OverlayIndicators::LoadRasterCustom(int slot, const std::wstring &path)
 	if (!m_wicFactory || !m_bitmapRenderTarget)
 		return false;
 
-	IWICBitmapDecoder *decoder = nullptr;
-	HRESULT hr = m_wicFactory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
-							     WICDecodeMetadataCacheOnLoad, &decoder);
-	if (FAILED(hr) || !decoder)
+	std::vector<overlay::gif::DecodedFrame> decoded;
+	if (!overlay::gif::DecodeFile(m_wicFactory, path, decoded) || decoded.empty())
 		return false;
 
-	IWICBitmapFrameDecode *frame = nullptr;
-	hr = decoder->GetFrame(0, &frame);
-	decoder->Release();
-	if (FAILED(hr) || !frame)
-		return false;
+	CustomSlot &s = m_custom[slot];
+	s.frames.clear();
+	s.frames.reserve(decoded.size());
+	s.frameIndex = 0;
+	s.frameStartTick = 0;
 
-	IWICFormatConverter *converter = nullptr;
-	hr = m_wicFactory->CreateFormatConverter(&converter);
-	if (FAILED(hr) || !converter) {
-		frame->Release();
-		return false;
+	for (const overlay::gif::DecodedFrame &src : decoded) {
+		CustomFrame frame;
+		frame.delayMs = src.delayMs;
+		if (!CreateFrameBitmaps(slot, frame, src.w, src.h, src.bgra.data(), src.stride)) {
+			for (CustomFrame &f : s.frames) {
+				if (f.original) {
+					f.original->Release();
+					f.original = nullptr;
+				}
+				if (f.tinted) {
+					f.tinted->Release();
+					f.tinted = nullptr;
+				}
+			}
+			s.frames.clear();
+			return false;
+		}
+		RebuildTintedFrame(frame, s.tintEnabled, s.colorRgb);
+		s.frames.push_back(std::move(frame));
 	}
 
-	hr = converter->Initialize(frame, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0f,
-				   WICBitmapPaletteTypeCustom);
-	frame->Release();
-	if (FAILED(hr)) {
-		converter->Release();
-		return false;
-	}
-
-	UINT w = 0, h = 0;
-	converter->GetSize(&w, &h);
-	if (w == 0 || h == 0) {
-		converter->Release();
-		return false;
-	}
-
-	const UINT stride = w * 4;
-	std::vector<uint8_t> pixels(static_cast<size_t>(stride) * static_cast<size_t>(h));
-	hr = converter->CopyPixels(nullptr, stride, static_cast<UINT>(pixels.size()), pixels.data());
-	converter->Release();
-	if (FAILED(hr))
-		return false;
-
-	return CreateBitmapsFromPixels(slot, w, h, pixels.data(), stride);
+	SyncTimerInterval();
+	return !s.frames.empty() && s.frames[0].original != nullptr;
 }
 
 bool OverlayIndicators::LoadSvgCustom(int slot, const std::wstring &path)
@@ -734,7 +752,19 @@ bool OverlayIndicators::LoadSvgCustom(int slot, const std::wstring &path)
 		obs_log(LOG_WARNING, "Indicators: SVG rasterize failed for slot %d", slot);
 		return false;
 	}
-	return CreateBitmapsFromPixels(slot, w, h, bgra.data(), stride);
+
+	CustomSlot &s = m_custom[slot];
+	s.frames.clear();
+	s.frameIndex = 0;
+	s.frameStartTick = 0;
+
+	CustomFrame frame;
+	if (!CreateFrameBitmaps(slot, frame, w, h, bgra.data(), stride))
+		return false;
+	RebuildTintedFrame(frame, s.tintEnabled, s.colorRgb);
+	s.frames.push_back(std::move(frame));
+	SyncTimerInterval();
+	return true;
 }
 
 bool OverlayIndicators::EnsureCustomBitmap(int slot)
@@ -745,7 +775,7 @@ bool OverlayIndicators::EnsureCustomBitmap(int slot)
 	CustomSlot &s = m_custom[slot];
 	if (s.path.empty())
 		return false;
-	if (s.original)
+	if (!s.frames.empty() && s.frames[0].original)
 		return true;
 	if (s.loadAttempted)
 		return false;
@@ -757,7 +787,31 @@ bool OverlayIndicators::EnsureCustomBitmap(int slot)
 		s.loadFailed = true;
 		obs_log(LOG_WARNING, "Indicators: failed to load custom icon for slot %d", slot);
 	}
-	return ok && s.original != nullptr;
+	return ok && !s.frames.empty() && s.frames[0].original != nullptr;
+}
+
+void OverlayIndicators::AdvanceCustomAnimation(int slot, ULONGLONG now)
+{
+	if (slot < 0 || slot >= CUSTOM_SLOT_COUNT)
+		return;
+	CustomSlot &s = m_custom[slot];
+	if (s.frames.size() <= 1)
+		return;
+	if (s.frameStartTick == 0)
+		s.frameStartTick = now;
+
+	int guard = 0;
+	while (guard++ < 64) {
+		const UINT delay = s.frames[s.frameIndex].delayMs < 20 ? 20u : s.frames[s.frameIndex].delayMs;
+		if (now < s.frameStartTick + delay)
+			break;
+		s.frameStartTick += delay;
+		s.frameIndex = (s.frameIndex + 1) % s.frames.size();
+		if (now > s.frameStartTick + 2000) {
+			s.frameStartTick = now;
+			break;
+		}
+	}
 }
 
 bool OverlayIndicators::DrawCustomIcon(int slot, const RECT &rect, float opacity)
@@ -766,7 +820,14 @@ bool OverlayIndicators::DrawCustomIcon(int slot, const RECT &rect, float opacity
 		return false;
 
 	CustomSlot &s = m_custom[slot];
-	ID2D1Bitmap *bmp = (s.tintEnabled && s.tinted) ? s.tinted : s.original;
+	AdvanceCustomAnimation(slot, GetTickCount64());
+	if (s.frames.empty())
+		return false;
+	if (s.frameIndex >= s.frames.size())
+		s.frameIndex = 0;
+
+	CustomFrame &frame = s.frames[s.frameIndex];
+	ID2D1Bitmap *bmp = (s.tintEnabled && frame.tinted) ? frame.tinted : frame.original;
 	if (!bmp)
 		return false;
 

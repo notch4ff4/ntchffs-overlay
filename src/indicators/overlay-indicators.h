@@ -41,15 +41,22 @@ public:
 	void RaiseTopmost();
 
 private:
-	struct CustomSlot {
-		std::wstring path;
-		bool tintEnabled = false;
-		int colorRgb = 0xFFFFFF;
+	struct CustomFrame {
 		ID2D1Bitmap *original = nullptr;
 		ID2D1Bitmap *tinted = nullptr;
 		std::vector<uint8_t> alpha;
 		UINT maskW = 0;
 		UINT maskH = 0;
+		UINT delayMs = 100;
+	};
+
+	struct CustomSlot {
+		std::wstring path;
+		bool tintEnabled = false;
+		int colorRgb = 0xFFFFFF;
+		std::vector<CustomFrame> frames;
+		size_t frameIndex = 0;
+		ULONGLONG frameStartTick = 0;
 		bool loadAttempted = false;
 		bool loadFailed = false;
 	};
@@ -58,6 +65,8 @@ private:
 	void Render();
 	void UpdateWindowLayout();
 	void EnsureTimer();
+	void SyncTimerInterval();
+	bool HasAnimatedCustom() const;
 	void CreateDeviceResources();
 	void DiscardDeviceResources();
 	void ReleaseCustomBitmaps();
@@ -65,8 +74,10 @@ private:
 	bool EnsureCustomBitmap(int slot);
 	bool LoadRasterCustom(int slot, const std::wstring &path);
 	bool LoadSvgCustom(int slot, const std::wstring &path);
-	bool CreateBitmapsFromPixels(int slot, UINT w, UINT h, const uint8_t *bgra, UINT stride);
+	bool CreateFrameBitmaps(int slot, CustomFrame &frame, UINT w, UINT h, const uint8_t *bgra, UINT stride);
 	void RebuildTintedBitmap(int slot);
+	void RebuildTintedFrame(CustomFrame &frame, bool tintEnabled, int colorRgb);
+	void AdvanceCustomAnimation(int slot, ULONGLONG now);
 	bool DrawCustomIcon(int slot, const RECT &rect, float opacity);
 	void DrawBuiltinIcon(int slot, const RECT &rect, float opacity);
 	void RenderIndicators();
@@ -110,6 +121,7 @@ private:
 	ULONGLONG m_replaySavedIndicatorStartTick;
 	ULONGLONG m_replaySavedUntil;
 	UINT_PTR m_updateTimer;
+	UINT m_timerIntervalMs;
 	int m_windowWidth;
 	int m_windowHeight;
 
