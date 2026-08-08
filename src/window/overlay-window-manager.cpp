@@ -11,6 +11,7 @@ extern "C" {
 OverlayWindowManager::OverlayWindowManager()
 	: m_hwnd(nullptr), m_hInstance(nullptr),
 	  m_clickHandler(nullptr), m_clickUserData(nullptr),
+	  m_rightClickHandler(nullptr), m_rightClickUserData(nullptr),
 	  m_mouseDownHandler(nullptr), m_mouseDownUserData(nullptr),
 	  m_mouseUpHandler(nullptr), m_mouseUpUserData(nullptr),
 	  m_mouseMoveHandler(nullptr), m_mouseMoveUserData(nullptr),
@@ -18,6 +19,7 @@ OverlayWindowManager::OverlayWindowManager()
 	  m_keyHandler(nullptr), m_keyHandlerUserData(nullptr),
 	  m_hotkeyHandler(nullptr), m_hotkeyHandlerUserData(nullptr),
 	  m_wheelHandler(nullptr), m_wheelHandlerUserData(nullptr),
+	  m_deferredHandler(nullptr), m_deferredUserData(nullptr),
 	  m_trackingMouseLeave(false), m_allowActivate(false),
 	  m_keyboardHook(nullptr) {
 }
@@ -68,6 +70,18 @@ LRESULT CALLBACK OverlayWindowManager::WindowProc(HWND hwnd, UINT msg, WPARAM wP
 		int y = HIWORD(lParam);
 		if (manager->m_mouseUpHandler) {
 			manager->m_mouseUpHandler(x, y, manager->m_mouseUpUserData);
+		}
+		return 0;
+	}
+
+	case WM_RBUTTONDOWN: {
+		if (manager->m_allowActivate) {
+			manager->ForceForeground();
+		}
+		int x = LOWORD(lParam);
+		int y = HIWORD(lParam);
+		if (manager->m_rightClickHandler) {
+			manager->m_rightClickHandler(x, y, manager->m_rightClickUserData);
 		}
 		return 0;
 	}
@@ -147,6 +161,13 @@ LRESULT CALLBACK OverlayWindowManager::WindowProc(HWND hwnd, UINT msg, WPARAM wP
 	case WM_HOTKEY: {
 		if (manager->m_hotkeyHandler) {
 			manager->m_hotkeyHandler(static_cast<int>(wParam), manager->m_hotkeyHandlerUserData);
+		}
+		return 0;
+	}
+
+	case WM_APP + 42: {
+		if (manager->m_deferredHandler) {
+			manager->m_deferredHandler(manager->m_deferredUserData);
 		}
 		return 0;
 	}
@@ -262,6 +283,11 @@ void OverlayWindowManager::SetClickHandler(void (*handler)(int x, int y, void *u
 	m_clickUserData = userData;
 }
 
+void OverlayWindowManager::SetRightClickHandler(void (*handler)(int x, int y, void *userData), void *userData) {
+	m_rightClickHandler = handler;
+	m_rightClickUserData = userData;
+}
+
 void OverlayWindowManager::SetMouseDownHandler(void (*handler)(int x, int y, void *userData), void *userData) {
 	m_mouseDownHandler = handler;
 	m_mouseDownUserData = userData;
@@ -295,6 +321,17 @@ void OverlayWindowManager::SetHotkeyHandler(void (*handler)(int id, void *userDa
 void OverlayWindowManager::SetWheelHandler(void (*handler)(int delta, int x, int y, void *userData), void *userData) {
 	m_wheelHandler = handler;
 	m_wheelHandlerUserData = userData;
+}
+
+void OverlayWindowManager::SetDeferredHandler(void (*handler)(void *userData), void *userData) {
+	m_deferredHandler = handler;
+	m_deferredUserData = userData;
+}
+
+void OverlayWindowManager::PostDeferred() {
+	if (m_hwnd) {
+		PostMessageW(m_hwnd, WM_APP + 42, 0, 0);
+	}
 }
 
 void OverlayWindowManager::SetKeyboardCaptureActive(bool active) {

@@ -38,6 +38,11 @@ extern "C" {
 
 OverlayRenderer *OverlayRenderer::s_timerInstance = nullptr;
 
+namespace {
+constexpr UINT_PTR kOpenWithTimerId = 42;
+constexpr UINT kOpenWithDelayMs = 200;
+} // namespace
+
 // Anchor symbol so GetModuleHandleEx can resolve this DLL for embedded icons.
 static int g_overlayIconsModuleAnchor = 0;
 
@@ -143,6 +148,9 @@ OverlayRenderer::OverlayRenderer()
 	  m_galleryVolume(100),
 	  m_galleryExportSubmenuOpen(false),
 	  m_galleryAudioTrackSubmenuOpen(false),
+	  m_galleryContextMenuOpen(false),
+	  m_galleryContextMenuIndex(-1),
+	  m_galleryContextMenuHoverIndex(-1),
 	  m_dragCandidate(false),
 	  m_dragActive(false),
 	  m_timelineDragging(false),
@@ -186,6 +194,8 @@ OverlayRenderer::OverlayRenderer()
 	ZeroMemory(&m_galleryAudioTrackButtonRect, sizeof(m_galleryAudioTrackButtonRect));
 	ZeroMemory(&m_galleryAudioTrackMenuRect, sizeof(m_galleryAudioTrackMenuRect));
 	ZeroMemory(&m_galleryExportCancelRect, sizeof(m_galleryExportCancelRect));
+	ZeroMemory(&m_galleryContextMenuRect, sizeof(m_galleryContextMenuRect));
+	ZeroMemory(&m_galleryContextMenuAnchor, sizeof(m_galleryContextMenuAnchor));
 	for (int i = 0; i < ICON_CACHE_SIZE; i++) {
 		m_iconBitmaps[i] = nullptr;
 		m_iconMasks[i] = IconMask{};
@@ -244,11 +254,18 @@ OverlayRenderer::~OverlayRenderer()
 
 void CALLBACK OverlayRenderer::TimerProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD time)
 {
-	UNUSED_PARAMETER(hwnd);
 	UNUSED_PARAMETER(msg);
-	UNUSED_PARAMETER(id);
 	UNUSED_PARAMETER(time);
 
+	if (id == kOpenWithTimerId) {
+		KillTimer(hwnd, kOpenWithTimerId);
+		if (s_timerInstance) {
+			s_timerInstance->RunPendingOpenWith();
+		}
+		return;
+	}
+
+	UNUSED_PARAMETER(hwnd);
 	if (s_timerInstance) {
 		s_timerInstance->UpdateStatus();
 		s_timerInstance->Render();
@@ -377,6 +394,22 @@ bool OverlayRenderer::Initialize(HINSTANCE hInstance)
 			OverlayRenderer *renderer = static_cast<OverlayRenderer *>(userData);
 			if (renderer) {
 				renderer->HandleClick(x, y);
+			}
+		},
+		this);
+	m_windowManager.SetRightClickHandler(
+		[](int x, int y, void *userData) {
+			OverlayRenderer *renderer = static_cast<OverlayRenderer *>(userData);
+			if (renderer) {
+				renderer->HandleRightClick(x, y);
+			}
+		},
+		this);
+	m_windowManager.SetDeferredHandler(
+		[](void *userData) {
+			OverlayRenderer *renderer = static_cast<OverlayRenderer *>(userData);
+			if (renderer) {
+				renderer->RunPendingOpenWith();
 			}
 		},
 		this);
@@ -2649,6 +2682,309 @@ HGLOBAL CreateHDropData(const std::wstring &path)
 	return hMem;
 }
 
+bool CopyFileToClipboard(HWND hwnd, const std::wstring &path, bool cut)
+{
+	HGLOBAL hDrop = CreateHDropData(path);
+	if (!hDrop) {
+		return false;
+	}
+
+	UINT dropEffectFormat = RegisterClipboardFormat(CFSTR_PREFERREDDROPEFFECT);
+	HGLOBAL hEffect = nullptr;
+	if (dropEffectFormat != 0) {
+		hEffect = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, sizeof(DWORD));
+		if (!hEffect) {
+			GlobalFree(hDrop);
+			return false;
+		}
+		DWORD *effect = static_cast<DWORD *>(GlobalLock(hEffect));
+		if (!effect) {
+			GlobalFree(hDrop);
+			GlobalFree(hEffect);
+			return false;
+		}
+		*effect = cut ? DROPEFFECT_MOVE : DROPEFFECT_COPY;
+		GlobalUnlock(hEffect);
+	}
+
+	if (!OpenClipboard(hwnd)) {
+		GlobalFree(hDrop);
+		if (hEffect) {
+			GlobalFree(hEffect);
+		}
+		return false;
+	}
+	EmptyClipboard();
+	SetClipboardData(CF_HDROP, hDrop);
+	if (dropEffectFormat != 0 && hEffect) {
+		SetClipboardData(dropEffectFormat, hEffect);
+	} else if (hEffect) {
+		GlobalFree(hEffect);
+	}
+	CloseClipboard();
+	return true;
+}
+
+bool CopyPathToClipboard(HWND hwnd, const std::wstring &path)
+{
+	const size_t bytes = (path.size() + 1) * sizeof(wchar_t);
+	HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+	if (!hMem) {
+		return false;
+	}
+	wchar_t *dest = static_cast<wchar_t *>(GlobalLock(hMem));
+	if (!dest) {
+		GlobalFree(hMem);
+		return false;
+	}
+	wcscpy_s(dest, path.size() + 1, path.c_str());
+	GlobalUnlock(hMem);
+
+	if (!OpenClipboard(hwnd)) {
+		GlobalFree(hMem);
+		return false;
+	}
+	EmptyClipboard();
+	SetClipboardData(CF_UNICODETEXT, hMem);
+	CloseClipboard();
+	return true;
+}
+
+void ShowFileInExplorer(const std::wstring &path)
+{
+	PIDLIST_ABSOLUTE pidl = ILCreateFromPathW(path.c_str());
+	if (!pidl) {
+		return;
+	}
+	SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0);
+	ILFree(pidl);
+}
+
+void OpenWithDialog(HWND /*unused*/, const std::wstring &path)
+{
+	// SHOpenWithDialog can open minimized when the last active window is a hidden
+	// topmost overlay. Use a short-lived normal owner instead.
+	HWND owner = CreateWindowExW(WS_EX_TOOLWINDOW, L"STATIC", L"", WS_POPUP, 0, 0, 1, 1, nullptr,
+				     nullptr, GetModuleHandleW(nullptr), nullptr);
+	if (owner) {
+		ShowWindow(owner, SW_SHOWNORMAL);
+		BringWindowToTop(owner);
+	}
+
+	OPENASINFO info = {};
+	info.pcszFile = path.c_str();
+	info.pcszClass = nullptr;
+	info.oaifInFlags = OAIF_EXEC;
+	SHOpenWithDialog(owner, &info);
+
+	if (owner) {
+		DestroyWindow(owner);
+	}
+}
+
+struct RenamePromptState {
+	std::wstring text;
+	bool accepted = false;
+	bool closed = false;
+};
+
+constexpr int kRenameEditId = 1001;
+constexpr wchar_t kRenamePromptClass[] = L"NtchffsOverlayRenamePrompt";
+
+LRESULT CALLBACK RenamePromptWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	RenamePromptState *state = reinterpret_cast<RenamePromptState *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+	switch (msg) {
+	case WM_CREATE: {
+		auto *cs = reinterpret_cast<CREATESTRUCTW *>(lParam);
+		state = static_cast<RenamePromptState *>(cs->lpCreateParams);
+		SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+
+		HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", state->text.c_str(),
+					    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 12, 14, 360, 26,
+					    hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRenameEditId)),
+					    cs->hInstance, nullptr);
+		CreateWindowW(L"BUTTON", overlay::util::ModuleTextW("OK").c_str(),
+			      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 200, 52, 84, 28, hwnd,
+			      reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), cs->hInstance, nullptr);
+		CreateWindowW(L"BUTTON", overlay::util::ModuleTextW("Cancel").c_str(),
+			      WS_CHILD | WS_VISIBLE | WS_TABSTOP, 292, 52, 84, 28, hwnd,
+			      reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)), cs->hInstance, nullptr);
+
+		if (edit) {
+			SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),
+				     TRUE);
+			size_t selEnd = state->text.find_last_of(L'.');
+			if (selEnd == std::wstring::npos) {
+				selEnd = state->text.size();
+			}
+			SendMessageW(edit, EM_SETSEL, 0, static_cast<LPARAM>(selEnd));
+			SetFocus(edit);
+		}
+		HWND okBtn = GetDlgItem(hwnd, IDOK);
+		HWND cancelBtn = GetDlgItem(hwnd, IDCANCEL);
+		if (okBtn) {
+			SendMessageW(okBtn, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),
+				     TRUE);
+		}
+		if (cancelBtn) {
+			SendMessageW(cancelBtn, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),
+				     TRUE);
+		}
+		return 0;
+	}
+	case WM_COMMAND: {
+		const int id = LOWORD(wParam);
+		if (id == IDOK && state) {
+			wchar_t buf[MAX_PATH] = {};
+			GetWindowTextW(GetDlgItem(hwnd, kRenameEditId), buf, MAX_PATH);
+			state->text = buf;
+			state->accepted = true;
+			DestroyWindow(hwnd);
+			return 0;
+		}
+		if (id == IDCANCEL) {
+			DestroyWindow(hwnd);
+			return 0;
+		}
+		break;
+	}
+	case WM_CLOSE:
+		DestroyWindow(hwnd);
+		return 0;
+	case WM_DESTROY:
+		if (state) {
+			state->closed = true;
+		}
+		return 0;
+	}
+	return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+bool EnsureRenamePromptClass(HINSTANCE instance)
+{
+	static bool registered = false;
+	if (registered) {
+		return true;
+	}
+	WNDCLASSEXW wc = {};
+	wc.cbSize = sizeof(wc);
+	wc.lpfnWndProc = RenamePromptWndProc;
+	wc.hInstance = instance;
+	wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+	wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+	wc.lpszClassName = kRenamePromptClass;
+	if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+		return false;
+	}
+	registered = true;
+	return true;
+}
+
+bool PromptRenameFileName(HWND owner, std::wstring &nameInOut)
+{
+	HMODULE instance = nullptr;
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			   reinterpret_cast<LPCWSTR>(&RenamePromptWndProc), &instance);
+	if (!instance) {
+		instance = GetModuleHandleW(nullptr);
+	}
+	if (!EnsureRenamePromptClass(instance)) {
+		return false;
+	}
+
+	RenamePromptState state;
+	state.text = nameInOut;
+
+	const int width = 400;
+	const int height = 120;
+	RECT ownerRect = {};
+	if (owner) {
+		GetWindowRect(owner, &ownerRect);
+	} else {
+		SystemParametersInfoW(SPI_GETWORKAREA, 0, &ownerRect, 0);
+	}
+	const int x = ownerRect.left + ((ownerRect.right - ownerRect.left) - width) / 2;
+	const int y = ownerRect.top + ((ownerRect.bottom - ownerRect.top) - height) / 2;
+
+	HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, kRenamePromptClass,
+				    overlay::util::ModuleTextW("Gallery.Ctx.Rename").c_str(),
+				    WS_POPUP | WS_CAPTION | WS_SYSMENU, x, y, width, height, owner, nullptr,
+				    instance, &state);
+	if (!hwnd) {
+		return false;
+	}
+
+	if (owner) {
+		EnableWindow(owner, FALSE);
+	}
+	ShowWindow(hwnd, SW_SHOW);
+	UpdateWindow(hwnd);
+
+	MSG msg = {};
+	while (!state.closed && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+		if (!IsDialogMessageW(hwnd, &msg)) {
+			TranslateMessage(&msg);
+			DispatchMessageW(&msg);
+		}
+	}
+
+	if (owner) {
+		EnableWindow(owner, TRUE);
+		SetForegroundWindow(owner);
+	}
+
+	if (!state.accepted) {
+		return false;
+	}
+	nameInOut = state.text;
+	return true;
+}
+
+bool IsValidFileName(const std::wstring &name)
+{
+	if (name.empty() || name == L"." || name == L"..") {
+		return false;
+	}
+	if (name.find_first_of(L"\\/:*?\"<>|") != std::wstring::npos) {
+		return false;
+	}
+	if (name.back() == L'.' || name.back() == L' ') {
+		return false;
+	}
+	return true;
+}
+
+enum class GalleryContextAction {
+	OpenFolder = 0,
+	OpenWith,
+	Copy,
+	CopyPath,
+	Rename,
+	Delete,
+	Count
+};
+
+const char *GalleryContextActionLocaleKey(GalleryContextAction action)
+{
+	switch (action) {
+	case GalleryContextAction::OpenFolder:
+		return "Gallery.Ctx.OpenFolder";
+	case GalleryContextAction::OpenWith:
+		return "Gallery.Ctx.OpenWith";
+	case GalleryContextAction::Copy:
+		return "Gallery.Ctx.Copy";
+	case GalleryContextAction::CopyPath:
+		return "Gallery.Ctx.CopyPath";
+	case GalleryContextAction::Rename:
+		return "Gallery.Ctx.Rename";
+	case GalleryContextAction::Delete:
+		return "Gallery.Ctx.Delete";
+	default:
+		return "Gallery.Ctx.Copy";
+	}
+}
+
 class SimpleDataObject : public IDataObject {
 public:
 	explicit SimpleDataObject(const std::wstring &path) : m_ref(1), m_path(path) {}
@@ -2782,6 +3118,9 @@ void OverlayRenderer::OpenGallery()
 	m_galleryTrimIn = 0.0;
 	m_galleryTrimOut = 0.0;
 	m_galleryTrimUserSet = false;
+	m_galleryExportSubmenuOpen = false;
+	m_galleryAudioTrackSubmenuOpen = false;
+	CloseGalleryContextMenu();
 	m_trimmer.Reset();
 	SetUpdateInterval(16);
 	m_videoPlayer.SetMuted(m_galleryMuted);
@@ -2846,6 +3185,7 @@ void OverlayRenderer::OpenGalleryFile(const std::wstring &filePath)
 	m_galleryTrimUserSet = false;
 	m_galleryExportSubmenuOpen = false;
 	m_galleryAudioTrackSubmenuOpen = false;
+	CloseGalleryContextMenu();
 	m_trimmer.Reset();
 	SetUpdateInterval(16);
 	m_videoPlayer.SetMuted(m_galleryMuted);
@@ -2909,6 +3249,7 @@ void OverlayRenderer::CloseGallery()
 	m_galleryFullscreen = false;
 	m_galleryExportSubmenuOpen = false;
 	m_galleryAudioTrackSubmenuOpen = false;
+	CloseGalleryContextMenu();
 	m_sharedFolderToOpenOnSuccess.clear();
 	m_gallerySelectedIndex = -1;
 	m_galleryPage = 0;
@@ -3207,6 +3548,7 @@ void OverlayRenderer::RenderGallery()
 		   D2D1::ColorF(0.86f, 0.86f, 0.9f), DWRITE_TEXT_ALIGNMENT_TRAILING);
 
 	RenderGalleryControls(m_galleryControlsRect);
+	RenderGalleryContextMenu(width, height);
 }
 
 void OverlayRenderer::RenderGalleryList(const RECT &listRect, int itemHeight, int itemsPerPageHint)
@@ -3341,9 +3683,7 @@ void OverlayRenderer::RenderGalleryControls(const RECT &controlsRect)
 				float radius = optH / 2.0f;
 				bool isCurrent = (i == m_videoPlayer.GetCurrentAudioTrackIndex());
 				DrawRoundedRectangle(optRect, radius,
-						     isCurrent ? AccentSelected()
-							       : D2D1::ColorF(45.0f / 255.0f, 42.0f / 255.0f, 58.0f / 255.0f,
-									     1.0f));
+						     isCurrent ? AccentSelected() : AccentHover(0.40f));
 				OverlayVideoPlayer::AudioTrackInfo info;
 				m_videoPlayer.GetAudioTrackInfo(i, info);
 				std::wstring rowLabel = std::to_wstring(i + 1) + L": " + WideFromUtf8(info.name);
@@ -3555,7 +3895,15 @@ static void getHotkeyVkMod(obs_data_t *data, const char *name, int defaultVk, in
 
 void OverlayRenderer::HandleGalleryKey(int vkCode, int mods)
 {
-	if (!m_galleryOpen || m_gallerySelectedIndex < 0) {
+	if (!m_galleryOpen) {
+		return;
+	}
+	if (vkCode == VK_ESCAPE && m_galleryContextMenuOpen) {
+		CloseGalleryContextMenu();
+		Render();
+		return;
+	}
+	if (m_gallerySelectedIndex < 0) {
 		return;
 	}
 	if (m_trimmer.GetStatus() == OverlayTrimmer::Status::Trimming) {
@@ -5154,6 +5502,257 @@ void OverlayRenderer::HandleSettingsWheel(int delta)
 	Render();
 }
 
+void OverlayRenderer::CloseGalleryContextMenu()
+{
+	m_galleryContextMenuOpen = false;
+	m_galleryContextMenuIndex = -1;
+	m_galleryContextMenuHoverIndex = -1;
+	m_galleryContextMenuItemRects.clear();
+	ZeroMemory(&m_galleryContextMenuRect, sizeof(m_galleryContextMenuRect));
+}
+
+void OverlayRenderer::RunPendingOpenWith()
+{
+	HWND hwnd = m_windowManager.GetHWND();
+	if (hwnd) {
+		KillTimer(hwnd, kOpenWithTimerId);
+	}
+	if (m_pendingOpenWithPath.empty()) {
+		return;
+	}
+	std::wstring path = m_pendingOpenWithPath;
+	m_pendingOpenWithPath.clear();
+	OpenWithDialog(nullptr, path);
+}
+
+void OverlayRenderer::RenderGalleryContextMenu(int galleryWidth, int galleryHeight)
+{
+	m_galleryContextMenuItemRects.clear();
+	if (!m_galleryContextMenuOpen) {
+		ZeroMemory(&m_galleryContextMenuRect, sizeof(m_galleryContextMenuRect));
+		return;
+	}
+
+	const int actionCount = static_cast<int>(GalleryContextAction::Count);
+	const int pad = 4;
+	const int optH = 26;
+	const int gap = 2;
+	const int menuW = 210;
+	const int menuH = pad * 2 + actionCount * (optH + gap) - gap;
+
+	int left = m_galleryContextMenuAnchor.x;
+	int top = m_galleryContextMenuAnchor.y;
+	if (left + menuW > galleryWidth - 8) {
+		left = galleryWidth - 8 - menuW;
+	}
+	if (top + menuH > galleryHeight - 8) {
+		top = galleryHeight - 8 - menuH;
+	}
+	if (left < 8) {
+		left = 8;
+	}
+	if (top < 8) {
+		top = 8;
+	}
+
+	RECT panel = {left, top, left + menuW, top + menuH};
+	m_galleryContextMenuRect = panel;
+	DrawRoundedRectangle(panel, 8.0f, AccentPanel());
+	DrawRoundedRectangleBorder(panel, 8.0f, 1.0f,
+				   D2D1::ColorF(58.0f / 255.0f, 58.0f / 255.0f, 69.0f / 255.0f, 1.0f));
+
+	for (int i = 0; i < actionCount; ++i) {
+		int rowTop = top + pad + i * (optH + gap);
+		RECT optRect = {left + pad, rowTop, left + menuW - pad, rowTop + optH};
+		m_galleryContextMenuItemRects.push_back(optRect);
+		const bool hovered = (i == m_galleryContextMenuHoverIndex);
+		DrawRoundedRectangle(optRect, 6.0f, hovered ? AccentSelected() : AccentHover(0.40f));
+		RECT textRect = {optRect.left + 10, optRect.top, optRect.right - 6, optRect.bottom};
+		RenderText(overlay::util::ModuleTextW(
+				   GalleryContextActionLocaleKey(static_cast<GalleryContextAction>(i))),
+			   textRect, 9.5f, DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(0.95f, 0.95f, 0.95f),
+			   DWRITE_TEXT_ALIGNMENT_LEADING);
+	}
+}
+
+int OverlayRenderer::GalleryListItemIndexAt(const POINT &pt) const
+{
+	if (!IsPointInRect(pt, m_galleryListRect)) {
+		return -1;
+	}
+	int itemsAreaBottom = m_galleryListRect.bottom - 34;
+	if (pt.y >= itemsAreaBottom) {
+		return -1;
+	}
+	int itemsAreaHeight = itemsAreaBottom - m_galleryListRect.top;
+	int itemHeight = 52;
+	int itemsPerPage = std::max(1, itemsAreaHeight / itemHeight);
+	int startIndex = m_galleryPage * itemsPerPage;
+	int localY = pt.y - (m_galleryListRect.top + 8);
+	if (localY < 0) {
+		return -1;
+	}
+	int indexInPage = localY / itemHeight;
+	int itemIndex = startIndex + indexInPage;
+	if (!m_gallery.GetItem(itemIndex)) {
+		return -1;
+	}
+	return itemIndex;
+}
+
+bool OverlayRenderer::DeleteGallerySelectedVideo()
+{
+	const GalleryItem *item = m_gallery.GetItem(m_gallerySelectedIndex);
+	if (!item || item->type != GalleryItem::Type::Video) {
+		return false;
+	}
+	int ret = MessageBoxW(m_windowManager.GetHWND(), item->name.c_str(),
+			      overlay::util::ModuleTextW("DeleteFile").c_str(), MB_YESNO | MB_ICONQUESTION);
+	if (ret != IDYES) {
+		return false;
+	}
+	std::wstring pathToDelete = item->path;
+	m_videoPlayer.Close();
+	if (!DeleteFileW(pathToDelete.c_str())) {
+		return false;
+	}
+	m_gallery.ReloadCurrent();
+	int count = static_cast<int>(m_gallery.GetItems().size());
+	if (count == 0) {
+		m_gallerySelectedIndex = -1;
+	} else {
+		m_gallerySelectedIndex =
+			(m_gallerySelectedIndex >= count) ? count - 1 : m_gallerySelectedIndex;
+		const GalleryItem *nextItem = m_gallery.GetItem(m_gallerySelectedIndex);
+		if (nextItem && nextItem->type == GalleryItem::Type::Video) {
+			m_videoPlayer.Open(nextItem->path);
+			m_galleryTrimIn = 0.0;
+			m_galleryTrimOut = m_videoPlayer.GetDuration();
+			m_galleryTrimUserSet = false;
+		} else {
+			m_gallerySelectedIndex = -1;
+		}
+	}
+	return true;
+}
+
+bool OverlayRenderer::RenameGalleryContextVideo()
+{
+	const GalleryItem *item = m_gallery.GetItem(m_galleryContextMenuIndex);
+	if (!item || item->type != GalleryItem::Type::Video) {
+		return false;
+	}
+
+	std::wstring newName = item->name;
+	HWND hwnd = m_windowManager.GetHWND();
+	if (!PromptRenameFileName(hwnd, newName)) {
+		return false;
+	}
+
+	// Trim whitespace
+	while (!newName.empty() && (newName.front() == L' ' || newName.front() == L'\t')) {
+		newName.erase(newName.begin());
+	}
+	while (!newName.empty() && (newName.back() == L' ' || newName.back() == L'\t')) {
+		newName.pop_back();
+	}
+
+	if (!IsValidFileName(newName)) {
+		MessageBoxW(hwnd, overlay::util::ModuleTextW("Gallery.Ctx.RenameInvalid").c_str(),
+			    overlay::util::ModuleTextW("Gallery.Ctx.Rename").c_str(), MB_OK | MB_ICONWARNING);
+		return false;
+	}
+	if (newName == item->name) {
+		return true;
+	}
+
+	const size_t slash = item->path.find_last_of(L"\\/");
+	if (slash == std::wstring::npos) {
+		return false;
+	}
+	const std::wstring newPath = item->path.substr(0, slash + 1) + newName;
+	if (GetFileAttributesW(newPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+		MessageBoxW(hwnd, overlay::util::ModuleTextW("Gallery.Ctx.RenameExists").c_str(),
+			    overlay::util::ModuleTextW("Gallery.Ctx.Rename").c_str(), MB_OK | MB_ICONWARNING);
+		return false;
+	}
+
+	const bool wasOpen = (m_gallerySelectedIndex == m_galleryContextMenuIndex);
+	const std::wstring oldPath = item->path;
+	if (wasOpen) {
+		m_videoPlayer.Close();
+	}
+
+	if (!MoveFileW(oldPath.c_str(), newPath.c_str())) {
+		if (wasOpen) {
+			m_videoPlayer.Open(oldPath);
+			m_galleryTrimIn = 0.0;
+			m_galleryTrimOut = m_videoPlayer.GetDuration();
+			m_galleryTrimUserSet = false;
+		}
+		MessageBoxW(hwnd, overlay::util::ModuleTextW("Gallery.Ctx.RenameFailed").c_str(),
+			    overlay::util::ModuleTextW("Gallery.Ctx.Rename").c_str(), MB_OK | MB_ICONERROR);
+		return false;
+	}
+
+	m_gallery.ReloadCurrent();
+	int found = -1;
+	const std::vector<GalleryItem> &items = m_gallery.GetItems();
+	for (size_t i = 0; i < items.size(); ++i) {
+		if (items[i].type == GalleryItem::Type::Video && items[i].path == newPath) {
+			found = static_cast<int>(i);
+			break;
+		}
+	}
+	m_gallerySelectedIndex = found;
+	m_galleryContextMenuIndex = found;
+	if (found >= 0 && wasOpen) {
+		m_videoPlayer.Open(newPath);
+		m_galleryTrimIn = 0.0;
+		m_galleryTrimOut = m_videoPlayer.GetDuration();
+		m_galleryTrimUserSet = false;
+	}
+	return true;
+}
+
+bool OverlayRenderer::ExecuteGalleryContextAction(int actionIndex)
+{
+	const GalleryItem *item = m_gallery.GetItem(m_galleryContextMenuIndex);
+	if (!item || item->type != GalleryItem::Type::Video) {
+		return false;
+	}
+	HWND hwnd = m_windowManager.GetHWND();
+	switch (static_cast<GalleryContextAction>(actionIndex)) {
+	case GalleryContextAction::OpenFolder:
+		ShowFileInExplorer(item->path);
+		Hide();
+		return true;
+	case GalleryContextAction::OpenWith: {
+		// Wait out the click (LBUTTONUP); PostMessage is too early and the release dismisses the dialog.
+		m_pendingOpenWithPath = item->path;
+		ReleaseCapture();
+		Hide();
+		if (hwnd) {
+			s_timerInstance = this;
+			KillTimer(hwnd, kOpenWithTimerId);
+			SetTimer(hwnd, kOpenWithTimerId, kOpenWithDelayMs, TimerProc);
+		}
+		return true;
+	}
+	case GalleryContextAction::Copy:
+		return CopyFileToClipboard(hwnd, item->path, false);
+	case GalleryContextAction::CopyPath:
+		return CopyPathToClipboard(hwnd, item->path);
+	case GalleryContextAction::Rename:
+		return RenameGalleryContextVideo();
+	case GalleryContextAction::Delete:
+		m_gallerySelectedIndex = m_galleryContextMenuIndex;
+		return DeleteGallerySelectedVideo();
+	default:
+		return false;
+	}
+}
+
 void OverlayRenderer::HandleGalleryClick(int x, int y)
 {
 	POINT pt = ClientToLayoutPoint(x, y);
@@ -5163,6 +5762,26 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 		}
 		return;
 	}
+
+	if (m_galleryContextMenuOpen) {
+		if (IsPointInRect(pt, m_galleryContextMenuRect)) {
+			for (size_t i = 0; i < m_galleryContextMenuItemRects.size(); ++i) {
+				if (IsPointInRect(pt, m_galleryContextMenuItemRects[i])) {
+					ExecuteGalleryContextAction(static_cast<int>(i));
+					CloseGalleryContextMenu();
+					if (IsVisible()) {
+						Render();
+					}
+					return;
+				}
+			}
+			return;
+		}
+		CloseGalleryContextMenu();
+		Render();
+		return;
+	}
+
 	if (IsPointInRect(pt, m_galleryFullscreenRect)) {
 		m_galleryFullscreen = !m_galleryFullscreen;
 		overlay_settings_ensure();
@@ -5186,6 +5805,7 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 			m_galleryTrimUserSet = false;
 			m_galleryExportSubmenuOpen = false;
 			m_galleryAudioTrackSubmenuOpen = false;
+			CloseGalleryContextMenu();
 			Render();
 		}
 		return;
@@ -5342,6 +5962,7 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 			Render();
 			return;
 		} else if (IsPointInRect(pt, m_galleryAudioTrackButtonRect)) {
+			CloseGalleryContextMenu();
 			m_galleryAudioTrackSubmenuOpen = true;
 			Render();
 			return;
@@ -5371,12 +5992,14 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 
 	if (IsPointInRect(pt, m_galleryPrevPageRect) && m_galleryPage > 0) {
 		m_galleryPage--;
+		CloseGalleryContextMenu();
 		Render();
 		return;
 	}
 	int maxPage = (static_cast<int>(m_gallery.GetItems().size()) - 1) / itemsPerPage;
 	if (IsPointInRect(pt, m_galleryNextPageRect) && m_galleryPage < maxPage) {
 		m_galleryPage++;
+		CloseGalleryContextMenu();
 		Render();
 		return;
 	}
@@ -5390,6 +6013,7 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 		int itemIndex = startIndex + indexInPage;
 		const GalleryItem *item = m_gallery.GetItem(itemIndex);
 		if (item) {
+			CloseGalleryContextMenu();
 			if (item->type == GalleryItem::Type::Folder) {
 				if (m_gallery.EnterFolder(itemIndex)) {
 					m_galleryPage = 0;
@@ -5444,6 +6068,7 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 		if (!selected || selected->type != GalleryItem::Type::Video) {
 			return;
 		}
+		CloseGalleryContextMenu();
 		m_galleryExportSubmenuOpen = true;
 		m_galleryAudioTrackSubmenuOpen = false;
 		m_exportTrackStreamIndices.clear();
@@ -5476,39 +6101,52 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 	}
 
 	if (IsPointInRect(pt, m_galleryDeleteRect)) {
-		const GalleryItem *item = m_gallery.GetItem(m_gallerySelectedIndex);
-		if (item && item->type == GalleryItem::Type::Video) {
-			int ret = MessageBoxW(m_windowManager.GetHWND(), item->name.c_str(),
-					      overlay::util::ModuleTextW("DeleteFile").c_str(),
-					      MB_YESNO | MB_ICONQUESTION);
-			if (ret == IDYES) {
-				std::wstring pathToDelete = item->path;
-				m_videoPlayer.Close();
-				if (DeleteFileW(pathToDelete.c_str())) {
-					m_gallery.ReloadCurrent();
-					int count = static_cast<int>(m_gallery.GetItems().size());
-					if (count == 0) {
-						m_gallerySelectedIndex = -1;
-					} else {
-						m_gallerySelectedIndex = (m_gallerySelectedIndex >= count)
-										 ? count - 1
-										 : m_gallerySelectedIndex;
-						const GalleryItem *nextItem = m_gallery.GetItem(m_gallerySelectedIndex);
-						if (nextItem && nextItem->type == GalleryItem::Type::Video) {
-							m_videoPlayer.Open(nextItem->path);
-							m_galleryTrimIn = 0.0;
-							m_galleryTrimOut = m_videoPlayer.GetDuration();
-							m_galleryTrimUserSet = false;
-						} else {
-							m_gallerySelectedIndex = -1;
-						}
-					}
-				}
-				Render();
-			}
+		if (DeleteGallerySelectedVideo()) {
+			CloseGalleryContextMenu();
+			Render();
 		}
 		return;
 	}
+}
+
+void OverlayRenderer::HandleGalleryRightClick(int x, int y)
+{
+	POINT pt = ClientToLayoutPoint(x, y);
+	if (m_trimmer.GetStatus() == OverlayTrimmer::Status::Trimming) {
+		return;
+	}
+
+	if (m_galleryContextMenuOpen && !IsPointInRect(pt, m_galleryContextMenuRect)) {
+		CloseGalleryContextMenu();
+	}
+
+	int itemIndex = GalleryListItemIndexAt(pt);
+	const GalleryItem *item = m_gallery.GetItem(itemIndex);
+	if (!item || item->type != GalleryItem::Type::Video) {
+		if (m_galleryContextMenuOpen) {
+			CloseGalleryContextMenu();
+			Render();
+		}
+		return;
+	}
+
+	m_galleryExportSubmenuOpen = false;
+	m_galleryAudioTrackSubmenuOpen = false;
+
+	const bool alreadySelected = (itemIndex == m_gallerySelectedIndex);
+	m_gallerySelectedIndex = itemIndex;
+	if (!alreadySelected) {
+		m_videoPlayer.Open(item->path);
+		m_galleryTrimIn = 0.0;
+		m_galleryTrimOut = m_videoPlayer.GetDuration();
+		m_galleryTrimUserSet = false;
+	}
+
+	m_galleryContextMenuOpen = true;
+	m_galleryContextMenuIndex = itemIndex;
+	m_galleryContextMenuHoverIndex = -1;
+	m_galleryContextMenuAnchor = pt;
+	Render();
 }
 
 bool OverlayRenderer::HandleGalleryMouseDown(int x, int y)

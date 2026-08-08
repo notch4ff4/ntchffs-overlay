@@ -21,6 +21,7 @@ public:
 	void SetPosition(const POINT &pos, int width, int height);
 	
 	void SetClickHandler(void (*handler)(int x, int y, void *userData), void *userData);
+	void SetRightClickHandler(void (*handler)(int x, int y, void *userData), void *userData);
 	void SetMouseDownHandler(void (*handler)(int x, int y, void *userData), void *userData);
 	void SetMouseUpHandler(void (*handler)(int x, int y, void *userData), void *userData);
 	void SetMouseMoveHandler(void (*handler)(int x, int y, void *userData), void *userData);
@@ -43,6 +44,10 @@ public:
 	// Vertical mouse wheel; delta follows Win32 convention (positive = wheel away/up).
 	void SetWheelHandler(void (*handler)(int delta, int x, int y, void *userData), void *userData);
 
+	// Runs after the current input message finishes (e.g. after LBUTTONUP).
+	void SetDeferredHandler(void (*handler)(void *userData), void *userData);
+	void PostDeferred();
+
 	// While active, a low-level keyboard hook routes key presses to the key handler
 	// regardless of window focus (used to capture a hotkey bind without focus mode),
 	// and swallows them so they do not leak to the focused application.
@@ -57,6 +62,8 @@ private:
 	
 	void (*m_clickHandler)(int x, int y, void *userData);
 	void *m_clickUserData;
+	void (*m_rightClickHandler)(int x, int y, void *userData);
+	void *m_rightClickUserData;
 	void (*m_mouseDownHandler)(int x, int y, void *userData);
 	void *m_mouseDownUserData;
 	void (*m_mouseUpHandler)(int x, int y, void *userData);
@@ -71,6 +78,8 @@ private:
 	void *m_hotkeyHandlerUserData;
 	void (*m_wheelHandler)(int delta, int x, int y, void *userData);
 	void *m_wheelHandlerUserData;
+	void (*m_deferredHandler)(void *userData);
+	void *m_deferredUserData;
 	bool m_trackingMouseLeave;
 	bool m_allowActivate;
 	HHOOK m_keyboardHook;

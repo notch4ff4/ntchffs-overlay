@@ -53,6 +53,7 @@ public:
 	void OpenGalleryFile(const std::wstring &filePath);
 
 	void HandleClick(int x, int y);
+	void HandleRightClick(int x, int y);
 	void HandleMouseDown(int x, int y);
 	void HandleMouseUp(int x, int y);
 	
@@ -80,8 +81,16 @@ private:
 	void CloseGallery();
 	void ApplyGalleryWindowSize();
 	void HandleGalleryClick(int x, int y);
+	void HandleGalleryRightClick(int x, int y);
 	void HandleGalleryKey(int vkCode, int mods);
 	bool HandleGalleryMouseDown(int x, int y);
+	void CloseGalleryContextMenu();
+	void RenderGalleryContextMenu(int galleryWidth, int galleryHeight);
+	bool ExecuteGalleryContextAction(int actionIndex);
+	bool DeleteGallerySelectedVideo();
+	bool RenameGalleryContextVideo();
+	int GalleryListItemIndexAt(const POINT &pt) const;
+	void RunPendingOpenWith();
 
 	// --- In-overlay settings panel ---
 	void CloseSettings();
@@ -189,6 +198,13 @@ private:
 	int m_galleryVolume;
 	bool m_galleryExportSubmenuOpen;
 	bool m_galleryFullscreen;
+	bool m_galleryContextMenuOpen;
+	int m_galleryContextMenuIndex;
+	int m_galleryContextMenuHoverIndex;
+	POINT m_galleryContextMenuAnchor;
+	RECT m_galleryContextMenuRect;
+	std::vector<RECT> m_galleryContextMenuItemRects;
+	std::wstring m_pendingOpenWithPath;
 	std::wstring m_sharedFolderToOpenOnSuccess;
 	// Defer opening until export succeeds.
 	OverlayGallery m_gallery;

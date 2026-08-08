@@ -122,13 +122,24 @@ void OverlayRenderer::HandleClick(int x, int y)
 	}
 }
 
+void OverlayRenderer::HandleRightClick(int x, int y)
+{
+	m_lastInteractionTick = GetTickCount64();
+	if (m_settingsOpen) {
+		return;
+	}
+	if (m_galleryOpen) {
+		HandleGalleryRightClick(x, y);
+	}
+}
+
 void OverlayRenderer::HandleMouseDown(int x, int y)
 {
 	m_lastInteractionTick = GetTickCount64();
 	if (m_galleryOpen) {
 		POINT pt = ClientToLayoutPoint(x, y);
 		// Popups must consume mouse down so timeline drag does not start behind them.
-		if (m_galleryAudioTrackSubmenuOpen || m_galleryExportSubmenuOpen) {
+		if (m_galleryAudioTrackSubmenuOpen || m_galleryExportSubmenuOpen || m_galleryContextMenuOpen) {
 			// WM_LBUTTONDOWN also invokes Click; suppress the duplicate gallery action.
 			m_suppressNextGalleryClick = true;
 			HandleGalleryClick(x, y);
@@ -169,6 +180,21 @@ void OverlayRenderer::HandleMouseMove(int x, int y)
 		HandleGalleryClick(x, y);
 		return;
 	}
+	if (m_galleryOpen && m_galleryContextMenuOpen) {
+		POINT pt = ClientToLayoutPoint(x, y);
+		int hover = -1;
+		for (size_t i = 0; i < m_galleryContextMenuItemRects.size(); ++i) {
+			if (IsPointInRect(pt, m_galleryContextMenuItemRects[i])) {
+				hover = static_cast<int>(i);
+				break;
+			}
+		}
+		if (hover != m_galleryContextMenuHoverIndex) {
+			m_galleryContextMenuHoverIndex = hover;
+			Render();
+		}
+		return;
+	}
 	if (m_galleryOpen && m_dragCandidate && !m_dragActive) {
 		MaybeStartDrag(x, y);
 	}
@@ -187,6 +213,11 @@ void OverlayRenderer::HandleMouseLeave()
 			m_settingsHoverIndex = -1;
 			Render();
 		}
+		return;
+	}
+	if (m_galleryContextMenuOpen && m_galleryContextMenuHoverIndex != -1) {
+		m_galleryContextMenuHoverIndex = -1;
+		Render();
 		return;
 	}
 	if (m_hoverTarget != HoverTarget::None) {
