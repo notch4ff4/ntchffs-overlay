@@ -1,4 +1,3 @@
-// Write by AI. Should be checked. (will be removed after checking)
 #ifdef _WIN32
 
 #include "overlay-svg-rasterize.h"
@@ -14,14 +13,45 @@ extern "C" {
 #include <d3d11.h>
 #include <dxgi.h>
 #include <dxgiformat.h>
-#include <shlwapi.h>
-#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
 
 namespace overlay::svg {
 namespace {
+
+template<typename T> struct ComRef {
+	T *p = nullptr;
+
+	ComRef() = default;
+	~ComRef() { reset(); }
+
+	ComRef(const ComRef &) = delete;
+	ComRef &operator=(const ComRef &) = delete;
+
+	void reset(T *next = nullptr)
+	{
+		if (p)
+			p->Release();
+		p = next;
+	}
+
+	T **out()
+	{
+		reset();
+		return &p;
+	}
+
+	T *get() const { return p; }
+	T *operator->() const { return p; }
+	explicit operator bool() const { return p != nullptr; }
+};
+
+bool HasExtension(const std::wstring &path, const wchar_t *ext)
+{
+	const size_t n = wcslen(ext);
+	return path.size() >= n && _wcsicmp(path.c_str() + path.size() - n, ext) == 0;
+}
 
 bool ReadFileUtf8(const std::wstring &path, std::string &out)
 {
@@ -48,29 +78,59 @@ bool ReadFileUtf8(const std::wstring &path, std::string &out)
 	return true;
 }
 
+// Locate the root <svg ...> opening tag (case-insensitive tag name).
+size_t FindSvgOpenTag(const std::string &svg)
+{
+	for (size_t i = 0; i + 4 <= svg.size(); i++) {
+		if (svg[i] != '<')
+			continue;
+		const char c1 = svg[i + 1] | 0x20;
+		const char c2 = svg[i + 2] | 0x20;
+		const char c3 = svg[i + 3] | 0x20;
+		if (c1 != 's' || c2 != 'v' || c3 != 'g')
+			continue;
+		if (i + 4 >= svg.size())
+			return i;
+		const char next = svg[i + 4];
+		if (next == ' ' || next == '\t' || next == '\n' || next == '\r' || next == '/' || next == '>')
+			return i;
+	}
+	return std::string::npos;
+}
+
 // D2D viewport is sizePx×sizePx. Absolute width/height like "800px" make viewBox
-// content render off-canvas. Keep viewBox, force width/height to the raster size.
+// content render off-canvas. Keep viewBox, force width/height on the root <svg> only.
 void NormalizeSvgMarkup(std::string &svg, UINT sizePx)
 {
+	const size_t open = FindSvgOpenTag(svg);
+	if (open == std::string::npos)
+		return;
+	const size_t gt = svg.find('>', open);
+	if (gt == std::string::npos || gt <= open)
+		return;
+
+	std::string tag = svg.substr(open, gt - open);
+
 	auto replaceAttr = [&](const char *name) {
-		const std::string key = std::string(name) + "=\"";
-		size_t pos = 0;
-		while ((pos = svg.find(key, pos)) != std::string::npos) {
-			const size_t start = pos;
+		const std::string sizeStr = std::to_string(sizePx);
+		for (const char quote : {'"', '\''}) {
+			const std::string key = std::string(name) + "=" + quote;
+			const size_t pos = tag.find(key);
+			if (pos == std::string::npos)
+				continue;
 			const size_t val = pos + key.size();
-			const size_t end = svg.find('"', val);
+			const size_t end = tag.find(quote, val);
 			if (end == std::string::npos)
-				break;
-			const std::string replacement = key + std::to_string(sizePx) + "\"";
-			svg.replace(start, end + 1 - start, replacement);
-			pos = start + replacement.size();
-			// Only rewrite the first svg root attrs (avoid touching nested uses).
-			break;
+				return;
+			const std::string replacement = key + sizeStr + quote;
+			tag.replace(pos, end + 1 - pos, replacement);
+			return;
 		}
 	};
 
 	replaceAttr("width");
 	replaceAttr("height");
+	svg.replace(open, gt - open, tag);
 }
 
 bool CreateStreamOnMemory(const std::string &bytes, IStream **outStream)
@@ -103,74 +163,57 @@ bool HasVisiblePixels(const std::vector<uint8_t> &bgra, UINT sizePx, UINT stride
 	for (UINT y = 0; y < sizePx; y++) {
 		for (UINT x = 0; x < sizePx; x++) {
 			const size_t o = static_cast<size_t>(y) * stride + static_cast<size_t>(x) * 4;
-			if (bgra[o + 3] > 8)
+			if (bgra[o + 3] > 8) {
 				opaque++;
+				if (opaque > 4)
+					return true;
+			}
 		}
 	}
-	return opaque > 4;
+	return false;
 }
 
 bool RasterizeWithWicTarget(IWICImagingFactory *wic, ID2D1Factory *d2d, IStream *stream, UINT sizePx,
 			    std::vector<uint8_t> &outBgra, UINT &outStride)
 {
-	IWICBitmap *wicBmp = nullptr;
-	HRESULT hr = wic->CreateBitmap(sizePx, sizePx, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, &wicBmp);
-	if (FAILED(hr) || !wicBmp) {
-		obs_log(LOG_WARNING, "SVG: CreateBitmap failed: 0x%08x", hr);
+	ComRef<IWICBitmap> wicBmp;
+	HRESULT hr = wic->CreateBitmap(sizePx, sizePx, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad,
+				       wicBmp.out());
+	if (FAILED(hr) || !wicBmp)
 		return false;
-	}
 
 	D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties(
 		D2D1_RENDER_TARGET_TYPE_DEFAULT,
 		D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-	ID2D1RenderTarget *rt = nullptr;
-	hr = d2d->CreateWicBitmapRenderTarget(wicBmp, rtProps, &rt);
-	if (FAILED(hr) || !rt) {
-		obs_log(LOG_WARNING, "SVG: CreateWicBitmapRenderTarget failed: 0x%08x", hr);
-		wicBmp->Release();
+	ComRef<ID2D1RenderTarget> rt;
+	hr = d2d->CreateWicBitmapRenderTarget(wicBmp.get(), rtProps, rt.out());
+	if (FAILED(hr) || !rt)
 		return false;
-	}
 
-	ID2D1DeviceContext5 *dc5 = nullptr;
-	hr = rt->QueryInterface(IID_PPV_ARGS(&dc5));
-	if (FAILED(hr) || !dc5) {
-		obs_log(LOG_WARNING, "SVG: ID2D1DeviceContext5 QI (WIC RT) failed: 0x%08x", hr);
-		rt->Release();
-		wicBmp->Release();
+	ComRef<ID2D1DeviceContext5> dc5;
+	hr = rt->QueryInterface(IID_PPV_ARGS(dc5.out()));
+	if (FAILED(hr) || !dc5)
 		return false;
-	}
 
-	ID2D1SvgDocument *svgDoc = nullptr;
-	hr = dc5->CreateSvgDocument(stream, D2D1::SizeF((float)sizePx, (float)sizePx), &svgDoc);
-	if (FAILED(hr) || !svgDoc) {
-		obs_log(LOG_WARNING, "SVG: CreateSvgDocument failed: 0x%08x", hr);
-		dc5->Release();
-		rt->Release();
-		wicBmp->Release();
+	ComRef<ID2D1SvgDocument> svgDoc;
+	hr = dc5->CreateSvgDocument(stream, D2D1::SizeF(static_cast<float>(sizePx), static_cast<float>(sizePx)),
+				    svgDoc.out());
+	if (FAILED(hr) || !svgDoc)
 		return false;
-	}
 
 	rt->BeginDraw();
 	rt->SetTransform(D2D1::Matrix3x2F::Identity());
 	rt->Clear(D2D1::ColorF(0, 0, 0, 0));
-	dc5->DrawSvgDocument(svgDoc);
+	dc5->DrawSvgDocument(svgDoc.get());
 	hr = rt->EndDraw();
-	svgDoc->Release();
-	dc5->Release();
-	rt->Release();
-	if (FAILED(hr)) {
-		obs_log(LOG_WARNING, "SVG: EndDraw failed: 0x%08x", hr);
-		wicBmp->Release();
+	if (FAILED(hr))
 		return false;
-	}
 
 	outStride = sizePx * 4;
 	outBgra.assign(static_cast<size_t>(outStride) * static_cast<size_t>(sizePx), 0);
 	WICRect rect = {0, 0, static_cast<INT>(sizePx), static_cast<INT>(sizePx)};
 	hr = wicBmp->CopyPixels(&rect, outStride, static_cast<UINT>(outBgra.size()), outBgra.data());
-	wicBmp->Release();
 	if (FAILED(hr)) {
-		obs_log(LOG_WARNING, "SVG: WIC CopyPixels failed: 0x%08x", hr);
 		outBgra.clear();
 		return false;
 	}
@@ -180,74 +223,42 @@ bool RasterizeWithWicTarget(IWICImagingFactory *wic, ID2D1Factory *d2d, IStream 
 bool RasterizeWithD3dTarget(ID2D1Factory *d2d, IStream *stream, UINT sizePx, std::vector<uint8_t> &outBgra,
 			    UINT &outStride)
 {
-	ID2D1Factory1 *factory1 = nullptr;
-	HRESULT hr = d2d->QueryInterface(IID_PPV_ARGS(&factory1));
-	if (FAILED(hr) || !factory1) {
-		obs_log(LOG_WARNING, "SVG: ID2D1Factory1 QI failed: 0x%08x", hr);
+	ComRef<ID2D1Factory1> factory1;
+	HRESULT hr = d2d->QueryInterface(IID_PPV_ARGS(factory1.out()));
+	if (FAILED(hr) || !factory1)
 		return false;
-	}
 
 	D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_0;
-	ID3D11Device *d3dDevice = nullptr;
-	ID3D11DeviceContext *d3dContext = nullptr;
+	ComRef<ID3D11Device> d3dDevice;
 	UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 	hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, nullptr, 0, D3D11_SDK_VERSION,
-			       &d3dDevice, &featureLevel, &d3dContext);
+			       d3dDevice.out(), &featureLevel, nullptr);
 	if (FAILED(hr)) {
 		hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags, nullptr, 0, D3D11_SDK_VERSION,
-				       &d3dDevice, &featureLevel, &d3dContext);
+				       d3dDevice.out(), &featureLevel, nullptr);
 	}
-	if (FAILED(hr) || !d3dDevice) {
-		obs_log(LOG_WARNING, "SVG: D3D11CreateDevice failed: 0x%08x", hr);
-		factory1->Release();
+	if (FAILED(hr) || !d3dDevice)
 		return false;
-	}
 
-	IDXGIDevice *dxgiDevice = nullptr;
-	hr = d3dDevice->QueryInterface(IID_PPV_ARGS(&dxgiDevice));
-	if (FAILED(hr) || !dxgiDevice) {
-		obs_log(LOG_WARNING, "SVG: IDXGIDevice QI failed: 0x%08x", hr);
-		if (d3dContext)
-			d3dContext->Release();
-		d3dDevice->Release();
-		factory1->Release();
+	ComRef<IDXGIDevice> dxgiDevice;
+	hr = d3dDevice->QueryInterface(IID_PPV_ARGS(dxgiDevice.out()));
+	if (FAILED(hr) || !dxgiDevice)
 		return false;
-	}
 
-	ID2D1Device *d2dDevice = nullptr;
-	hr = factory1->CreateDevice(dxgiDevice, &d2dDevice);
-	dxgiDevice->Release();
-	factory1->Release();
-	if (FAILED(hr) || !d2dDevice) {
-		obs_log(LOG_WARNING, "SVG: CreateDevice failed: 0x%08x", hr);
-		if (d3dContext)
-			d3dContext->Release();
-		d3dDevice->Release();
+	ComRef<ID2D1Device> d2dDevice;
+	hr = factory1->CreateDevice(dxgiDevice.get(), d2dDevice.out());
+	if (FAILED(hr) || !d2dDevice)
 		return false;
-	}
 
-	ID2D1DeviceContext *dc = nullptr;
-	hr = d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &dc);
-	if (FAILED(hr) || !dc) {
-		obs_log(LOG_WARNING, "SVG: CreateDeviceContext failed: 0x%08x", hr);
-		d2dDevice->Release();
-		if (d3dContext)
-			d3dContext->Release();
-		d3dDevice->Release();
+	ComRef<ID2D1DeviceContext> dc;
+	hr = d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, dc.out());
+	if (FAILED(hr) || !dc)
 		return false;
-	}
 
-	ID2D1DeviceContext5 *dc5 = nullptr;
-	hr = dc->QueryInterface(IID_PPV_ARGS(&dc5));
-	if (FAILED(hr) || !dc5) {
-		obs_log(LOG_WARNING, "SVG: ID2D1DeviceContext5 QI (D3D) failed: 0x%08x", hr);
-		dc->Release();
-		d2dDevice->Release();
-		if (d3dContext)
-			d3dContext->Release();
-		d3dDevice->Release();
+	ComRef<ID2D1DeviceContext5> dc5;
+	hr = dc->QueryInterface(IID_PPV_ARGS(dc5.out()));
+	if (FAILED(hr) || !dc5)
 		return false;
-	}
 
 	float dpiX = 96.0f, dpiY = 96.0f;
 	dc->GetDpi(&dpiX, &dpiY);
@@ -255,95 +266,59 @@ bool RasterizeWithD3dTarget(ID2D1Factory *d2d, IStream *stream, UINT sizePx, std
 	D2D1_BITMAP_PROPERTIES1 targetProps = D2D1::BitmapProperties1(
 		D2D1_BITMAP_OPTIONS_TARGET,
 		D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpiX, dpiY);
-	ID2D1Bitmap1 *targetBmp = nullptr;
-	hr = dc5->CreateBitmap(px, nullptr, 0, &targetProps, &targetBmp);
-	if (FAILED(hr) || !targetBmp) {
-		obs_log(LOG_WARNING, "SVG: CreateBitmap(TARGET) failed: 0x%08x", hr);
-		dc5->Release();
-		dc->Release();
-		d2dDevice->Release();
-		if (d3dContext)
-			d3dContext->Release();
-		d3dDevice->Release();
+	ComRef<ID2D1Bitmap1> targetBmp;
+	hr = dc5->CreateBitmap(px, nullptr, 0, &targetProps, targetBmp.out());
+	if (FAILED(hr) || !targetBmp)
 		return false;
-	}
 
-	ID2D1SvgDocument *svgDoc = nullptr;
-	hr = dc5->CreateSvgDocument(stream, D2D1::SizeF((float)sizePx, (float)sizePx), &svgDoc);
-	if (FAILED(hr) || !svgDoc) {
-		obs_log(LOG_WARNING, "SVG: CreateSvgDocument (D3D) failed: 0x%08x", hr);
-		targetBmp->Release();
-		dc5->Release();
-		dc->Release();
-		d2dDevice->Release();
-		if (d3dContext)
-			d3dContext->Release();
-		d3dDevice->Release();
+	ComRef<ID2D1SvgDocument> svgDoc;
+	hr = dc5->CreateSvgDocument(stream, D2D1::SizeF(static_cast<float>(sizePx), static_cast<float>(sizePx)),
+				    svgDoc.out());
+	if (FAILED(hr) || !svgDoc)
 		return false;
-	}
 
-	dc5->SetTarget(targetBmp);
+	dc5->SetTarget(targetBmp.get());
 	dc5->BeginDraw();
 	dc5->Clear(D2D1::ColorF(0, 0, 0, 0));
-	dc5->DrawSvgDocument(svgDoc);
+	dc5->DrawSvgDocument(svgDoc.get());
 	hr = dc5->EndDraw();
-	svgDoc->Release();
 	dc5->SetTarget(nullptr);
-	if (FAILED(hr)) {
-		obs_log(LOG_WARNING, "SVG: D3D EndDraw failed: 0x%08x", hr);
-		targetBmp->Release();
-		dc5->Release();
-		dc->Release();
-		d2dDevice->Release();
-		if (d3dContext)
-			d3dContext->Release();
-		d3dDevice->Release();
+	if (FAILED(hr))
 		return false;
-	}
 
 	D2D1_BITMAP_PROPERTIES1 cpuProps = D2D1::BitmapProperties1(
 		D2D1_BITMAP_OPTIONS_CANNOT_DRAW | D2D1_BITMAP_OPTIONS_CPU_READ,
 		D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpiX, dpiY);
-	ID2D1Bitmap1 *cpuBmp = nullptr;
-	hr = dc->CreateBitmap(px, nullptr, 0, &cpuProps, &cpuBmp);
-	bool ok = false;
-	if (SUCCEEDED(hr) && cpuBmp) {
-		hr = cpuBmp->CopyFromBitmap(nullptr, targetBmp, nullptr);
-		if (SUCCEEDED(hr)) {
-			D2D1_MAPPED_RECT mapped = {};
-			hr = cpuBmp->Map(D2D1_MAP_OPTIONS_READ, &mapped);
-			if (SUCCEEDED(hr) && mapped.bits) {
-				outStride = sizePx * 4;
-				outBgra.resize(static_cast<size_t>(outStride) * static_cast<size_t>(sizePx));
-				for (UINT y = 0; y < sizePx; y++) {
-					memcpy(outBgra.data() + static_cast<size_t>(y) * outStride,
-					       mapped.bits + static_cast<size_t>(y) * mapped.pitch,
-					       static_cast<size_t>(sizePx) * 4);
-				}
-				ok = true;
-				cpuBmp->Unmap();
-			} else {
-				obs_log(LOG_WARNING, "SVG: Map failed: 0x%08x", hr);
-			}
-		} else {
-			obs_log(LOG_WARNING, "SVG: CopyFromBitmap failed: 0x%08x", hr);
-		}
-		cpuBmp->Release();
-	} else {
-		obs_log(LOG_WARNING, "SVG: CreateBitmap(CPU_READ) failed: 0x%08x", hr);
-	}
+	ComRef<ID2D1Bitmap1> cpuBmp;
+	hr = dc->CreateBitmap(px, nullptr, 0, &cpuProps, cpuBmp.out());
+	if (FAILED(hr) || !cpuBmp)
+		return false;
 
-	targetBmp->Release();
-	dc5->Release();
-	dc->Release();
-	d2dDevice->Release();
-	if (d3dContext)
-		d3dContext->Release();
-	d3dDevice->Release();
-	return ok;
+	hr = cpuBmp->CopyFromBitmap(nullptr, targetBmp.get(), nullptr);
+	if (FAILED(hr))
+		return false;
+
+	D2D1_MAPPED_RECT mapped = {};
+	hr = cpuBmp->Map(D2D1_MAP_OPTIONS_READ, &mapped);
+	if (FAILED(hr) || !mapped.bits)
+		return false;
+
+	outStride = sizePx * 4;
+	outBgra.resize(static_cast<size_t>(outStride) * static_cast<size_t>(sizePx));
+	for (UINT y = 0; y < sizePx; y++) {
+		memcpy(outBgra.data() + static_cast<size_t>(y) * outStride,
+		       mapped.bits + static_cast<size_t>(y) * mapped.pitch, static_cast<size_t>(sizePx) * 4);
+	}
+	cpuBmp->Unmap();
+	return true;
 }
 
 } // namespace
+
+bool IsSvgPath(const std::wstring &path)
+{
+	return HasExtension(path, L".svg");
+}
 
 bool RasterizeFile(IWICImagingFactory *wic, ID2D1Factory *d2d, const std::wstring &path, UINT sizePx,
 		   std::vector<uint8_t> &outBgra, UINT &outW, UINT &outH, UINT &outStride)
@@ -355,37 +330,40 @@ bool RasterizeFile(IWICImagingFactory *wic, ID2D1Factory *d2d, const std::wstrin
 	if (!wic || !d2d || path.empty() || sizePx == 0)
 		return false;
 
+	const char *failReason = nullptr;
+
 	std::string markup;
 	if (!ReadFileUtf8(path, markup)) {
-		obs_log(LOG_WARNING, "SVG: failed to read file");
-		return false;
-	}
-	NormalizeSvgMarkup(markup, sizePx);
+		failReason = "failed to read file";
+	} else {
+		NormalizeSvgMarkup(markup, sizePx);
 
-	IStream *stream = nullptr;
-	if (!CreateStreamOnMemory(markup, &stream) || !stream) {
-		obs_log(LOG_WARNING, "SVG: create memory stream failed");
-		return false;
+		ComRef<IStream> stream;
+		if (!CreateStreamOnMemory(markup, stream.out()) || !stream) {
+			failReason = "create memory stream failed";
+		} else {
+			bool ok = RasterizeWithWicTarget(wic, d2d, stream.get(), sizePx, outBgra, outStride);
+			if (!ok || !HasVisiblePixels(outBgra, sizePx, outStride)) {
+				LARGE_INTEGER zero = {};
+				stream->Seek(zero, STREAM_SEEK_SET, nullptr);
+				ok = RasterizeWithD3dTarget(d2d, stream.get(), sizePx, outBgra, outStride);
+			}
+
+			if (!ok || !HasVisiblePixels(outBgra, sizePx, outStride)) {
+				failReason = "raster produced empty image";
+				outBgra.clear();
+				outStride = 0;
+			} else {
+				outW = sizePx;
+				outH = sizePx;
+				return true;
+			}
+		}
 	}
 
-	bool ok = RasterizeWithWicTarget(wic, d2d, stream, sizePx, outBgra, outStride);
-	if (!ok || !HasVisiblePixels(outBgra, sizePx, outStride)) {
-		LARGE_INTEGER zero = {};
-		stream->Seek(zero, STREAM_SEEK_SET, nullptr);
-		ok = RasterizeWithD3dTarget(d2d, stream, sizePx, outBgra, outStride);
-	}
-	stream->Release();
-
-	if (!ok || !HasVisiblePixels(outBgra, sizePx, outStride)) {
-		obs_log(LOG_WARNING, "SVG: raster produced empty image");
-		outBgra.clear();
-		outStride = 0;
-		return false;
-	}
-
-	outW = sizePx;
-	outH = sizePx;
-	return true;
+	if (failReason)
+		obs_log(LOG_WARNING, "SVG: %s", failReason);
+	return false;
 }
 
 } // namespace overlay::svg

@@ -7,7 +7,6 @@
 #include "overlay-indicators-c.h"
 #include "overlay-toasts-c.h"
 #include "overlay-svg-rasterize.h"
-#include "overlay-gif-decode.h"
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 #include <util/platform.h>
@@ -1344,194 +1343,10 @@ void OverlayRenderer::InvalidateIndicatorPreview(int slot)
 {
 	if (slot < 0 || slot >= INDICATOR_CUSTOM_SLOT_COUNT)
 		return;
-	IndicatorPreviewCache &p = m_indicatorPreview[slot];
-	for (IndicatorPreviewFrame &frame : p.frames) {
-		if (frame.original) {
-			frame.original->Release();
-			frame.original = nullptr;
-		}
-		if (frame.tinted) {
-			frame.tinted->Release();
-			frame.tinted = nullptr;
-		}
-		frame.alpha.clear();
-		frame.maskW = 0;
-		frame.maskH = 0;
-	}
-	p.frames.clear();
-	p.frameIndex = 0;
-	p.frameStartTick = 0;
-	p.loadAttempted = false;
-	p.loadFailed = false;
-	p.path.clear();
-	p.tintEnabled = false;
-	p.colorRgb = 0xFFFFFF;
-}
-
-void OverlayRenderer::RebuildIndicatorPreviewTintFrame(IndicatorPreviewFrame &frame, bool tintEnabled, int colorRgb)
-{
-	ID2D1RenderTarget *target = m_bitmapRenderTarget ? m_bitmapRenderTarget : m_renderTarget;
-	if (frame.tinted) {
-		frame.tinted->Release();
-		frame.tinted = nullptr;
-	}
-	if (!tintEnabled || frame.alpha.empty() || frame.maskW == 0 || frame.maskH == 0 || !target)
-		return;
-
-	const float cr = ((colorRgb >> 16) & 0xFF) / 255.0f;
-	const float cg = ((colorRgb >> 8) & 0xFF) / 255.0f;
-	const float cb = (colorRgb & 0xFF) / 255.0f;
-	const UINT stride = frame.maskW * 4;
-	std::vector<uint8_t> bgra(static_cast<size_t>(stride) * static_cast<size_t>(frame.maskH));
-	for (UINT y = 0; y < frame.maskH; y++) {
-		for (UINT x = 0; x < frame.maskW; x++) {
-			const size_t idx = static_cast<size_t>(y) * frame.maskW + x;
-			const float af = frame.alpha[idx] / 255.0f;
-			const uint8_t A = static_cast<uint8_t>(af * 255.0f + 0.5f);
-			const uint8_t B = static_cast<uint8_t>(cb * 255.0f * af + 0.5f);
-			const uint8_t G = static_cast<uint8_t>(cg * 255.0f * af + 0.5f);
-			const uint8_t R = static_cast<uint8_t>(cr * 255.0f * af + 0.5f);
-			const size_t o = static_cast<size_t>(y) * stride + static_cast<size_t>(x) * 4;
-			bgra[o + 0] = B;
-			bgra[o + 1] = G;
-			bgra[o + 2] = R;
-			bgra[o + 3] = A;
-		}
-	}
-
-	D2D1_BITMAP_PROPERTIES props =
-		D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-	ID2D1Bitmap *bmp = nullptr;
-	if (SUCCEEDED(target->CreateBitmap(D2D1::SizeU(frame.maskW, frame.maskH), bgra.data(), stride, &props, &bmp)) &&
-	    bmp)
-		frame.tinted = bmp;
-}
-
-void OverlayRenderer::RebuildIndicatorPreviewTint(int slot)
-{
-	if (slot < 0 || slot >= INDICATOR_CUSTOM_SLOT_COUNT)
-		return;
-	IndicatorPreviewCache &p = m_indicatorPreview[slot];
-	for (IndicatorPreviewFrame &frame : p.frames)
-		RebuildIndicatorPreviewTintFrame(frame, p.tintEnabled, p.colorRgb);
-}
-
-bool OverlayRenderer::CreateIndicatorPreviewFrame(IndicatorPreviewFrame &frame, UINT w, UINT h, const uint8_t *bgra,
-						  UINT stride)
-{
-	if (!bgra || w == 0 || h == 0)
-		return false;
-	ID2D1RenderTarget *target = m_bitmapRenderTarget ? m_bitmapRenderTarget : m_renderTarget;
-	if (!target)
-		return false;
-
-	if (frame.original) {
-		frame.original->Release();
-		frame.original = nullptr;
-	}
-	if (frame.tinted) {
-		frame.tinted->Release();
-		frame.tinted = nullptr;
-	}
-
-	frame.maskW = w;
-	frame.maskH = h;
-	frame.alpha.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
-	for (UINT y = 0; y < h; y++) {
-		for (UINT x = 0; x < w; x++) {
-			const size_t src = static_cast<size_t>(y) * stride + static_cast<size_t>(x) * 4;
-			frame.alpha[static_cast<size_t>(y) * w + x] = bgra[src + 3];
-		}
-	}
-
-	D2D1_BITMAP_PROPERTIES props =
-		D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-	ID2D1Bitmap *bmp = nullptr;
-	if (FAILED(target->CreateBitmap(D2D1::SizeU(w, h), bgra, stride, &props, &bmp)) || !bmp)
-		return false;
-	frame.original = bmp;
-	return true;
-}
-
-bool OverlayRenderer::LoadIndicatorPreviewRaster(int slot, const std::wstring &path)
-{
-	if (!m_wicFactory)
-		return false;
-
-	std::vector<overlay::gif::DecodedFrame> decoded;
-	if (!overlay::gif::DecodeFile(m_wicFactory, path, decoded) || decoded.empty())
-		return false;
-
-	IndicatorPreviewCache &p = m_indicatorPreview[slot];
-	for (IndicatorPreviewFrame &old : p.frames) {
-		if (old.original) {
-			old.original->Release();
-			old.original = nullptr;
-		}
-		if (old.tinted) {
-			old.tinted->Release();
-			old.tinted = nullptr;
-		}
-	}
-	p.frames.clear();
-	p.frameIndex = 0;
-	p.frameStartTick = 0;
-	p.frames.reserve(decoded.size());
-
-	for (const overlay::gif::DecodedFrame &src : decoded) {
-		IndicatorPreviewFrame frame;
-		frame.delayMs = src.delayMs;
-		if (!CreateIndicatorPreviewFrame(frame, src.w, src.h, src.bgra.data(), src.stride)) {
-			for (IndicatorPreviewFrame &f : p.frames) {
-				if (f.original) {
-					f.original->Release();
-					f.original = nullptr;
-				}
-				if (f.tinted) {
-					f.tinted->Release();
-					f.tinted = nullptr;
-				}
-			}
-			p.frames.clear();
-			return false;
-		}
-		RebuildIndicatorPreviewTintFrame(frame, p.tintEnabled, p.colorRgb);
-		p.frames.push_back(std::move(frame));
-	}
-	return !p.frames.empty() && p.frames[0].original != nullptr;
-}
-
-bool OverlayRenderer::LoadIndicatorPreviewSvg(int slot, const std::wstring &path)
-{
-	if (!m_wicFactory || !m_d2dFactory)
-		return false;
-
-	std::vector<uint8_t> bgra;
-	UINT w = 0, h = 0, stride = 0;
-	if (!overlay::svg::RasterizeFile(m_wicFactory, m_d2dFactory, path, 64, bgra, w, h, stride))
-		return false;
-
-	IndicatorPreviewCache &p = m_indicatorPreview[slot];
-	for (IndicatorPreviewFrame &old : p.frames) {
-		if (old.original) {
-			old.original->Release();
-			old.original = nullptr;
-		}
-		if (old.tinted) {
-			old.tinted->Release();
-			old.tinted = nullptr;
-		}
-	}
-	p.frames.clear();
-	p.frameIndex = 0;
-	p.frameStartTick = 0;
-
-	IndicatorPreviewFrame frame;
-	if (!CreateIndicatorPreviewFrame(frame, w, h, bgra.data(), stride))
-		return false;
-	RebuildIndicatorPreviewTintFrame(frame, p.tintEnabled, p.colorRgb);
-	p.frames.push_back(std::move(frame));
-	return true;
+	overlay::icon::InvalidateSlot(m_indicatorPreview[slot]);
+	m_indicatorPreview[slot].path.clear();
+	m_indicatorPreview[slot].tintEnabled = false;
+	m_indicatorPreview[slot].colorRgb = 0xFFFFFF;
 }
 
 bool OverlayRenderer::EnsureIndicatorPreview(int slot)
@@ -1539,167 +1354,16 @@ bool OverlayRenderer::EnsureIndicatorPreview(int slot)
 	if (slot < 0 || slot >= INDICATOR_CUSTOM_SLOT_COUNT)
 		return false;
 
-	const std::wstring &wantPath = m_setIndicatorIconPath[slot];
-	const bool wantTint = m_setIndicatorTint[slot];
-	const int wantColor = m_setIndicatorColor[slot] & 0xFFFFFF;
-	IndicatorPreviewCache &p = m_indicatorPreview[slot];
-
-	const bool pathChanged = (p.path != wantPath);
-	const bool tintChanged = (p.tintEnabled != wantTint) || (p.colorRgb != wantColor);
-
-	if (pathChanged) {
-		for (IndicatorPreviewFrame &frame : p.frames) {
-			if (frame.original) {
-				frame.original->Release();
-				frame.original = nullptr;
-			}
-			if (frame.tinted) {
-				frame.tinted->Release();
-				frame.tinted = nullptr;
-			}
-		}
-		p.frames.clear();
-		p.frameIndex = 0;
-		p.frameStartTick = 0;
-		p.path = wantPath;
-		p.tintEnabled = wantTint;
-		p.colorRgb = wantColor;
-		p.loadAttempted = false;
-		p.loadFailed = false;
-	} else if (tintChanged) {
-		p.tintEnabled = wantTint;
-		p.colorRgb = wantColor;
-		if (!p.frames.empty())
-			RebuildIndicatorPreviewTint(slot);
-	}
-
-	if (wantPath.empty())
-		return false;
-	if (!p.frames.empty() && p.frames[0].original)
-		return true;
-	if (p.loadAttempted)
-		return false;
-
-	p.loadAttempted = true;
-	auto hasExt = [](const std::wstring &path, const wchar_t *ext) {
-		const size_t n = wcslen(ext);
-		return path.size() >= n && _wcsicmp(path.c_str() + path.size() - n, ext) == 0;
-	};
-	const bool isSvg = hasExt(wantPath, L".svg");
-	const bool ok = isSvg ? LoadIndicatorPreviewSvg(slot, wantPath) : LoadIndicatorPreviewRaster(slot, wantPath);
-	if (!ok)
-		p.loadFailed = true;
-	return ok && !p.frames.empty() && p.frames[0].original != nullptr;
-}
-
-void OverlayRenderer::AdvanceIndicatorPreviewAnimation(int slot, ULONGLONG now)
-{
-	if (slot < 0 || slot >= INDICATOR_CUSTOM_SLOT_COUNT)
-		return;
-	IndicatorPreviewCache &p = m_indicatorPreview[slot];
-	if (p.frames.size() <= 1)
-		return;
-	if (p.frameStartTick == 0)
-		p.frameStartTick = now;
-
-	int guard = 0;
-	while (guard++ < 64) {
-		const UINT delay = p.frames[p.frameIndex].delayMs < 20 ? 20u : p.frames[p.frameIndex].delayMs;
-		if (now < p.frameStartTick + delay)
-			break;
-		p.frameStartTick += delay;
-		p.frameIndex = (p.frameIndex + 1) % p.frames.size();
-		if (now > p.frameStartTick + 2000) {
-			p.frameStartTick = now;
-			break;
-		}
-	}
-}
-
-void OverlayRenderer::DrawBuiltinIndicatorPreview(int slot, const RECT &rect, D2D1_COLOR_F color)
-{
 	ID2D1RenderTarget *target = m_bitmapRenderTarget ? m_bitmapRenderTarget : m_renderTarget;
-	if (!target || !m_textBrush || !m_d2dFactory)
-		return;
-
-	m_textBrush->SetColor(color);
-	const float strokeWidth = 2.0f;
-	auto getCenter = [](const RECT &r) {
-		return D2D1_POINT_2F{(r.left + r.right) / 2.0f, (r.top + r.bottom) / 2.0f};
-	};
-	auto pointOnCircle = [](const D2D1_POINT_2F &center, float radius, float angleRad) {
-		return D2D1_POINT_2F{center.x + radius * std::cos(angleRad),
-				     center.y + radius * std::sin(angleRad)};
-	};
-
-	if (slot == 0) {
-		D2D1_POINT_2F center = getCenter(rect);
-		float radius = (rect.right - rect.left) * 0.32f;
-		target->DrawEllipse(D2D1::Ellipse(center, radius, radius), m_textBrush, strokeWidth);
-		return;
-	}
-	if (slot == 1) {
-		D2D1_POINT_2F center = getCenter(rect);
-		float radius = (rect.right - rect.left) * 0.34f;
-		float startAngle = -0.25f * 3.14159265f;
-		float endAngle = 1.25f * 3.14159265f;
-		D2D1_POINT_2F startPt = pointOnCircle(center, radius, startAngle);
-		D2D1_POINT_2F endPt = pointOnCircle(center, radius, endAngle);
-		ID2D1PathGeometry *geometry = nullptr;
-		if (SUCCEEDED(m_d2dFactory->CreatePathGeometry(&geometry)) && geometry) {
-			ID2D1GeometrySink *sink = nullptr;
-			if (SUCCEEDED(geometry->Open(&sink)) && sink) {
-				sink->BeginFigure(startPt, D2D1_FIGURE_BEGIN_HOLLOW);
-				D2D1_ARC_SEGMENT arc = {};
-				arc.point = endPt;
-				arc.size = D2D1::SizeF(radius, radius);
-				arc.rotationAngle = 0.0f;
-				arc.sweepDirection = D2D1_SWEEP_DIRECTION_CLOCKWISE;
-				arc.arcSize = D2D1_ARC_SIZE_LARGE;
-				sink->AddArc(arc);
-				sink->EndFigure(D2D1_FIGURE_END_OPEN);
-				sink->Close();
-				sink->Release();
-			}
-			target->DrawGeometry(geometry, m_textBrush, strokeWidth);
-			geometry->Release();
-		}
-		float arrowAngle = endAngle + 0.5f;
-		D2D1_POINT_2F arrowPt1 = pointOnCircle(center, radius * 0.85f, arrowAngle);
-		float arrowAngle2 = endAngle - 0.4f;
-		D2D1_POINT_2F arrowPt2 = pointOnCircle(center, radius * 0.85f, arrowAngle2);
-		target->DrawLine(arrowPt1, endPt, m_textBrush, strokeWidth);
-		target->DrawLine(arrowPt2, endPt, m_textBrush, strokeWidth);
-		return;
-	}
-	if (slot == 2) {
-		const float s = static_cast<float>(rect.right - rect.left);
-		const float inset = s * 0.20f;
-		const float labelInset = s * 0.15f;
-		const float labelH = s * 0.30f;
-		D2D1_RECT_F outer = D2D1::RectF((float)rect.left + inset, (float)rect.top + inset,
-						(float)rect.right - inset, (float)rect.bottom - inset);
-		D2D1_RECT_F label = D2D1::RectF(outer.left + labelInset, outer.top + labelInset,
-						outer.right - labelInset, outer.top + labelInset + labelH);
-		target->DrawRectangle(outer, m_textBrush, strokeWidth);
-		target->DrawRectangle(label, m_textBrush, strokeWidth);
-		return;
-	}
-	if (slot == 3) {
-		const float w = (float)(rect.right - rect.left);
-		const float h = (float)(rect.bottom - rect.top);
-		D2D1_POINT_2F p1 = {(float)rect.left + w * 0.22f, (float)rect.top + h * 0.52f};
-		D2D1_POINT_2F p2 = {(float)rect.left + w * 0.42f, (float)rect.top + h * 0.72f};
-		D2D1_POINT_2F p3 = {(float)rect.left + w * 0.78f, (float)rect.top + h * 0.30f};
-		target->DrawLine(p1, p2, m_textBrush, strokeWidth);
-		target->DrawLine(p2, p3, m_textBrush, strokeWidth);
-	}
+	return overlay::icon::EnsureLoaded(m_wicFactory, m_d2dFactory, target, m_indicatorPreview[slot],
+					   m_setIndicatorIconPath[slot], m_setIndicatorTint[slot],
+					   m_setIndicatorColor[slot], overlay::icon::kDefaultSvgPx);
 }
 
 void OverlayRenderer::DrawIndicatorPreview(int slot, const RECT &rect)
 {
 	ID2D1RenderTarget *target = m_bitmapRenderTarget ? m_bitmapRenderTarget : m_renderTarget;
-	if (!target || slot < 0 || slot >= INDICATOR_CUSTOM_SLOT_COUNT)
+	if (!target || !m_textBrush || slot < 0 || slot >= INDICATOR_CUSTOM_SLOT_COUNT)
 		return;
 
 	DrawRoundedRectangle(rect, 6.0f, D2D1::ColorF(0.12f, 0.12f, 0.15f, 1.0f));
@@ -1715,24 +1379,19 @@ void OverlayRenderer::DrawIndicatorPreview(int slot, const RECT &rect)
 			: D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f);
 
 	if (EnsureIndicatorPreview(slot)) {
-		IndicatorPreviewCache &p = m_indicatorPreview[slot];
-		if (!p.frames.empty()) {
-			AdvanceIndicatorPreviewAnimation(slot, GetTickCount64());
-			if (p.frameIndex >= p.frames.size())
-				p.frameIndex = 0;
-			IndicatorPreviewFrame &frame = p.frames[p.frameIndex];
-			ID2D1Bitmap *bmp = (p.tintEnabled && frame.tinted) ? frame.tinted : frame.original;
-			if (bmp) {
-				D2D1_RECT_F dest =
-					D2D1::RectF((float)iconRect.left, (float)iconRect.top, (float)iconRect.right,
-						    (float)iconRect.bottom);
-				target->DrawBitmap(bmp, dest, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-				return;
-			}
+		overlay::icon::Slot &p = m_indicatorPreview[slot];
+		overlay::icon::AdvanceAnimation(p, GetTickCount64());
+		ID2D1Bitmap *bmp = overlay::icon::CurrentBitmap(p);
+		if (bmp) {
+			D2D1_RECT_F dest = D2D1::RectF((float)iconRect.left, (float)iconRect.top, (float)iconRect.right,
+						       (float)iconRect.bottom);
+			target->DrawBitmap(bmp, dest, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+			return;
 		}
 	}
 
-	DrawBuiltinIndicatorPreview(slot, iconRect, color);
+	m_textBrush->SetColor(color);
+	overlay::icon::DrawBuiltin(target, m_d2dFactory, m_textBrush, slot, iconRect, 2.0f);
 }
 
 uint64_t OverlayRenderer::MakeTintKey(int iconType, const D2D1_COLOR_F &tint) const
@@ -2015,8 +1674,7 @@ bool OverlayRenderer::LoadAboutBitmapFromModuleFile(const char *relativePath, UI
 	bfree(path);
 
 	const std::wstring wpath(widePath.data());
-	const bool isSvg = wpath.size() >= 4 &&
-			   (_wcsicmp(wpath.c_str() + (wpath.size() - 4), L".svg") == 0);
+	const bool isSvg = overlay::svg::IsSvgPath(wpath);
 
 	ID2D1RenderTarget *target = m_bitmapRenderTarget ? m_bitmapRenderTarget : m_renderTarget;
 	if (!target)

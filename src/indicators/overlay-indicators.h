@@ -4,10 +4,9 @@
 
 #include <windows.h>
 #include <d2d1.h>
-#include <dwrite.h>
 #include <wincodec.h>
 #include <string>
-#include <vector>
+#include "overlay-icon-frames.h"
 #include "overlay-layout.h"
 #include "overlay-state.h"
 #include "overlay-window-manager.h"
@@ -41,26 +40,6 @@ public:
 	void RaiseTopmost();
 
 private:
-	struct CustomFrame {
-		ID2D1Bitmap *original = nullptr;
-		ID2D1Bitmap *tinted = nullptr;
-		std::vector<uint8_t> alpha;
-		UINT maskW = 0;
-		UINT maskH = 0;
-		UINT delayMs = 100;
-	};
-
-	struct CustomSlot {
-		std::wstring path;
-		bool tintEnabled = false;
-		int colorRgb = 0xFFFFFF;
-		std::vector<CustomFrame> frames;
-		size_t frameIndex = 0;
-		ULONGLONG frameStartTick = 0;
-		bool loadAttempted = false;
-		bool loadFailed = false;
-	};
-
 	void UpdateStatus();
 	void Render();
 	void UpdateWindowLayout();
@@ -72,11 +51,7 @@ private:
 	void ReleaseCustomBitmaps();
 	void InvalidateCustomSlot(int slot);
 	bool EnsureCustomBitmap(int slot);
-	bool LoadRasterCustom(int slot, const std::wstring &path);
-	bool LoadSvgCustom(int slot, const std::wstring &path);
-	bool CreateFrameBitmaps(int slot, CustomFrame &frame, UINT w, UINT h, const uint8_t *bgra, UINT stride);
-	void RebuildTintedBitmap(int slot);
-	void RebuildTintedFrame(CustomFrame &frame, bool tintEnabled, int colorRgb);
+	UINT SvgRasterPx() const;
 	void AdvanceCustomAnimation(int slot, ULONGLONG now);
 	bool DrawCustomIcon(int slot, const RECT &rect, float opacity);
 	void DrawBuiltinIcon(int slot, const RECT &rect, float opacity);
@@ -98,14 +73,13 @@ private:
 	OverlayLayoutManager m_layoutManager;
 
 	ID2D1Factory *m_d2dFactory;
-	IDWriteFactory *m_writeFactory;
 	IWICImagingFactory *m_wicFactory;
 	IWICBitmap *m_wicBitmap;
 	ID2D1RenderTarget *m_bitmapRenderTarget;
 	ID2D1SolidColorBrush *m_textBrush;
-	ID2D1SolidColorBrush *m_activeBrush;
+	bool m_comInitialized;
 
-	CustomSlot m_custom[CUSTOM_SLOT_COUNT];
+	overlay::icon::Slot m_custom[CUSTOM_SLOT_COUNT];
 	std::wstring m_soundPath[SOUND_EVENT_COUNT];
 
 	OverlayPosition m_position;
