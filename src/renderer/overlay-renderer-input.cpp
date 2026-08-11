@@ -40,14 +40,37 @@ void OverlayRenderer::HandleClick(int x, int y)
 
 	if (IsPointInRect(pt, m_layout.replayPanelRect)) {
 		if (m_state.replayActive) {
-			int localY = pt.y - m_layout.replayPanelRect.top;
-			int half = (m_layout.replayPanelRect.bottom - m_layout.replayPanelRect.top) / 2;
-			if (localY < half) {
-				m_stateManager.ToggleReplayBuffer();
-			} else if (!m_state.replaySaving) {
-				m_stateManager.SaveReplay();
+			if (m_replayClipPickerOpen && !m_state.replaySaving) {
+				if (IsPointInRect(pt, m_replayClipChevronRect)) {
+					m_replayClipPickerOpen = false;
+				} else {
+					for (size_t i = 0; i < m_replayClipOptionRects.size(); i++) {
+						if (!IsPointInRect(pt, m_replayClipOptionRects[i]))
+							continue;
+						if (i < m_replayClipOptionEnabled.size() &&
+						    m_replayClipOptionEnabled[i] &&
+						    i < m_replayClipOptionSeconds.size()) {
+							m_stateManager.SaveReplayClip(m_replayClipOptionSeconds[i]);
+						}
+						m_replayClipPickerOpen = false;
+						break;
+					}
+				}
+			} else {
+				int localY = pt.y - m_layout.replayPanelRect.top;
+				int half = (m_layout.replayPanelRect.bottom - m_layout.replayPanelRect.top) / 2;
+				if (localY < half) {
+					m_stateManager.ToggleReplayBuffer();
+				} else if (!m_state.replaySaving) {
+					if (IsPointInRect(pt, m_replayClipChevronRect)) {
+						m_replayClipPickerOpen = true;
+					} else {
+						m_stateManager.SaveReplay();
+					}
+				}
 			}
 		} else {
+			m_replayClipPickerOpen = false;
 			m_stateManager.ToggleReplayBuffer();
 		}
 		UpdateStatus();
@@ -265,6 +288,12 @@ OverlayRenderer::HoverTarget OverlayRenderer::GetHoverTarget(const POINT &pt) co
 		return HoverTarget::ShowOBSButton;
 	if (IsPointInRect(pt, m_layout.recordingPanelRect))
 		return HoverTarget::RecordingPanel;
+	if (m_state.replayActive && !m_state.replaySaving) {
+		if (IsPointInRect(pt, m_replayClipChevronRect))
+			return HoverTarget::ReplayClipChevron;
+		if (!m_replayClipPickerOpen && IsPointInRect(pt, m_replaySaveRect))
+			return HoverTarget::ReplaySaveButton;
+	}
 	if (IsPointInRect(pt, m_layout.replayPanelRect))
 		return HoverTarget::ReplayPanel;
 	return HoverTarget::None;

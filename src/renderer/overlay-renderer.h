@@ -121,6 +121,8 @@ private:
 		None,
 		RecordingPanel,
 		ReplayPanel,
+		ReplaySaveButton,
+		ReplayClipChevron,
 		RecordFolderButton,
 		ShowOBSButton,
 		SettingsButton,
@@ -260,6 +262,7 @@ private:
 		Indicators,
 		Audio,
 		Replay,
+		ClipSave,
 		Notifications,
 		Hotkeys,
 		About
@@ -268,6 +271,7 @@ private:
 		ToggleBool,
 		StepDown,
 		StepUp,
+		EditInt,
 		HotkeyCapture,
 		Browse,
 		BrowseIndicator,
@@ -298,6 +302,9 @@ private:
 		ToastVideoSaved,
 		ToastOpenHint,
 		ToastLowDisk,
+		ClipShow0,
+		ClipShow1,
+		ClipShow2,
 		// numeric/enum fields (StepDown / StepUp)
 		Position,
 		Margin,
@@ -309,15 +316,24 @@ private:
 		IndicatorsPosition,
 		IndicatorsScale,
 		ToastLowDiskGb,
-		ToastDurationSec
+		ToastDurationSec,
+		ClipBufferLength,
+		ClipDuration0,
+		ClipDuration1,
+		ClipDuration2
 	};
 	static const int INDICATOR_CUSTOM_SLOT_COUNT = 4;
 	static const int INDICATOR_SOUND_EVENT_COUNT = 5;
+	static const int CLIP_SAVE_SLOT_COUNT = 3;
 	struct SettingsHit {
 		RECT rect;
 		SettingsAction action;
 		int field; // SettingsField for Toggle/Step, hotkey index, or SettingsPage for OpenCategory
 	};
+
+	void BeginSettingsIntEdit(SettingsField field);
+	void CancelSettingsIntEdit();
+	bool CommitSettingsIntEdit();
 
 	bool m_settingsOpen;
 	SettingsPage m_settingsPage;
@@ -328,6 +344,8 @@ private:
 	int m_settingsViewportTop;
 	int m_settingsViewportBottom;
 	int m_settingsCapturingHotkeyIndex;
+	int m_settingsEditingIntField; // SettingsField or -1
+	std::wstring m_settingsEditText;
 	int m_settingsHoverIndex;
 	std::vector<SettingsHit> m_settingsHits;
 
@@ -364,16 +382,28 @@ private:
 	bool m_setToastLowDisk;
 	int m_setToastLowDiskGb;
 	int m_setToastDurationSec;
+	int m_setBufferLengthSec;
+	int m_setClipSeconds[CLIP_SAVE_SLOT_COUNT];
+	bool m_setClipShow[CLIP_SAVE_SLOT_COUNT];
 	std::wstring m_setExportPath;
-	static const int SETTINGS_HOTKEY_COUNT = 9;
+	static const int SETTINGS_HOTKEY_COUNT = 12;
 	int m_setHotkeyVk[SETTINGS_HOTKEY_COUNT];
 	int m_setHotkeyMod[SETTINGS_HOTKEY_COUNT];
 
 	void ApplyIndicatorCustoms();
 	void ApplyIndicatorSounds();
 	void ApplyToastActionHotkeys();
+	void ApplyClipSaveHotkeys();
 	void ApplyToastAccentColor();
 	void ApplyToastOptions();
+
+	// Replay clip picker: chevron swaps the whole replay panel to a vertical preset list
+	bool m_replayClipPickerOpen;
+	RECT m_replaySaveRect;
+	RECT m_replayClipChevronRect;
+	std::vector<RECT> m_replayClipOptionRects;
+	std::vector<int> m_replayClipOptionSeconds;
+	std::vector<bool> m_replayClipOptionEnabled;
 	void ApplyAccentBrushes();
 	float UiScale() const;
 	float FontScale() const;

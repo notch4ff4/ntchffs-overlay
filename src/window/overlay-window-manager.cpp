@@ -26,6 +26,50 @@ OverlayWindowManager::OverlayWindowManager()
 
 OverlayWindowManager *OverlayWindowManager::s_keyboardCaptureManager = nullptr;
 
+namespace {
+// Track modifiers ourselves: swallowing KEYDOWN in the LL hook prevents
+// GetAsyncKeyState from seeing Ctrl/Alt/Shift as held for the next key.
+bool g_captureShiftDown = false;
+bool g_captureCtrlDown = false;
+bool g_captureAltDown = false;
+
+void ResetCaptureModifiers()
+{
+	g_captureShiftDown = false;
+	g_captureCtrlDown = false;
+	g_captureAltDown = false;
+}
+
+bool IsModifierVk(int vk)
+{
+	return vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT || vk == VK_CONTROL ||
+	       vk == VK_LCONTROL || vk == VK_RCONTROL || vk == VK_MENU || vk == VK_LMENU ||
+	       vk == VK_RMENU;
+}
+
+void UpdateCaptureModifier(int vk, bool down)
+{
+	if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT)
+		g_captureShiftDown = down;
+	else if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL)
+		g_captureCtrlDown = down;
+	else if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU)
+		g_captureAltDown = down;
+}
+
+int CaptureModsFromTrackedState()
+{
+	int mods = 0;
+	if (g_captureShiftDown)
+		mods |= 1;
+	if (g_captureCtrlDown)
+		mods |= 2;
+	if (g_captureAltDown)
+		mods |= 4;
+	return mods;
+}
+} // namespace
+
 OverlayWindowManager::~OverlayWindowManager() {
 	Shutdown();
 }
@@ -339,6 +383,7 @@ void OverlayWindowManager::SetKeyboardCaptureActive(bool active) {
 		if (m_keyboardHook) {
 			return;
 		}
+		ResetCaptureModifiers();
 		s_keyboardCaptureManager = this;
 		m_keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc,
 						  GetModuleHandle(NULL), 0);
@@ -354,6 +399,7 @@ void OverlayWindowManager::SetKeyboardCaptureActive(bool active) {
 		if (s_keyboardCaptureManager == this) {
 			s_keyboardCaptureManager = nullptr;
 		}
+		ResetCaptureModifiers();
 	}
 }
 
@@ -361,26 +407,29 @@ LRESULT CALLBACK OverlayWindowManager::LowLevelKeyboardProc(int code, WPARAM wPa
 	if (code == HC_ACTION) {
 		OverlayWindowManager *mgr = s_keyboardCaptureManager;
 		if (mgr) {
-			if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
-				KBDLLHOOKSTRUCT *kb = reinterpret_cast<KBDLLHOOKSTRUCT *>(lParam);
-				if (kb && mgr->m_keyHandler) {
-					int vk = static_cast<int>(kb->vkCode);
-					int mods = 0;
-					// Physical key state is reliable here even though the event is swallowed.
-					if (GetAsyncKeyState(VK_SHIFT) & 0x8000)
-						mods |= 1;
-					if (GetAsyncKeyState(VK_CONTROL) & 0x8000)
-						mods |= 2;
-					if (GetAsyncKeyState(VK_MENU) & 0x8000)
-						mods |= 4;
-					mgr->m_keyHandler(vk, mods, mgr->m_keyHandlerUserData);
+			KBDLLHOOKSTRUCT *kb = reinterpret_cast<KBDLLHOOKSTRUCT *>(lParam);
+			if (!kb)
+				return 1;
+
+			const int vk = static_cast<int>(kb->vkCode);
+			const bool down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+			const bool up = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+
+			if (down || up) {
+				if (IsModifierVk(vk)) {
+					UpdateCaptureModifier(vk, down);
+					// Swallow modifiers so they don't reach the focused app,
+					// but keep our own down-state so combinations work.
+					return 1;
 				}
-				// Swallow so the bind key does not reach the focused app/game.
+			}
+
+			if (down && mgr->m_keyHandler) {
+				mgr->m_keyHandler(vk, CaptureModsFromTrackedState(), mgr->m_keyHandlerUserData);
 				return 1;
 			}
-			if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
+			if (up)
 				return 1;
-			}
 		}
 	}
 	return CallNextHookEx(NULL, code, wParam, lParam);

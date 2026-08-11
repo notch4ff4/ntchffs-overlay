@@ -37,6 +37,7 @@ public:
 	void ToggleRecording();
 	void ToggleReplayBuffer();
 	void SaveReplay();
+	void SaveReplayClip(int seconds);
 	static void SetReplaySaving(bool saving);
 	static bool GetReplaySaving();
 	

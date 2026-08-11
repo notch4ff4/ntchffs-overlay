@@ -34,6 +34,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "overlay-toasts-c.h"
 #include "overlay-runtime-apply.h"
 #include "overlay-smart-replay.h"
+#include "overlay-clip-save.h"
 #include "overlay-state.h"
 #include <QAction>
 #include <QInputDialog>
@@ -152,7 +153,8 @@ static void handle_replay_saved_event(void)
 			"Replay buffer saved event without a valid file path");
 	}
 
-	overlay_smart_replay_on_save_completed(replay_path);
+	if (!overlay_clip_save_on_replay_saved(replay_path))
+		overlay_smart_replay_on_save_completed(replay_path);
 }
 
 static void handle_recording_stopped_event(void)

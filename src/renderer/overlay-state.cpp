@@ -2,10 +2,12 @@
 
 #include "overlay-state.h"
 #include "overlay-smart-replay.h"
+#include "overlay-clip-save.h"
 #include <obs-frontend-api.h>
 #include <obs-module.h>
 #include <obs-data.h>
 #include <util/config-file.h>
+#include <util/platform.h>
 #include <shlobj.h>
 #include <knownfolders.h>
 #include <sstream>
@@ -15,6 +17,7 @@
 #include <shlwapi.h>
 #include <comdef.h>
 #include <atomic>
+#include <cstdint>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -61,12 +64,38 @@ void OverlayStateManager::UpdateRecordingStatus(OverlayState &state) {
 }
 
 void OverlayStateManager::UpdateReplayStatus(OverlayState &state) {
+	bool rawActive = false;
 	try {
-		state.replayActive = obs_frontend_replay_buffer_active();
+		// Prefer the live output flag. The frontend atomic can briefly disagree
+		// while recording starts and shared encoders/outputs are wired up
+		// (seen as a one-second "replay on" flash on first OBS launch).
+		obs_output_t *out = obs_frontend_get_replay_buffer_output();
+		if (out) {
+			rawActive = obs_output_active(out);
+			obs_output_release(out);
+		}
+		if (rawActive && !obs_frontend_replay_buffer_active())
+			rawActive = false;
 	} catch (...) {
-		// Frontend APIs may be unavailable during early OBS startup.
+		rawActive = false;
 	}
-	state.replaySaving = GetReplaySaving();
+
+	// Suppress sub-frame / short rising-edge flashes without delaying a real start much.
+	static uint64_t risingSinceNs = 0;
+	if (!rawActive) {
+		risingSinceNs = 0;
+		state.replayActive = false;
+	} else {
+		const uint64_t now = os_gettime_ns();
+		if (risingSinceNs == 0)
+			risingSinceNs = now;
+		constexpr uint64_t kRisingConfirmNs = 120ULL * 1000ULL * 1000ULL; // 120 ms
+		state.replayActive = (now - risingSinceNs) >= kRisingConfirmNs;
+	}
+
+	state.replaySaving = state.replayActive ? GetReplaySaving() : false;
+	if (!state.replayActive && GetReplaySaving())
+		SetReplaySaving(false);
 }
 
 void OverlayStateManager::UpdateStats(OverlayState &state) {
@@ -171,6 +200,32 @@ void OverlayStateManager::ToggleReplayBuffer() {
 
 void OverlayStateManager::SaveReplay() {
 	obs_queue_task(OBS_TASK_UI, save_replay_ui_task, nullptr, false);
+}
+
+static void save_replay_clip_ui_task(void *param)
+{
+	const int seconds = static_cast<int>(reinterpret_cast<intptr_t>(param));
+
+	try {
+		if (!obs_frontend_replay_buffer_active()) {
+			return;
+		}
+		if (OverlayStateManager::GetReplaySaving()) {
+			return;
+		}
+		if (!overlay_clip_save_request(seconds)) {
+			return;
+		}
+		OverlayStateManager::SetReplaySaving(true);
+	} catch (...) {
+		obs_log(LOG_ERROR, "Failed to save replay clip");
+	}
+}
+
+void OverlayStateManager::SaveReplayClip(int seconds)
+{
+	obs_queue_task(OBS_TASK_UI, save_replay_clip_ui_task, reinterpret_cast<void *>(static_cast<intptr_t>(seconds)),
+		       false);
 }
 
 std::string OverlayStateManager::GetConfiguredRecordingPath() {
