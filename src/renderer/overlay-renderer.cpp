@@ -1347,8 +1347,16 @@ void OverlayRenderer::RenderButtons()
 
 	RECT obsRect = m_layout.showOBSButtonRect;
 	const bool hoverShowObs = (m_hoverTarget == HoverTarget::ShowOBSButton);
-	RenderText(overlay::util::ModuleTextW("ShowObs"), obsRect, 10.0f * FontScale(), DWRITE_FONT_WEIGHT_NORMAL,
-		   hoverShowObs ? hoverColor : D2D1::ColorF(1.0f, 1.0f, 1.0f));
+	bool obsVisible = false;
+#ifdef ENABLE_QT
+	if (QWidget *mainWindow = static_cast<QWidget *>(obs_frontend_get_main_window()))
+		obsVisible = mainWindow->isVisible() && !mainWindow->isMinimized();
+#else
+	if (HWND obsHwnd = (HWND)obs_frontend_get_main_window())
+		obsVisible = IsWindow(obsHwnd) && IsWindowVisible(obsHwnd) && !IsIconic(obsHwnd);
+#endif
+	RenderText(overlay::util::ModuleTextW(obsVisible ? "HideObs" : "ShowObs"), obsRect, 10.0f * FontScale(),
+		   DWRITE_FONT_WEIGHT_NORMAL, hoverShowObs ? hoverColor : D2D1::ColorF(1.0f, 1.0f, 1.0f));
 }
 
 void OverlayRenderer::RenderText(const std::wstring &text, const RECT &rect, float fontSize, DWRITE_FONT_WEIGHT weight,
