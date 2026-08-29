@@ -481,4 +481,13 @@ extern "C" void overlay_smart_replay_on_replay_buffer_stopped(void)
 #endif
 }
 
+extern "C" bool overlay_smart_replay_is_restart_pending(void)
+{
+#ifdef ENABLE_QT
+	return g_replay_restart_pending;
+#else
+	return false;
+#endif
+}
+
 #endif // ENABLE_FRONTEND_API

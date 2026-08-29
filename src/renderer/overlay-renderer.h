@@ -294,6 +294,7 @@ private:
 		IndicatorsTint1,
 		IndicatorsTint2,
 		IndicatorsTint3,
+		RememberReplayBuffer,
 		SmartReplay,
 		SmartReplayMode,
 		GalleryInOverlay,
@@ -372,6 +373,7 @@ private:
 	void InvalidateIndicatorPreview(int slot);
 	bool EnsureIndicatorPreview(int slot);
 	void DrawIndicatorPreview(int slot, const RECT &rect);
+	bool m_setRememberReplayBuffer;
 	bool m_setSmartReplay;
 	int m_setSmartReplayMode;
 	bool m_setGalleryInOverlay;

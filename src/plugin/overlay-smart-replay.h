@@ -17,6 +17,7 @@ void overlay_smart_replay_set_mode(int mode);
 bool overlay_smart_replay_request_save(void);
 void overlay_smart_replay_on_save_completed(const char *replay_path);
 void overlay_smart_replay_on_replay_buffer_stopped(void);
+bool overlay_smart_replay_is_restart_pending(void);
 
 #ifdef __cplusplus
 }

@@ -442,16 +442,78 @@ static void ApplyToastAccentFromSettings()
 	overlay_toasts_set_accent_color(overlay_toasts, accent);
 }
 
+static bool g_obs_exiting = false;
+static bool g_remember_replay_snapshotted = false;
+
+static bool settings_get_bool(const char *key, bool def)
+{
+	if (!saved_settings_data || !obs_data_has_user_value(saved_settings_data, key))
+		return def;
+	return obs_data_get_bool(saved_settings_data, key);
+}
+
+static void remember_replay_buffer_set_was_active(bool active, bool persist)
+{
+	if (!settings_get_bool("remember_replay_buffer", false))
+		return;
+	overlay_settings_ensure();
+	if (!saved_settings_data)
+		return;
+	obs_data_set_bool(saved_settings_data, "replay_buffer_was_active", active);
+	if (persist)
+		overlay_settings_save();
+}
+
+static void remember_replay_buffer_snapshot_for_exit(void)
+{
+	if (g_remember_replay_snapshotted)
+		return;
+	g_obs_exiting = true;
+	g_remember_replay_snapshotted = true;
+	if (!settings_get_bool("remember_replay_buffer", false))
+		return;
+	const bool active = obs_frontend_replay_buffer_active();
+	obs_log(LOG_INFO, "Remember Replay Buffer: exit snapshot active=%s", active ? "yes" : "no");
+	remember_replay_buffer_set_was_active(active, true);
+}
+
+static void maybe_restore_replay_buffer_state(void)
+{
+	if (!settings_get_bool("remember_replay_buffer", false))
+		return;
+	if (!settings_get_bool("replay_buffer_was_active", false)) {
+		obs_log(LOG_INFO, "Remember Replay Buffer: last state was inactive, skip start");
+		return;
+	}
+	if (obs_frontend_replay_buffer_active()) {
+		obs_log(LOG_INFO, "Remember Replay Buffer: already active, skip start");
+		return;
+	}
+	obs_log(LOG_INFO, "Remember Replay Buffer: starting once to restore last state");
+	obs_frontend_replay_buffer_start();
+}
+
+extern "C" void overlay_runtime_set_remember_replay_buffer(bool enabled)
+{
+	overlay_settings_ensure();
+	if (!saved_settings_data)
+		return;
+	obs_data_set_bool(saved_settings_data, "remember_replay_buffer", enabled);
+	if (enabled) {
+		const bool active = obs_frontend_replay_buffer_active();
+		obs_data_set_bool(saved_settings_data, "replay_buffer_was_active", active);
+		obs_log(LOG_INFO, "Remember Replay Buffer: enabled, sync was_active=%s",
+			active ? "yes" : "no");
+	}
+	overlay_settings_save();
+}
+
 static void ApplyToastOptionsFromSettings()
 {
 	if (!overlay_toasts)
 		return;
 
-	auto getBool = [](const char *key, bool def) {
-		if (!saved_settings_data || !obs_data_has_user_value(saved_settings_data, key))
-			return def;
-		return obs_data_get_bool(saved_settings_data, key);
-	};
+	auto getBool = [](const char *key, bool def) { return settings_get_bool(key, def); };
 	int thresholdGb = 5;
 	if (saved_settings_data && obs_data_has_user_value(saved_settings_data, "toast_low_disk_gb")) {
 		thresholdGb = (int)obs_data_get_int(saved_settings_data, "toast_low_disk_gb");
@@ -590,11 +652,23 @@ static void frontend_event_callback(enum obs_frontend_event event, void *priv_da
 				obs_log(LOG_ERROR, "Failed to create overlay toasts");
 			}
 		}
+
+		maybe_restore_replay_buffer_state();
+	} else if (event == OBS_FRONTEND_EVENT_EXIT ||
+		   event == OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN) {
+		// Snapshot before outputs are torn down; after EXIT frontend API must not be used.
+		remember_replay_buffer_snapshot_for_exit();
 	} else if (event == OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVED) {
 		handle_replay_saved_event();
 	} else if (event == OBS_FRONTEND_EVENT_RECORDING_STOPPED) {
 		handle_recording_stopped_event();
+	} else if (event == OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED) {
+		if (!g_obs_exiting)
+			remember_replay_buffer_set_was_active(true, true);
 	} else if (event == OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED) {
+		// Shutdown stops the buffer after our EXIT snapshot — do not overwrite it.
+		if (!g_obs_exiting && !overlay_smart_replay_is_restart_pending())
+			remember_replay_buffer_set_was_active(false, true);
 		overlay_smart_replay_on_replay_buffer_stopped();
 	}
 }
@@ -661,6 +735,9 @@ void obs_module_unload(void)
 	}
 
 	hotkeys_loaded = false;
+
+	// Do not query replay buffer here: after EXIT the frontend API is invalid, and
+	// shutdown STOPPED would otherwise force was_active=false. Snapshot is done on EXIT.
 
 	overlay_settings_save();
 

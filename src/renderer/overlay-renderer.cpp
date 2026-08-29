@@ -240,6 +240,7 @@ OverlayRenderer::OverlayRenderer()
 		m_setIndicatorTint[i] = false;
 		m_setIndicatorColor[i] = 0xFFFFFF;
 	}
+	m_setRememberReplayBuffer = false;
 	m_setSmartReplay = true;
 	m_setSmartReplayMode = 0;
 	m_setBufferLengthSec = 120;
@@ -4158,6 +4159,7 @@ void OverlayRenderer::LoadSettingsWorkingValues()
 		m_setIndicatorTint[i] = getBoolDef(tintKey.c_str(), false);
 		m_setIndicatorColor[i] = getIntDef(colorKey.c_str(), 0xFFFFFF) & 0xFFFFFF;
 	}
+	m_setRememberReplayBuffer = getBoolDef("remember_replay_buffer", false);
 	m_setSmartReplay = getBoolDef("smart_replay", true);
 	m_setSmartReplayMode = ClampInt(getIntDef("smart_replay_mode", 0), 0, 1);
 	{
@@ -4225,6 +4227,7 @@ void OverlayRenderer::PersistSettingsWorkingValues()
 		obs_data_set_bool(d, tintKey.c_str(), m_setIndicatorTint[i]);
 		obs_data_set_int(d, colorKey.c_str(), m_setIndicatorColor[i] & 0xFFFFFF);
 	}
+	obs_data_set_bool(d, "remember_replay_buffer", m_setRememberReplayBuffer);
 	obs_data_set_bool(d, "smart_replay", m_setSmartReplay);
 	obs_data_set_int(d, "smart_replay_mode", m_setSmartReplayMode);
 	obs_data_set_int(d, "clip_buffer_length", m_setBufferLengthSec);
@@ -4957,6 +4960,8 @@ void OverlayRenderer::RenderSettingsPanel()
 		}
 		break;
 	case SettingsPage::Replay:
+		checkboxRow(overlay::util::ModuleTextW("RememberReplayBuffer"), m_setRememberReplayBuffer,
+			    SettingsField::RememberReplayBuffer);
 		checkboxRow(overlay::util::ModuleTextW("SmartReplay"), m_setSmartReplay, SettingsField::SmartReplay);
 		stepperRow(overlay::util::ModuleTextW("SmartReplay.Mode"),
 			   overlay::util::ModuleTextW(kSettingsSmartReplayModeKeys[m_setSmartReplayMode]),
@@ -5313,6 +5318,12 @@ void OverlayRenderer::HandleSettingsClick(int x, int y)
 				m_setIndicatorTint[slot] = !m_setIndicatorTint[slot];
 			break;
 		}
+		case SettingsField::RememberReplayBuffer:
+			m_setRememberReplayBuffer = !m_setRememberReplayBuffer;
+#ifdef ENABLE_QT
+			overlay_runtime_set_remember_replay_buffer(m_setRememberReplayBuffer);
+#endif
+			break;
 		case SettingsField::SmartReplay:
 			m_setSmartReplay = !m_setSmartReplay;
 #ifdef ENABLE_QT
