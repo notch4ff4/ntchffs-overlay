@@ -44,6 +44,7 @@ the Free Software Foundation; either version 2 of the License, or
 
 static bool g_smart_replay_enabled = true;
 static int g_smart_replay_mode = OVERLAY_SMART_REPLAY_LEGACY;
+static bool g_clip_ignore_trim = true;
 static bool g_replay_restart_pending = false;
 static int g_replay_restart_attempts = 0;
 static uint64_t g_last_save_request_ns = 0;
@@ -157,6 +158,12 @@ static void set_smart_replay_mode(int mode)
 	g_smart_replay_mode = mode;
 	obs_log(LOG_INFO, "Smart replay mode: %s",
 		mode == OVERLAY_SMART_REPLAY_TIMESTAMP_TRIM ? "timestamp trim" : "legacy");
+}
+
+static void set_clip_ignore_trim(bool ignore)
+{
+	g_clip_ignore_trim = ignore;
+	obs_log(LOG_INFO, "[SmartReplay] clip ignore trim=%s", ignore ? "yes" : "no");
 }
 
 static void schedule_smart_replay_buffer_start(void)
@@ -418,7 +425,36 @@ extern "C" void overlay_smart_replay_set_mode(int mode)
 #endif
 }
 
-extern "C" bool overlay_smart_replay_request_save(void)
+extern "C" void overlay_smart_replay_set_clip_ignore_trim(bool ignore)
+{
+#ifdef ENABLE_QT
+	set_clip_ignore_trim(ignore);
+#else
+	UNUSED_PARAMETER(ignore);
+#endif
+}
+
+extern "C" bool overlay_smart_replay_get_clip_ignore_trim(void)
+{
+#ifdef ENABLE_QT
+	return g_clip_ignore_trim;
+#else
+	return true;
+#endif
+}
+
+extern "C" bool overlay_smart_replay_clip_uses_keep_last(void)
+{
+#ifdef ENABLE_QT
+	if (!g_smart_replay_enabled || g_smart_replay_mode != OVERLAY_SMART_REPLAY_TIMESTAMP_TRIM)
+		return true;
+	return g_clip_ignore_trim;
+#else
+	return true;
+#endif
+}
+
+extern "C" bool overlay_smart_replay_note_save_request(void)
 {
 #ifdef ENABLE_QT
 	if (!g_smart_replay_enabled || g_smart_replay_mode != OVERLAY_SMART_REPLAY_TIMESTAMP_TRIM)
@@ -445,8 +481,19 @@ extern "C" bool overlay_smart_replay_request_save(void)
 		g_save_requests.size(), get_replay_buffer_max_secs(),
 		obs_frontend_replay_buffer_active() ? "yes" : "no", elapsed_since_prev_sec);
 
-	obs_frontend_replay_buffer_save();
+	return true;
+#else
+	return false;
+#endif
+}
 
+extern "C" bool overlay_smart_replay_request_save(void)
+{
+#ifdef ENABLE_QT
+	if (!overlay_smart_replay_note_save_request())
+		return false;
+
+	obs_frontend_replay_buffer_save();
 	return true;
 #else
 	return false;
@@ -465,6 +512,38 @@ extern "C" void overlay_smart_replay_on_save_completed(const char *replay_path)
 	}
 
 	restart_smart_replay_buffer_after_save();
+#else
+	UNUSED_PARAMETER(replay_path);
+#endif
+}
+
+extern "C" void overlay_smart_replay_acknowledge_save(const char *replay_path)
+{
+#ifdef ENABLE_QT
+	if (!g_smart_replay_enabled || g_smart_replay_mode != OVERLAY_SMART_REPLAY_TIMESTAMP_TRIM)
+		return;
+
+	if (g_save_requests.empty()) {
+		obs_log(LOG_INFO,
+			"[SmartReplay] clip save acknowledged with empty request queue path=%s",
+			replay_path ? replay_path : "(null)");
+		return;
+	}
+
+	const SaveRequestRecord record = g_save_requests.front();
+	g_save_requests.pop_front();
+
+	const uint64_t complete_ns = os_gettime_ns();
+	const double save_delay_sec =
+		record.request_ns > 0 ? ns_to_seconds(complete_ns - record.request_ns) : 0.0;
+
+	obs_log(LOG_INFO,
+		"[SmartReplay] clip save acknowledged seq=%llu path=%s request_ns=%llu complete_ns=%llu save_delay=%.3f s queue_depth=%zu (overlap trim skipped)",
+		static_cast<unsigned long long>(record.sequence),
+		replay_path ? replay_path : "(null)",
+		static_cast<unsigned long long>(record.request_ns),
+		static_cast<unsigned long long>(complete_ns), save_delay_sec,
+		g_save_requests.size());
 #else
 	UNUSED_PARAMETER(replay_path);
 #endif

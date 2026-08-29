@@ -215,6 +215,17 @@ LRESULT CALLBACK OverlayWindowManager::WindowProc(HWND hwnd, UINT msg, WPARAM wP
 		}
 		return 0;
 	}
+
+	case WM_APP + 43: {
+		struct SyncWork {
+			void (*fn)(void *);
+			void *param;
+		};
+		SyncWork *work = reinterpret_cast<SyncWork *>(lParam);
+		if (work && work->fn)
+			work->fn(work->param);
+		return 0;
+	}
 	
 	case WM_DESTROY:
 		return 0;
@@ -376,6 +387,25 @@ void OverlayWindowManager::PostDeferred() {
 	if (m_hwnd) {
 		PostMessageW(m_hwnd, WM_APP + 42, 0, 0);
 	}
+}
+
+void OverlayWindowManager::RunOnWindowThreadSync(void (*fn)(void *param), void *param) {
+	if (!fn)
+		return;
+	if (!m_hwnd) {
+		fn(param);
+		return;
+	}
+	const DWORD windowThread = GetWindowThreadProcessId(m_hwnd, nullptr);
+	if (windowThread == GetCurrentThreadId()) {
+		fn(param);
+		return;
+	}
+	struct SyncWork {
+		void (*fn)(void *);
+		void *param;
+	} work = {fn, param};
+	SendMessageW(m_hwnd, WM_APP + 43, 0, reinterpret_cast<LPARAM>(&work));
 }
 
 void OverlayWindowManager::SetKeyboardCaptureActive(bool active) {

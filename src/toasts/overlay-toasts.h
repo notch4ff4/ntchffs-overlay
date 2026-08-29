@@ -42,8 +42,11 @@ public:
 	void Shutdown();
 
 	void SetActionHotkeys(int viewVk, int viewMod, int deleteVk, int deleteMod);
+	void SetHotkeysAlwaysActive(bool always);
 	void SetAccentColor(int colorRgb);
 	void SetViewFileHandler(void (*handler)(const wchar_t *path, void *userData), void *userData);
+	void SetDeleteFileHandlers(void (*releaseHandler)(const wchar_t *path, void *userData),
+				   void (*deletedHandler)(const wchar_t *path, void *userData), void *userData);
 	void SetEnabled(bool enabled);
 	void SetVideoSavedEnabled(bool enabled);
 	void SetOpenHintEnabled(bool enabled);
@@ -69,10 +72,12 @@ private:
 	void DismissCurrent();
 	void RegisterActionHotkeys();
 	void UnregisterActionHotkeys();
+	void SyncActionHotkeys();
 	void RefreshCurrentActionHotkeys();
 	void OnHotkey(int id);
 	void HandleView();
 	void HandleDelete();
+	std::wstring ActionTargetPath() const;
 	void CheckDiskSpace();
 	void Update();
 	void Render();
@@ -118,6 +123,8 @@ private:
 	ToastItem m_current;
 	bool m_hasCurrent;
 	bool m_hotkeysRegistered;
+	bool m_hotkeysAlways;
+	std::wstring m_lastActionPath;
 	AnimPhase m_animPhase;
 	double m_animStartSec;
 	double m_holdUntilSec;
@@ -135,6 +142,9 @@ private:
 	int m_deleteMod;
 	void (*m_viewFileHandler)(const wchar_t *path, void *userData);
 	void *m_viewFileUserData;
+	void (*m_releaseFileHandler)(const wchar_t *path, void *userData);
+	void (*m_fileDeletedHandler)(const wchar_t *path, void *userData);
+	void *m_deleteFileUserData;
 	ULONGLONG m_lastDiskCheckTick;
 	ULONGLONG m_lastLowDiskToastTick;
 	UINT_PTR m_updateTimer;

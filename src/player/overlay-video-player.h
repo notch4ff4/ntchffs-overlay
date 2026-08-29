@@ -36,6 +36,7 @@ public:
 
 	bool Open(const std::wstring &path);
 	void Close();
+	const std::wstring &GetOpenPath() const { return m_openPath; }
 
 	void SetPlaying(bool playing);
 	bool IsPlaying() const { return m_playing; }

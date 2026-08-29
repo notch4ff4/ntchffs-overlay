@@ -153,7 +153,9 @@ static void handle_replay_saved_event(void)
 			"Replay buffer saved event without a valid file path");
 	}
 
-	if (!overlay_clip_save_on_replay_saved(replay_path))
+	if (overlay_clip_save_on_replay_saved(replay_path))
+		overlay_smart_replay_acknowledge_save(replay_path);
+	else
 		overlay_smart_replay_on_save_completed(replay_path);
 }
 
@@ -375,11 +377,23 @@ extern "C" void overlay_runtime_set_smart_replay_mode(int mode)
 	overlay_smart_replay_set_mode(mode);
 }
 
+extern "C" void overlay_runtime_set_smart_replay_clip_ignore_trim(bool ignore)
+{
+	overlay_smart_replay_set_clip_ignore_trim(ignore);
+}
+
 extern "C" void overlay_runtime_set_toast_action_hotkeys(int viewVk, int viewMod, int deleteVk, int deleteMod)
 {
 	if (!overlay_toasts)
 		return;
 	overlay_toasts_set_action_hotkeys(overlay_toasts, viewVk, viewMod, deleteVk, deleteMod);
+}
+
+extern "C" void overlay_runtime_set_toast_hotkeys_always_active(bool always)
+{
+	if (!overlay_toasts)
+		return;
+	overlay_toasts_set_hotkeys_always_active(overlay_toasts, always);
 }
 
 extern "C" void overlay_runtime_set_toast_accent_color(int colorRgb)
@@ -404,6 +418,22 @@ static void ToastViewInOverlayHandler(const char *pathUtf8, void *userData)
 	if (!pathUtf8 || !pathUtf8[0] || !overlay_window)
 		return;
 	overlay_window_open_gallery_file(overlay_window, pathUtf8);
+}
+
+static void ToastReleaseFileHandler(const char *pathUtf8, void *userData)
+{
+	UNUSED_PARAMETER(userData);
+	if (!pathUtf8 || !pathUtf8[0] || !overlay_window)
+		return;
+	overlay_window_release_gallery_file(overlay_window, pathUtf8);
+}
+
+static void ToastFileDeletedHandler(const char *pathUtf8, void *userData)
+{
+	UNUSED_PARAMETER(userData);
+	if (!pathUtf8 || !pathUtf8[0] || !overlay_window)
+		return;
+	overlay_window_notify_gallery_file_deleted(overlay_window, pathUtf8);
 }
 
 static void ApplyToastHotkeysFromSettings()
@@ -534,6 +564,13 @@ static void ApplyToastOptionsFromSettings()
 	overlay_toasts_set_options(overlay_toasts, getBool("toasts_enabled", true),
 				   getBool("toast_video_saved", true), getBool("toast_open_hint", true),
 				   getBool("toast_low_disk", true), thresholdGb, durationSec);
+
+	bool hotkeysAlways = false;
+	if (saved_settings_data && obs_data_has_user_value(saved_settings_data, "toast_hotkeys_scope"))
+		hotkeysAlways = obs_data_get_int(saved_settings_data, "toast_hotkeys_scope") == 1;
+	else
+		hotkeysAlways = getBool("toast_hotkeys_always", false);
+	overlay_toasts_set_hotkeys_always_active(overlay_toasts, hotkeysAlways);
 }
 
 static void frontend_event_callback(enum obs_frontend_event event, void *priv_data)
@@ -646,6 +683,8 @@ static void frontend_event_callback(enum obs_frontend_event event, void *priv_da
 				ApplyToastAccentFromSettings();
 				ApplyToastOptionsFromSettings();
 				overlay_toasts_set_view_handler(overlay_toasts, ToastViewInOverlayHandler, nullptr);
+				overlay_toasts_set_delete_handlers(overlay_toasts, ToastReleaseFileHandler,
+								   ToastFileDeletedHandler, nullptr);
 				MaybeShowOpenOverlayHint();
 				overlay_toasts_tick_disk_space(overlay_toasts);
 			} else {
@@ -695,6 +734,13 @@ bool obs_module_load(void)
 		smartReplayMode = static_cast<int>(obs_data_get_int(saved_settings_data, "smart_replay_mode"));
 	}
 	overlay_smart_replay_set_mode(smartReplayMode);
+
+	const bool clipIgnoreTrim =
+		!saved_settings_data ||
+			!obs_data_has_user_value(saved_settings_data, "smart_replay_clip_ignore_trim")
+			? true
+			: obs_data_get_bool(saved_settings_data, "smart_replay_clip_ignore_trim");
+	overlay_smart_replay_set_clip_ignore_trim(clipIgnoreTrim);
 #endif
 
 	// Frontend callbacks persist hotkey bindings in the OBS profile.

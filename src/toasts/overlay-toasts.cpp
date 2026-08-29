@@ -87,6 +87,7 @@ OverlayToasts::OverlayToasts()
 	  m_textBrush(nullptr),
 	  m_hasCurrent(false),
 	  m_hotkeysRegistered(false),
+	  m_hotkeysAlways(false),
 	  m_animPhase(AnimPhase::Idle),
 	  m_animStartSec(0.0),
 	  m_holdUntilSec(0.0),
@@ -104,6 +105,9 @@ OverlayToasts::OverlayToasts()
 	  m_deleteMod(2),
 	  m_viewFileHandler(nullptr),
 	  m_viewFileUserData(nullptr),
+	  m_releaseFileHandler(nullptr),
+	  m_fileDeletedHandler(nullptr),
+	  m_deleteFileUserData(nullptr),
 	  m_lastDiskCheckTick(0),
 	  m_lastLowDiskToastTick(0),
 	  m_updateTimer(0),
@@ -292,6 +296,15 @@ void OverlayToasts::SetActionHotkeys(int viewVk, int viewMod, int deleteVk, int 
 	m_deleteVk = deleteVk > 0 ? deleteVk : VK_F8;
 	m_deleteMod = deleteMod & 7;
 	RefreshCurrentActionHotkeys();
+	SyncActionHotkeys();
+}
+
+void OverlayToasts::SetHotkeysAlwaysActive(bool always)
+{
+	if (m_hotkeysAlways == always)
+		return;
+	m_hotkeysAlways = always;
+	SyncActionHotkeys();
 }
 
 void OverlayToasts::SetAccentColor(int colorRgb)
@@ -311,6 +324,14 @@ void OverlayToasts::SetViewFileHandler(void (*handler)(const wchar_t *path, void
 	m_viewFileUserData = userData;
 }
 
+void OverlayToasts::SetDeleteFileHandlers(void (*releaseHandler)(const wchar_t *path, void *userData),
+					  void (*deletedHandler)(const wchar_t *path, void *userData), void *userData)
+{
+	m_releaseFileHandler = releaseHandler;
+	m_fileDeletedHandler = deletedHandler;
+	m_deleteFileUserData = userData;
+}
+
 void OverlayToasts::SetEnabled(bool enabled)
 {
 	if (m_enabled == enabled)
@@ -321,11 +342,14 @@ void OverlayToasts::SetEnabled(bool enabled)
 		m_queue.clear();
 		m_hasCurrent = false;
 		m_current = ToastItem();
+		m_lastActionPath.clear();
 		m_animPhase = AnimPhase::Idle;
 		m_slideProgress = 0.0f;
 		m_windowManager.Hide();
 		SetAnimTimerBoost(false);
 		EnsureTimer(TIMER_IDLE_MS);
+	} else {
+		SyncActionHotkeys();
 	}
 }
 
@@ -417,7 +441,14 @@ void OverlayToasts::Show(const wchar_t *text, ULONGLONG durationMs, const char *
 
 void OverlayToasts::ShowReplaySaved(const wchar_t *path)
 {
-	if (!m_enabled || !m_videoSavedEnabled || !path || !path[0])
+	if (!m_enabled || !path || !path[0])
+		return;
+
+	m_lastActionPath = path;
+	if (m_hotkeysAlways)
+		SyncActionHotkeys();
+
+	if (!m_videoSavedEnabled)
 		return;
 
 	ToastItem item;
@@ -487,12 +518,13 @@ void OverlayToasts::Enqueue(ToastItem item)
 	if (!item.id.empty()) {
 		if (m_hasCurrent && m_current.id == item.id && m_animPhase != AnimPhase::Exit) {
 			const ULONGLONG duration = item.durationMs > 0 ? item.durationMs : m_current.durationMs;
-			UnregisterActionHotkeys();
+			if (!m_hotkeysAlways)
+				UnregisterActionHotkeys();
 			m_current = std::move(item);
 			m_current.durationMs = duration;
 			if (m_animPhase == AnimPhase::Hold)
 				m_holdUntilSec = NowSeconds() + (duration / 1000.0);
-			RegisterActionHotkeys();
+			SyncActionHotkeys();
 			Render();
 			return;
 		}
@@ -518,7 +550,8 @@ void OverlayToasts::StartExit()
 	if (!m_hasCurrent || m_animPhase == AnimPhase::Exit)
 		return;
 
-	UnregisterActionHotkeys();
+	if (!m_hotkeysAlways)
+		UnregisterActionHotkeys();
 	m_animPhase = AnimPhase::Exit;
 	m_animStartSec = NowSeconds();
 	SetAnimTimerBoost(true);
@@ -553,11 +586,24 @@ void OverlayToasts::DismissCurrent()
 void OverlayToasts::RegisterActionHotkeys()
 {
 	UnregisterActionHotkeys();
-	if (!m_hasCurrent || m_current.actions.empty())
+	if (!m_enabled)
 		return;
 
 	HWND hwnd = m_windowManager.GetHWND();
 	if (!hwnd)
+		return;
+
+	if (m_hotkeysAlways) {
+		if (m_viewVk > 0)
+			RegisterHotKey(hwnd, HOTKEY_VIEW, WinHotkeyMods(m_viewMod), static_cast<UINT>(m_viewVk));
+		if (m_deleteVk > 0)
+			RegisterHotKey(hwnd, HOTKEY_DELETE, WinHotkeyMods(m_deleteMod),
+				       static_cast<UINT>(m_deleteVk));
+		m_hotkeysRegistered = true;
+		return;
+	}
+
+	if (!m_hasCurrent || m_current.actions.empty() || m_animPhase == AnimPhase::Exit)
 		return;
 
 	for (const ToastAction &action : m_current.actions) {
@@ -566,6 +612,11 @@ void OverlayToasts::RegisterActionHotkeys()
 		RegisterHotKey(hwnd, action.hotkeyId, WinHotkeyMods(action.mod), static_cast<UINT>(action.vk));
 	}
 	m_hotkeysRegistered = true;
+}
+
+void OverlayToasts::SyncActionHotkeys()
+{
+	RegisterActionHotkeys();
 }
 
 void OverlayToasts::RefreshCurrentActionHotkeys()
@@ -584,7 +635,7 @@ void OverlayToasts::RefreshCurrentActionHotkeys()
 	}
 	m_current.text = FormatWithPlaceholders(overlay::util::ModuleTextW("Toast.ReplaySaved"),
 						HotkeyName(m_viewVk, m_viewMod), HotkeyName(m_deleteVk, m_deleteMod));
-	RegisterActionHotkeys();
+	SyncActionHotkeys();
 	Render();
 }
 
@@ -603,6 +654,18 @@ void OverlayToasts::UnregisterActionHotkeys()
 
 void OverlayToasts::OnHotkey(int id)
 {
+	if (m_hotkeysAlways) {
+		if (id == HOTKEY_VIEW) {
+			HandleView();
+			return;
+		}
+		if (id == HOTKEY_DELETE) {
+			HandleDelete();
+			return;
+		}
+		return;
+	}
+
 	if (!m_hasCurrent || m_animPhase == AnimPhase::Exit)
 		return;
 
@@ -620,43 +683,80 @@ void OverlayToasts::OnHotkey(int id)
 	}
 }
 
+std::wstring OverlayToasts::ActionTargetPath() const
+{
+	if (m_hasCurrent && !m_current.filePath.empty() && m_animPhase != AnimPhase::Exit)
+		return m_current.filePath;
+	if (m_hotkeysAlways)
+		return m_lastActionPath;
+	return std::wstring();
+}
+
 void OverlayToasts::HandleView()
 {
-	if (!m_hasCurrent || m_current.filePath.empty())
+	const std::wstring path = ActionTargetPath();
+	if (path.empty())
 		return;
 
-	const std::wstring path = m_current.filePath;
 	if (m_viewFileHandler)
 		m_viewFileHandler(path.c_str(), m_viewFileUserData);
 	else
 		ShellExecuteW(NULL, L"open", path.c_str(), NULL, NULL, SW_SHOWDEFAULT);
-	DismissCurrent();
+	if (m_hasCurrent && m_animPhase != AnimPhase::Exit)
+		DismissCurrent();
 }
 
 void OverlayToasts::HandleDelete()
 {
-	if (!m_hasCurrent || m_current.filePath.empty())
+	const std::wstring path = ActionTargetPath();
+	if (path.empty())
 		return;
 
-	const std::wstring path = m_current.filePath;
 	const std::wstring name = path.substr(path.find_last_of(L"\\/") + 1);
 
+	const bool keepAlwaysHotkeys = m_hotkeysAlways;
 	UnregisterActionHotkeys();
 
 	const int ret = MessageBoxW(NULL, name.c_str(), overlay::util::ModuleTextW("DeleteFile").c_str(),
 				    MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
 	if (ret == IDYES) {
-		if (DeleteFileW(path.c_str())) {
-			obs_log(LOG_INFO, "Toasts: deleted replay file");
-		} else {
-			obs_log(LOG_WARNING, "Toasts: failed to delete replay file (%lu)", GetLastError());
+		if (m_releaseFileHandler)
+			m_releaseFileHandler(path.c_str(), m_deleteFileUserData);
+
+		bool deleted = false;
+		for (int attempt = 0; attempt < 20; ++attempt) {
+			if (DeleteFileW(path.c_str())) {
+				deleted = true;
+				break;
+			}
+			const DWORD err = GetLastError();
+			if (err != ERROR_SHARING_VIOLATION && err != ERROR_LOCK_VIOLATION) {
+				obs_log(LOG_WARNING, "Toasts: failed to delete replay file (%lu)", err);
+				break;
+			}
+			// Decoder close can take a moment to drop the Win32 share lock.
+			if (attempt == 0 && m_releaseFileHandler)
+				m_releaseFileHandler(path.c_str(), m_deleteFileUserData);
+			Sleep(50);
 		}
-		DismissCurrent();
+
+		if (deleted) {
+			obs_log(LOG_INFO, "Toasts: deleted replay file");
+			if (m_lastActionPath == path)
+				m_lastActionPath.clear();
+			if (m_fileDeletedHandler)
+				m_fileDeletedHandler(path.c_str(), m_deleteFileUserData);
+		} else {
+			obs_log(LOG_WARNING, "Toasts: delete still failed after retries (%lu)", GetLastError());
+		}
+		if (m_hasCurrent && m_animPhase != AnimPhase::Exit)
+			DismissCurrent();
+		else if (keepAlwaysHotkeys)
+			SyncActionHotkeys();
 		return;
 	}
 
-	if (m_hasCurrent && m_animPhase != AnimPhase::Exit)
-		RegisterActionHotkeys();
+	SyncActionHotkeys();
 }
 
 void OverlayToasts::CheckDiskSpace()

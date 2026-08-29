@@ -48,6 +48,10 @@ public:
 	void SetDeferredHandler(void (*handler)(void *userData), void *userData);
 	void PostDeferred();
 
+	// Runs fn(param) on this window's thread and waits (SendMessage). Safe to call
+	// from another thread when mutating UI/player state that the timer also touches.
+	void RunOnWindowThreadSync(void (*fn)(void *param), void *param);
+
 	// While active, a low-level keyboard hook routes key presses to the key handler
 	// regardless of window focus (used to capture a hotkey bind without focus mode),
 	// and swallows them so they do not leak to the focused application.

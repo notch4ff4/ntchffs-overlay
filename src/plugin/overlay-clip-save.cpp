@@ -25,6 +25,8 @@ https://github.com/JoshuaPotter/replay-buffer-pro/issues/30
 #include <string>
 #include <thread>
 
+#include "overlay-smart-replay.h"
+
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -113,19 +115,29 @@ bool overlay_clip_save_request(int seconds)
 	}
 
 	seconds = clamp_clip_seconds(seconds);
-	const int buffer_len = overlay_clip_save_get_buffer_length();
-	if (buffer_len > 0 && seconds > buffer_len) {
-		obs_log(LOG_WARNING, "[ClipSave] request rejected: %d s > buffer %d s", seconds, buffer_len);
-		return false;
+	const bool keep_last = overlay_smart_replay_clip_uses_keep_last();
+	if (keep_last) {
+		const int buffer_len = overlay_clip_save_get_buffer_length();
+		if (buffer_len > 0 && seconds > buffer_len) {
+			obs_log(LOG_WARNING, "[ClipSave] request rejected: %d s > buffer %d s", seconds, buffer_len);
+			return false;
+		}
+
+		int expected = 0;
+		if (!g_pending_clip_seconds.compare_exchange_strong(expected, seconds)) {
+			obs_log(LOG_INFO, "[ClipSave] request rejected: pending clip already set (%d s)", expected);
+			return false;
+		}
+		obs_log(LOG_INFO, "[ClipSave] saving clip keep-last %d s", seconds);
+	} else {
+		g_pending_clip_seconds.store(0);
+		obs_log(LOG_INFO,
+			"[ClipSave] saving via timestamp trim (requested %d s label ignored for length)",
+			seconds);
 	}
 
-	int expected = 0;
-	if (!g_pending_clip_seconds.compare_exchange_strong(expected, seconds)) {
-		obs_log(LOG_INFO, "[ClipSave] request rejected: pending clip already set (%d s)", expected);
-		return false;
-	}
-
-	obs_log(LOG_INFO, "[ClipSave] saving clip keep-last %d s", seconds);
+	// Advance Smart Replay timestamp-trim timeline so later full saves trim correctly.
+	overlay_smart_replay_note_save_request();
 	obs_frontend_replay_buffer_save();
 	return true;
 }

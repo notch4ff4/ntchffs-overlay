@@ -20,12 +20,15 @@ enum {
 	OVERLAY_CLIP_SAVE_MAX_SECONDS = 21600,
 };
 
-// Request a timed clip save (seconds > 0). Does not use Smart Replay request path.
+// Request a timed clip save (seconds > 0).
+// In timestamp-trim mode, keep-last vs since-last-timestamp is controlled by
+// overlay_smart_replay_set_clip_ignore_trim. Timestamp is always noted for the timeline.
 // Returns false if the request was rejected (inactive buffer, invalid duration, busy).
 bool overlay_clip_save_request(int seconds);
 
 // Called on OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVED.
-// Returns true when a pending timed clip was consumed (caller should skip Smart Replay).
+// Returns true when a pending timed clip was consumed (caller should acknowledge
+// Smart Replay without overlap trim, instead of running the full save-completed path).
 bool overlay_clip_save_on_replay_saved(const char *replay_path);
 
 int overlay_clip_save_get_buffer_length(void);

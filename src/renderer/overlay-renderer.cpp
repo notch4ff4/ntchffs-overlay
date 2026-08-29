@@ -40,7 +40,9 @@ OverlayRenderer *OverlayRenderer::s_timerInstance = nullptr;
 
 namespace {
 constexpr UINT_PTR kOpenWithTimerId = 42;
+constexpr UINT_PTR kClipHotkeyTimerId = 43;
 constexpr UINT kOpenWithDelayMs = 200;
+constexpr UINT kClipHotkeyPollMs = 33;
 } // namespace
 
 // Anchor symbol so GetModuleHandleEx can resolve this DLL for embedded icons.
@@ -133,6 +135,8 @@ OverlayRenderer::OverlayRenderer()
 	  m_position(OverlayPosition::Top),
 	  m_margin(20),
 	  m_orientation(OverlayOrientation::Horizontal),
+	  m_monitorMode(OverlayMonitorMode::Primary),
+	  m_monitorIndex(0),
 	  m_autoHideEnabled(false),
 	  m_autoHideSeconds(5),
 	  m_lastInteractionTick(0),
@@ -169,7 +173,8 @@ OverlayRenderer::OverlayRenderer()
 	  m_galleryContentWidth(0),
 	  m_galleryContentHeight(0),
 	  m_updateTimer(0),
-	  m_updateIntervalMs(500)
+	  m_updateIntervalMs(500),
+	  m_clipHotkeyTimer(0)
 {
 	ZeroMemory(&m_dragStart, sizeof(m_dragStart));
 	ZeroMemory(&m_galleryListRect, sizeof(m_galleryListRect));
@@ -223,6 +228,8 @@ OverlayRenderer::OverlayRenderer()
 	m_setPosition = 0;
 	m_setMargin = 20;
 	m_setOrientation = 0;
+	m_setMonitorMode = 0;
+	m_setMonitorIndex = 0;
 	m_setOpacityPct = 88;
 	m_setOverlayScale = 100;
 	m_setTextScale = 100;
@@ -243,6 +250,7 @@ OverlayRenderer::OverlayRenderer()
 	m_setRememberReplayBuffer = false;
 	m_setSmartReplay = true;
 	m_setSmartReplayMode = 0;
+	m_setSmartReplayClipIgnoreTrim = true;
 	m_setBufferLengthSec = 120;
 	static const int kDefaultClipSeconds[CLIP_SAVE_SLOT_COUNT] = {15, 30, 60};
 	for (int i = 0; i < CLIP_SAVE_SLOT_COUNT; i++) {
@@ -257,10 +265,13 @@ OverlayRenderer::OverlayRenderer()
 	m_setToastLowDisk = true;
 	m_setToastLowDiskGb = 5;
 	m_setToastDurationSec = 8;
+	m_setToastHotkeysScope = 0;
 	for (int i = 0; i < SETTINGS_HOTKEY_COUNT; i++) {
 		m_setHotkeyVk[i] = 0;
 		m_setHotkeyMod[i] = 0;
 	}
+	for (int i = 0; i < CLIP_SAVE_SLOT_COUNT; i++)
+		m_clipHotkeyWasDown[i] = false;
 }
 
 OverlayRenderer::~OverlayRenderer()
@@ -278,6 +289,12 @@ void CALLBACK OverlayRenderer::TimerProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD
 		if (s_timerInstance) {
 			s_timerInstance->RunPendingOpenWith();
 		}
+		return;
+	}
+
+	if (id == kClipHotkeyTimerId) {
+		if (s_timerInstance)
+			s_timerInstance->PollClipSaveHotkeys();
 		return;
 	}
 
@@ -332,6 +349,20 @@ bool OverlayRenderer::Initialize(HINSTANCE hInstance)
 		int64_t orientation = obs_data_get_int(saved_settings_data, "orientation");
 		if (orientation == 0 || orientation == 1) {
 			m_orientation = static_cast<OverlayOrientation>(static_cast<int>(orientation));
+		}
+
+		int64_t monitorMode = obs_data_get_int(saved_settings_data, "overlay_monitor_mode");
+		if (monitorMode >= 0 && monitorMode <= 2) {
+			m_monitorMode = static_cast<OverlayMonitorMode>(static_cast<int>(monitorMode));
+		}
+		int64_t monitorIndex = obs_data_get_int(saved_settings_data, "overlay_monitor_index");
+		if (monitorIndex < 0)
+			monitorIndex = 0;
+		{
+			const int monitorCount = std::max(1, m_layoutManager.GetMonitorCount());
+			if (monitorIndex >= monitorCount)
+				monitorIndex = monitorCount - 1;
+			m_monitorIndex = static_cast<int>(monitorIndex);
 		}
 
 		m_autoHideEnabled = obs_data_get_bool(saved_settings_data, "auto_hide_enabled");
@@ -405,7 +436,7 @@ bool OverlayRenderer::Initialize(HINSTANCE hInstance)
 		ApplyAccentBrushes();
 	}
 
-	// Clip-save hotkeys are Win32 RegisterHotKey bindings; load and apply after HWND exists.
+	// Clip-save hotkeys are polled (not RegisterHotKey) so bare keys stay usable in other apps.
 	if (saved_settings_data) {
 		for (int i = 0; i < CLIP_SAVE_SLOT_COUNT; i++) {
 			const std::string secKey = "clip_slot_" + std::to_string(i) + "_seconds";
@@ -498,11 +529,10 @@ bool OverlayRenderer::Initialize(HINSTANCE hInstance)
 void OverlayRenderer::Shutdown()
 {
 	HWND hwnd = m_windowManager.GetHWND();
-	if (hwnd) {
-		for (int i = 0; i < CLIP_SAVE_SLOT_COUNT; i++)
-			UnregisterHotKey(hwnd, 200 + i);
+	if (hwnd && m_clipHotkeyTimer) {
+		KillTimer(hwnd, m_clipHotkeyTimer);
+		m_clipHotkeyTimer = 0;
 	}
-	m_windowManager.SetHotkeyHandler(nullptr, nullptr);
 
 	if (m_updateTimer) {
 		KillTimer(m_windowManager.GetHWND(), m_updateTimer);
@@ -849,14 +879,39 @@ void OverlayRenderer::ApplyWindowGeometry()
 	m_layoutManager.CalculateLayout(m_position, m_margin, m_orientation, m_state.statsVisible,
 					m_overlayScalePercent, m_layout);
 
+	const RECT workArea = GetTargetWorkArea();
 	if (IsDimmingActive()) {
-		POINT normalPos = m_layoutManager.CalculateWindowPosition(m_position, m_margin, m_layout);
+		POINT normalPos = m_layoutManager.CalculateWindowPosition(m_position, m_margin, m_layout, workArea);
 		ApplyDimmingWindowGeometry(normalPos, m_layout.windowWidth, m_layout.windowHeight);
 	} else {
 		m_dimContentOffset = {0, 0};
-		POINT windowPos = m_layoutManager.CalculateWindowPosition(m_position, m_margin, m_layout);
+		POINT windowPos = m_layoutManager.CalculateWindowPosition(m_position, m_margin, m_layout, workArea);
 		m_windowManager.SetPosition(windowPos, m_layout.windowWidth, m_layout.windowHeight);
 	}
+}
+
+RECT OverlayRenderer::GetTargetWorkArea() const
+{
+	return GetTargetWorkArea(m_monitorMode, m_monitorIndex);
+}
+
+RECT OverlayRenderer::GetTargetWorkArea(OverlayMonitorMode mode, int monitorIndex) const
+{
+	return m_layoutManager.ResolveWorkArea(mode, monitorIndex);
+}
+
+std::wstring OverlayRenderer::FormatMonitorLabel(int monitorIndex) const
+{
+	RECT workArea = {};
+	RECT monitorBounds = {};
+	if (!m_layoutManager.GetMonitorInfoByIndex(monitorIndex, workArea, monitorBounds)) {
+		return overlay::util::ModuleTextW("Monitor.Unknown");
+	}
+
+	const int width = monitorBounds.right - monitorBounds.left;
+	const int height = monitorBounds.bottom - monitorBounds.top;
+	return overlay::util::ModuleTextW("Monitor.N") + L" " + std::to_wstring(monitorIndex + 1) + L" (" +
+	       std::to_wstring(width) + L"x" + std::to_wstring(height) + L")";
 }
 
 void OverlayRenderer::ApplyDimmingWindowGeometry(POINT contentScreenTopLeft, int contentWidth,
@@ -3070,11 +3125,127 @@ void OverlayRenderer::CloseGallery()
 	Render();
 }
 
+void OverlayRenderer::ReleaseGalleryFileIfOpen(const std::wstring &filePath)
+{
+	if (filePath.empty())
+		return;
+
+	auto fileNameOf = [](const std::wstring &p) -> std::wstring {
+		const size_t slash = p.find_last_of(L"\\/");
+		return (slash == std::wstring::npos) ? p : p.substr(slash + 1);
+	};
+	auto sameFile = [&](const std::wstring &a, const std::wstring &b) -> bool {
+		if (a.empty() || b.empty())
+			return false;
+		if (_wcsicmp(a.c_str(), b.c_str()) == 0)
+			return true;
+		wchar_t fullA[MAX_PATH];
+		wchar_t fullB[MAX_PATH];
+		const DWORD na = GetFullPathNameW(a.c_str(), MAX_PATH, fullA, nullptr);
+		const DWORD nb = GetFullPathNameW(b.c_str(), MAX_PATH, fullB, nullptr);
+		if (na > 0 && na < MAX_PATH && nb > 0 && nb < MAX_PATH && _wcsicmp(fullA, fullB) == 0)
+			return true;
+		return _wcsicmp(fileNameOf(a).c_str(), fileNameOf(b).c_str()) == 0;
+	};
+
+	const std::wstring &openPath = m_videoPlayer.GetOpenPath();
+	if (!openPath.empty() && sameFile(openPath, filePath)) {
+		obs_log(LOG_INFO, "Gallery: releasing open player file before external delete");
+		m_videoPlayer.Close();
+		return;
+	}
+
+	const GalleryItem *item = m_gallery.GetItem(m_gallerySelectedIndex);
+	if (item && item->type == GalleryItem::Type::Video && sameFile(item->path, filePath)) {
+		obs_log(LOG_INFO, "Gallery: releasing selected player file before external delete");
+		m_videoPlayer.Close();
+	}
+}
+
+void OverlayRenderer::ReleaseGalleryFileIfOpenSync(const std::wstring &filePath)
+{
+	struct Ctx {
+		OverlayRenderer *self;
+		const std::wstring *path;
+	} ctx{this, &filePath};
+	m_windowManager.RunOnWindowThreadSync(
+		[](void *param) {
+			Ctx *c = static_cast<Ctx *>(param);
+			c->self->ReleaseGalleryFileIfOpen(*c->path);
+		},
+		&ctx);
+}
+
+void OverlayRenderer::NotifyGalleryFileDeleted(const std::wstring &filePath)
+{
+	if (filePath.empty() || !m_galleryOpen)
+		return;
+
+	auto fileNameOf = [](const std::wstring &p) -> std::wstring {
+		const size_t slash = p.find_last_of(L"\\/");
+		return (slash == std::wstring::npos) ? p : p.substr(slash + 1);
+	};
+	auto sameFile = [&](const std::wstring &a, const std::wstring &b) -> bool {
+		if (a.empty() || b.empty())
+			return false;
+		if (_wcsicmp(a.c_str(), b.c_str()) == 0)
+			return true;
+		return _wcsicmp(fileNameOf(a).c_str(), fileNameOf(b).c_str()) == 0;
+	};
+
+	const GalleryItem *selected = m_gallery.GetItem(m_gallerySelectedIndex);
+	const bool wasSelected = selected && selected->type == GalleryItem::Type::Video &&
+				 sameFile(selected->path, filePath);
+
+	// Ensure decoder is not still holding the deleted path.
+	if (!m_videoPlayer.GetOpenPath().empty() && sameFile(m_videoPlayer.GetOpenPath(), filePath))
+		m_videoPlayer.Close();
+
+	m_gallery.ReloadCurrent();
+	const int count = static_cast<int>(m_gallery.GetItems().size());
+	if (count == 0) {
+		m_gallerySelectedIndex = -1;
+		m_videoPlayer.Close();
+	} else if (wasSelected) {
+		m_gallerySelectedIndex =
+			(m_gallerySelectedIndex >= count) ? count - 1 : m_gallerySelectedIndex;
+		const GalleryItem *nextItem = m_gallery.GetItem(m_gallerySelectedIndex);
+		if (nextItem && nextItem->type == GalleryItem::Type::Video) {
+			m_videoPlayer.Open(nextItem->path);
+			m_galleryTrimIn = 0.0;
+			m_galleryTrimOut = m_videoPlayer.GetDuration();
+			m_galleryTrimUserSet = false;
+		} else {
+			m_gallerySelectedIndex = -1;
+			m_videoPlayer.Close();
+		}
+	} else if (m_gallerySelectedIndex >= count) {
+		m_gallerySelectedIndex = count - 1;
+	}
+
+	if (IsVisible())
+		Render();
+}
+
+void OverlayRenderer::NotifyGalleryFileDeletedSync(const std::wstring &filePath)
+{
+	struct Ctx {
+		OverlayRenderer *self;
+		const std::wstring *path;
+	} ctx{this, &filePath};
+	m_windowManager.RunOnWindowThreadSync(
+		[](void *param) {
+			Ctx *c = static_cast<Ctx *>(param);
+			c->self->NotifyGalleryFileDeleted(*c->path);
+		},
+		&ctx);
+}
+
 void OverlayRenderer::ApplyGalleryWindowSize()
 {
 	if (!m_galleryOpen)
 		return;
-	RECT workArea = m_layoutManager.GetScreenWorkArea();
+	RECT workArea = GetTargetWorkArea();
 	int workWidth = workArea.right - workArea.left;
 	int workHeight = workArea.bottom - workArea.top;
 
@@ -3782,7 +3953,6 @@ static const int kToastViewHotkeyIndex = 7;
 static const int kToastDeleteHotkeyIndex = 8;
 static const int kClipHotkeyBaseIndex = 9;
 static const int kClipHotkeyCount = 3;
-static const int kClipHotkeyIdBase = 200;
 
 const int kDefaultClipSeconds[3] = {15, 30, 60};
 
@@ -3801,24 +3971,54 @@ std::wstring FormatClipDurationLabel(int seconds)
 	return std::to_wstring(m) + L"m " + std::to_wstring(s) + L"s";
 }
 
-UINT ClipWinHotkeyMods(int mod)
+// True when the foreground app is typing into a text field. Used so bare clip
+// hotkeys (e.g. 8/9/0) do not fire while the user is entering text.
+bool ForegroundHasTextCaret()
 {
-	UINT winMods = MOD_NOREPEAT;
-	if (mod & 1)
-		winMods |= MOD_SHIFT;
-	if (mod & 2)
-		winMods |= MOD_CONTROL;
-	if (mod & 4)
-		winMods |= MOD_ALT;
-	return winMods;
+	HWND fg = GetForegroundWindow();
+	if (!fg)
+		return false;
+	DWORD tid = GetWindowThreadProcessId(fg, nullptr);
+	if (!tid)
+		return false;
+	GUITHREADINFO gi = {};
+	gi.cbSize = sizeof(gi);
+	if (!GetGUIThreadInfo(tid, &gi))
+		return false;
+	return gi.hwndCaret != nullptr;
+}
+
+int CurrentModifierMask()
+{
+	int mods = 0;
+	if (GetAsyncKeyState(VK_SHIFT) & 0x8000)
+		mods |= 1;
+	if (GetAsyncKeyState(VK_CONTROL) & 0x8000)
+		mods |= 2;
+	if (GetAsyncKeyState(VK_MENU) & 0x8000)
+		mods |= 4;
+	return mods;
+}
+
+bool ClipHotkeyComboDown(int vk, int mod)
+{
+	if (vk <= 0)
+		return false;
+	if (!(GetAsyncKeyState(vk) & 0x8000))
+		return false;
+	return CurrentModifierMask() == mod;
 }
 
 const char *const kSettingsPositionKeys[9] = {
 	"Position.Top",        "Position.Bottom",     "Position.Left",
 	"Position.Right",      "Position.TopLeft",    "Position.TopRight",
 	"Position.BottomLeft", "Position.BottomRight", "Position.Center"};
+const char *const kSettingsMonitorModeKeys[3] = {
+	"Monitor.Primary", "Monitor.Specific", "Monitor.Cursor"};
 const char *const kSettingsOrientationKeys[2] = {"Orientation.Horizontal", "Orientation.Vertical"};
 const char *const kSettingsSmartReplayModeKeys[2] = {"SmartReplay.Mode.Legacy", "SmartReplay.Mode.TimestampTrim"};
+const char *const kSettingsToastHotkeysScopeKeys[2] = {"Hotkeys.ToastScope.WhileToast",
+						       "Hotkeys.ToastScope.Always"};
 
 const char *const kIndicatorSlotKeys[4] = {"recording", "replay", "saving", "saved"};
 const char *const kIndicatorSlotLabelKeys[4] = {"Indicators.Recording", "Indicators.Replay", "Indicators.Saving",
@@ -4128,6 +4328,11 @@ void OverlayRenderer::LoadSettingsWorkingValues()
 	m_setMargin = ClampInt(getIntDef("margin", 20), 0, 200);
 	int orient = getIntDef("orientation", 0);
 	m_setOrientation = (orient == 1) ? 1 : 0;
+	m_setMonitorMode = ClampInt(getIntDef("overlay_monitor_mode", 0), 0, 2);
+	{
+		const int monitorCount = std::max(1, m_layoutManager.GetMonitorCount());
+		m_setMonitorIndex = ClampInt(getIntDef("overlay_monitor_index", 0), 0, monitorCount - 1);
+	}
 	double alpha = (d && obs_data_has_user_value(d, "overlay_background_alpha"))
 			       ? obs_data_get_double(d, "overlay_background_alpha")
 			       : 0.88;
@@ -4162,6 +4367,7 @@ void OverlayRenderer::LoadSettingsWorkingValues()
 	m_setRememberReplayBuffer = getBoolDef("remember_replay_buffer", false);
 	m_setSmartReplay = getBoolDef("smart_replay", true);
 	m_setSmartReplayMode = ClampInt(getIntDef("smart_replay_mode", 0), 0, 1);
+	m_setSmartReplayClipIgnoreTrim = getBoolDef("smart_replay_clip_ignore_trim", true);
 	{
 		const int profileLen = overlay_clip_save_get_buffer_length();
 		m_setBufferLengthSec = ClampInt(profileLen > 0 ? profileLen : getIntDef("clip_buffer_length", 120),
@@ -4182,6 +4388,7 @@ void OverlayRenderer::LoadSettingsWorkingValues()
 	m_setToastLowDisk = getBoolDef("toast_low_disk", true);
 	m_setToastLowDiskGb = ClampInt(getIntDef("toast_low_disk_gb", 5), 1, 100);
 	m_setToastDurationSec = ClampInt(getIntDef("toast_duration_sec", 8), 2, 60);
+	m_setToastHotkeysScope = ClampInt(getIntDef("toast_hotkeys_scope", 0), 0, 1);
 	if (d && obs_data_has_user_value(d, "gallery_export_path"))
 		m_setExportPath = overlay::util::Utf8ToWide(obs_data_get_string(d, "gallery_export_path"));
 	else
@@ -4205,6 +4412,8 @@ void OverlayRenderer::PersistSettingsWorkingValues()
 	obs_data_set_int(d, "position", m_setPosition);
 	obs_data_set_int(d, "margin", m_setMargin);
 	obs_data_set_int(d, "orientation", m_setOrientation);
+	obs_data_set_int(d, "overlay_monitor_mode", m_setMonitorMode);
+	obs_data_set_int(d, "overlay_monitor_index", m_setMonitorIndex);
 	obs_data_set_double(d, "overlay_background_alpha", m_setOpacityPct / 100.0);
 	obs_data_set_int(d, "overlay_scale", m_setOverlayScale);
 	obs_data_set_int(d, "overlay_text_scale", m_setTextScale);
@@ -4230,6 +4439,7 @@ void OverlayRenderer::PersistSettingsWorkingValues()
 	obs_data_set_bool(d, "remember_replay_buffer", m_setRememberReplayBuffer);
 	obs_data_set_bool(d, "smart_replay", m_setSmartReplay);
 	obs_data_set_int(d, "smart_replay_mode", m_setSmartReplayMode);
+	obs_data_set_bool(d, "smart_replay_clip_ignore_trim", m_setSmartReplayClipIgnoreTrim);
 	obs_data_set_int(d, "clip_buffer_length", m_setBufferLengthSec);
 	for (int i = 0; i < CLIP_SAVE_SLOT_COUNT; i++) {
 		obs_data_set_int(d, ("clip_slot_" + std::to_string(i) + "_seconds").c_str(), m_setClipSeconds[i]);
@@ -4243,6 +4453,8 @@ void OverlayRenderer::PersistSettingsWorkingValues()
 	obs_data_set_bool(d, "toast_low_disk", m_setToastLowDisk);
 	obs_data_set_int(d, "toast_low_disk_gb", m_setToastLowDiskGb);
 	obs_data_set_int(d, "toast_duration_sec", m_setToastDurationSec);
+	obs_data_set_int(d, "toast_hotkeys_scope", m_setToastHotkeysScope);
+	obs_data_set_bool(d, "toast_hotkeys_always", m_setToastHotkeysScope == 1);
 	obs_data_set_string(d, "gallery_export_path", overlay::util::WideToUtf8(m_setExportPath).c_str());
 	for (int i = 0; i < SETTINGS_HOTKEY_COUNT; i++) {
 		obs_data_set_int(d, (std::string(kSettingsHotkeyKeys[i]) + "_vk").c_str(), m_setHotkeyVk[i]);
@@ -4254,6 +4466,11 @@ void OverlayRenderer::PersistSettingsWorkingValues()
 	ApplyClipSaveHotkeys();
 	ApplyToastAccentColor();
 	ApplyToastOptions();
+#ifdef ENABLE_QT
+	overlay_runtime_set_smart_replay(m_setSmartReplay);
+	overlay_runtime_set_smart_replay_mode(m_setSmartReplayMode);
+	overlay_runtime_set_smart_replay_clip_ignore_trim(m_setSmartReplayClipIgnoreTrim);
+#endif
 }
 
 void OverlayRenderer::ApplyIndicatorCustoms()
@@ -4291,32 +4508,45 @@ void OverlayRenderer::ApplyClipSaveHotkeys()
 	if (!hwnd)
 		return;
 
+	// Do not use RegisterHotKey: it steals bare keys (8/9/0, etc.) system-wide
+	// and blocks typing in browsers and other apps. Poll instead, like OBS hotkeys.
+	bool anyBound = false;
 	for (int i = 0; i < kClipHotkeyCount; i++) {
-		UnregisterHotKey(hwnd, kClipHotkeyIdBase + i);
+		const int vk = m_setHotkeyVk[kClipHotkeyBaseIndex + i];
+		const int mod = m_setHotkeyMod[kClipHotkeyBaseIndex + i];
+		m_clipHotkeyWasDown[i] = ClipHotkeyComboDown(vk, mod);
+		if (vk > 0)
+			anyBound = true;
 	}
 
-	m_windowManager.SetHotkeyHandler(
-		[](int id, void *userData) {
-			OverlayRenderer *r = static_cast<OverlayRenderer *>(userData);
-			if (!r || r->m_settingsOpen || r->m_galleryOpen)
-				return;
-			if (r->m_state.replaySaving || !r->m_state.replayActive)
-				return;
-			const int slot = id - kClipHotkeyIdBase;
-			if (slot < 0 || slot >= kClipHotkeyCount)
-				return;
-			r->m_stateManager.SaveReplayClip(r->m_setClipSeconds[slot]);
-			r->UpdateStatus();
-			r->Render();
-		},
-		this);
+	if (anyBound) {
+		s_timerInstance = this;
+		if (!m_clipHotkeyTimer)
+			m_clipHotkeyTimer = SetTimer(hwnd, kClipHotkeyTimerId, kClipHotkeyPollMs, TimerProc);
+	} else if (m_clipHotkeyTimer) {
+		KillTimer(hwnd, m_clipHotkeyTimer);
+		m_clipHotkeyTimer = 0;
+	}
+}
+
+void OverlayRenderer::PollClipSaveHotkeys()
+{
+	const bool suppress = m_settingsOpen || m_galleryOpen || m_settingsCapturingHotkeyIndex >= 0 ||
+			      !obs_frontend_replay_buffer_active() || OverlayStateManager::GetReplaySaving() ||
+			      ForegroundHasTextCaret();
 
 	for (int i = 0; i < kClipHotkeyCount; i++) {
 		const int vk = m_setHotkeyVk[kClipHotkeyBaseIndex + i];
 		const int mod = m_setHotkeyMod[kClipHotkeyBaseIndex + i];
-		if (vk <= 0)
-			continue;
-		RegisterHotKey(hwnd, kClipHotkeyIdBase + i, ClipWinHotkeyMods(mod), static_cast<UINT>(vk));
+		const bool down = ClipHotkeyComboDown(vk, mod);
+		if (!suppress && down && !m_clipHotkeyWasDown[i]) {
+			m_stateManager.SaveReplayClip(m_setClipSeconds[i]);
+			if (IsVisible()) {
+				UpdateStatus();
+				Render();
+			}
+		}
+		m_clipHotkeyWasDown[i] = down;
 	}
 }
 
@@ -4332,6 +4562,7 @@ void OverlayRenderer::ApplyToastOptions()
 #ifdef ENABLE_QT
 	overlay_runtime_set_toast_options(m_setToastsEnabled, m_setToastVideoSaved, m_setToastOpenHint,
 					  m_setToastLowDisk, m_setToastLowDiskGb, m_setToastDurationSec);
+	overlay_runtime_set_toast_hotkeys_always_active(m_setToastHotkeysScope == 1);
 #endif
 }
 
@@ -4404,6 +4635,12 @@ void OverlayRenderer::CloseSettings()
 	m_position = static_cast<OverlayPosition>(m_setPosition);
 	m_margin = m_setMargin;
 	m_orientation = static_cast<OverlayOrientation>(m_setOrientation);
+	m_monitorMode = static_cast<OverlayMonitorMode>(ClampInt(m_setMonitorMode, 0, 2));
+	{
+		const int monitorCount = std::max(1, m_layoutManager.GetMonitorCount());
+		m_monitorIndex = ClampInt(m_setMonitorIndex, 0, monitorCount - 1);
+		m_setMonitorIndex = m_monitorIndex;
+	}
 	m_overlayBackgroundAlpha = static_cast<float>(m_setOpacityPct) / 100.0f;
 	m_overlayScalePercent = ClampInt(m_setOverlayScale, 50, 300);
 	m_textScalePercent = ClampInt(m_setTextScale, 50, 300);
@@ -4425,7 +4662,8 @@ void OverlayRenderer::ApplySettingsWindowSize()
 {
 	if (!m_settingsOpen)
 		return;
-	RECT workArea = m_layoutManager.GetScreenWorkArea();
+	const OverlayMonitorMode mode = static_cast<OverlayMonitorMode>(ClampInt(m_setMonitorMode, 0, 2));
+	RECT workArea = GetTargetWorkArea(mode, m_setMonitorIndex);
 	int workWidth = workArea.right - workArea.left;
 	int workHeight = workArea.bottom - workArea.top;
 
@@ -4735,6 +4973,13 @@ void OverlayRenderer::RenderSettingsPanel()
 		checkboxRow(overlay::util::ModuleTextW("CaptureFocus"), m_setCaptureFocus, SettingsField::CaptureFocus);
 		break;
 	case SettingsPage::Appearance:
+		stepperRow(overlay::util::ModuleTextW("Monitor.Label"),
+			   overlay::util::ModuleTextW(kSettingsMonitorModeKeys[ClampInt(m_setMonitorMode, 0, 2)]),
+			   SettingsField::MonitorMode);
+		if (m_setMonitorMode == static_cast<int>(OverlayMonitorMode::Specific)) {
+			stepperRow(overlay::util::ModuleTextW("Monitor.Index"), FormatMonitorLabel(m_setMonitorIndex),
+				   SettingsField::MonitorIndex);
+		}
 		stepperRow(overlay::util::ModuleTextW("Position.Label"),
 			   overlay::util::ModuleTextW(kSettingsPositionKeys[m_setPosition]), SettingsField::Position);
 		stepperRow(overlay::util::ModuleTextW("Margin"), std::to_wstring(m_setMargin) + L" px",
@@ -4963,9 +5208,16 @@ void OverlayRenderer::RenderSettingsPanel()
 		checkboxRow(overlay::util::ModuleTextW("RememberReplayBuffer"), m_setRememberReplayBuffer,
 			    SettingsField::RememberReplayBuffer);
 		checkboxRow(overlay::util::ModuleTextW("SmartReplay"), m_setSmartReplay, SettingsField::SmartReplay);
-		stepperRow(overlay::util::ModuleTextW("SmartReplay.Mode"),
-			   overlay::util::ModuleTextW(kSettingsSmartReplayModeKeys[m_setSmartReplayMode]),
-			   SettingsField::SmartReplayMode);
+		if (m_setSmartReplay) {
+			stepperRow(overlay::util::ModuleTextW("SmartReplay.Mode"),
+				   overlay::util::ModuleTextW(kSettingsSmartReplayModeKeys[m_setSmartReplayMode]),
+				   SettingsField::SmartReplayMode);
+			if (m_setSmartReplayMode == 1) {
+				checkboxRow(overlay::util::ModuleTextW("SmartReplay.ClipIgnoreTrim"),
+					    m_setSmartReplayClipIgnoreTrim,
+					    SettingsField::SmartReplayClipIgnoreTrim);
+			}
+		}
 		break;
 	case SettingsPage::ClipSave: {
 		const bool bufferLocked = m_state.replayActive;
@@ -5020,6 +5272,9 @@ void OverlayRenderer::RenderSettingsPanel()
 			hotkeyRow(overlay::util::ModuleTextW(kSettingsHotkeyLabelKeys[i]), i);
 		}
 		sectionLabel(overlay::util::ModuleTextW("Hotkeys.Toasts"));
+		stepperRow(overlay::util::ModuleTextW("Hotkeys.ToastScope"),
+			   overlay::util::ModuleTextW(kSettingsToastHotkeysScopeKeys[m_setToastHotkeysScope]),
+			   SettingsField::ToastHotkeysScope);
 		hotkeyRow(overlay::util::ModuleTextW(kSettingsHotkeyLabelKeys[kToastViewHotkeyIndex]),
 			  kToastViewHotkeyIndex);
 		hotkeyRow(overlay::util::ModuleTextW(kSettingsHotkeyLabelKeys[kToastDeleteHotkeyIndex]),
@@ -5330,6 +5585,12 @@ void OverlayRenderer::HandleSettingsClick(int x, int y)
 			overlay_runtime_set_smart_replay(m_setSmartReplay);
 #endif
 			break;
+		case SettingsField::SmartReplayClipIgnoreTrim:
+			m_setSmartReplayClipIgnoreTrim = !m_setSmartReplayClipIgnoreTrim;
+#ifdef ENABLE_QT
+			overlay_runtime_set_smart_replay_clip_ignore_trim(m_setSmartReplayClipIgnoreTrim);
+#endif
+			break;
 		case SettingsField::ClipShow0:
 		case SettingsField::ClipShow1:
 		case SettingsField::ClipShow2: {
@@ -5384,6 +5645,18 @@ void OverlayRenderer::HandleSettingsClick(int x, int y)
 		case SettingsField::Orientation:
 			m_setOrientation = (m_setOrientation + dir + 2) % 2;
 			break;
+		case SettingsField::MonitorMode:
+			m_setMonitorMode = (m_setMonitorMode + dir + 3) % 3;
+			if (m_settingsOpen)
+				ApplySettingsWindowSize();
+			break;
+		case SettingsField::MonitorIndex: {
+			const int monitorCount = std::max(1, m_layoutManager.GetMonitorCount());
+			m_setMonitorIndex = (m_setMonitorIndex + dir + monitorCount) % monitorCount;
+			if (m_settingsOpen)
+				ApplySettingsWindowSize();
+			break;
+		}
 		case SettingsField::Opacity:
 			m_setOpacityPct = ClampInt(m_setOpacityPct + dir * 2, 50, 100);
 			break;
@@ -5422,6 +5695,10 @@ void OverlayRenderer::HandleSettingsClick(int x, int y)
 			break;
 		case SettingsField::ToastDurationSec:
 			m_setToastDurationSec = ClampInt(m_setToastDurationSec + dir, 2, 60);
+			ApplyToastOptions();
+			break;
+		case SettingsField::ToastHotkeysScope:
+			m_setToastHotkeysScope = (m_setToastHotkeysScope + dir + 2) % 2;
 			ApplyToastOptions();
 			break;
 		default:

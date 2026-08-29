@@ -65,6 +65,113 @@ RECT OverlayLayoutManager::GetMonitorBoundsForPoint(POINT screenPoint) const
 	return monitorBounds;
 }
 
+namespace {
+
+struct MonitorEnumContext {
+	int targetIndex;
+	int currentIndex;
+	RECT workArea;
+	RECT monitorBounds;
+	bool found;
+	int count;
+};
+
+BOOL CALLBACK OverlayMonitorEnumProc(HMONITOR monitor, HDC, LPRECT, LPARAM lParam)
+{
+	auto *ctx = reinterpret_cast<MonitorEnumContext *>(lParam);
+	if (!ctx)
+		return FALSE;
+
+	if (ctx->targetIndex < 0) {
+		ctx->count++;
+		return TRUE;
+	}
+
+	if (ctx->currentIndex == ctx->targetIndex) {
+		MONITORINFO info = {};
+		info.cbSize = sizeof(MONITORINFO);
+		if (GetMonitorInfo(monitor, &info)) {
+			ctx->workArea = info.rcWork;
+			ctx->monitorBounds = info.rcMonitor;
+			ctx->found = true;
+		}
+		return FALSE;
+	}
+
+	ctx->currentIndex++;
+	return TRUE;
+}
+
+} // namespace
+
+int OverlayLayoutManager::GetMonitorCount() const
+{
+	MonitorEnumContext ctx = {};
+	ctx.targetIndex = -1;
+	EnumDisplayMonitors(nullptr, nullptr, OverlayMonitorEnumProc, reinterpret_cast<LPARAM>(&ctx));
+	return ctx.count > 0 ? ctx.count : 1;
+}
+
+bool OverlayLayoutManager::GetMonitorInfoByIndex(int index, RECT &workArea, RECT &monitorBounds) const
+{
+	const int count = GetMonitorCount();
+	if (count <= 0)
+		return false;
+	if (index < 0)
+		index = 0;
+	if (index >= count)
+		index = count - 1;
+
+	MonitorEnumContext ctx = {};
+	ctx.targetIndex = index;
+	EnumDisplayMonitors(nullptr, nullptr, OverlayMonitorEnumProc, reinterpret_cast<LPARAM>(&ctx));
+	if (!ctx.found)
+		return false;
+
+	workArea = ctx.workArea;
+	monitorBounds = ctx.monitorBounds;
+	return true;
+}
+
+RECT OverlayLayoutManager::GetMonitorWorkAreaByIndex(int index) const
+{
+	RECT workArea = GetScreenWorkArea();
+	RECT monitorBounds = {};
+	if (GetMonitorInfoByIndex(index, workArea, monitorBounds))
+		return workArea;
+	return GetScreenWorkArea();
+}
+
+RECT OverlayLayoutManager::GetMonitorWorkAreaAtCursor() const
+{
+	POINT cursor = {};
+	if (!GetCursorPos(&cursor))
+		return GetScreenWorkArea();
+
+	HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+	if (!monitor)
+		return GetScreenWorkArea();
+
+	MONITORINFO info = {};
+	info.cbSize = sizeof(MONITORINFO);
+	if (!GetMonitorInfo(monitor, &info))
+		return GetScreenWorkArea();
+	return info.rcWork;
+}
+
+RECT OverlayLayoutManager::ResolveWorkArea(OverlayMonitorMode mode, int specificIndex) const
+{
+	switch (mode) {
+	case OverlayMonitorMode::Specific:
+		return GetMonitorWorkAreaByIndex(specificIndex);
+	case OverlayMonitorMode::Cursor:
+		return GetMonitorWorkAreaAtCursor();
+	case OverlayMonitorMode::Primary:
+	default:
+		return GetScreenWorkArea();
+	}
+}
+
 void OverlayLayoutManager::CalculateBaseSize(OverlayOrientation orientation, int &width, int &height) {
 	if (orientation == OverlayOrientation::Horizontal) {
 		width = BASE_WIDTH_HORIZONTAL;
@@ -342,53 +449,59 @@ void OverlayLayoutManager::CalculateLayout(OverlayPosition position, int margin,
 
 POINT OverlayLayoutManager::CalculateWindowPosition(OverlayPosition position, int margin,
                                                     const OverlayLayout &layout) {
-	RECT workArea = GetScreenWorkArea();
+	return CalculateWindowPosition(position, margin, layout, GetScreenWorkArea());
+}
+
+POINT OverlayLayoutManager::CalculateWindowPosition(OverlayPosition position, int margin,
+                                                    const OverlayLayout &layout, const RECT &workArea) {
 	POINT windowPos = {0, 0};
 
 	int mainOverlayX = 0, mainOverlayY = 0;
+	const int workWidth = workArea.right - workArea.left;
+	const int workHeight = workArea.bottom - workArea.top;
 
 	switch (position) {
 	case OverlayPosition::Top:
-		mainOverlayX = (workArea.right - workArea.left - layout.baseWidth) / 2;
+		mainOverlayX = (workWidth - layout.baseWidth) / 2;
 		mainOverlayY = margin;
 		break;
 	case OverlayPosition::Bottom:
-		mainOverlayX = (workArea.right - workArea.left - layout.baseWidth) / 2;
-		mainOverlayY = (workArea.bottom - workArea.top) - layout.baseHeight - margin;
+		mainOverlayX = (workWidth - layout.baseWidth) / 2;
+		mainOverlayY = workHeight - layout.baseHeight - margin;
 		break;
 	case OverlayPosition::Left:
 		mainOverlayX = margin;
-		mainOverlayY = (workArea.bottom - workArea.top - layout.baseHeight) / 2;
+		mainOverlayY = (workHeight - layout.baseHeight) / 2;
 		break;
 	case OverlayPosition::Right:
-		mainOverlayX = (workArea.right - workArea.left) - layout.baseWidth - margin;
-		mainOverlayY = (workArea.bottom - workArea.top - layout.baseHeight) / 2;
+		mainOverlayX = workWidth - layout.baseWidth - margin;
+		mainOverlayY = (workHeight - layout.baseHeight) / 2;
 		break;
 	case OverlayPosition::TopLeft:
 		mainOverlayX = margin;
 		mainOverlayY = margin;
 		break;
 	case OverlayPosition::TopRight:
-		mainOverlayX = (workArea.right - workArea.left) - layout.baseWidth - margin;
+		mainOverlayX = workWidth - layout.baseWidth - margin;
 		mainOverlayY = margin;
 		break;
 	case OverlayPosition::BottomLeft:
 		mainOverlayX = margin;
-		mainOverlayY = (workArea.bottom - workArea.top) - layout.baseHeight - margin;
+		mainOverlayY = workHeight - layout.baseHeight - margin;
 		break;
 	case OverlayPosition::BottomRight:
-		mainOverlayX = (workArea.right - workArea.left) - layout.baseWidth - margin;
-		mainOverlayY = (workArea.bottom - workArea.top) - layout.baseHeight - margin;
+		mainOverlayX = workWidth - layout.baseWidth - margin;
+		mainOverlayY = workHeight - layout.baseHeight - margin;
 		break;
 	case OverlayPosition::Center:
-		mainOverlayX = (workArea.right - workArea.left - layout.baseWidth) / 2;
-		mainOverlayY = (workArea.bottom - workArea.top - layout.baseHeight) / 2;
+		mainOverlayX = (workWidth - layout.baseWidth) / 2;
+		mainOverlayY = (workHeight - layout.baseHeight) / 2;
 		break;
 	}
 
 	// Window origin is main-overlay position minus the adaptive container offset.
-	windowPos.x = mainOverlayX - layout.offsetX;
-	windowPos.y = mainOverlayY - layout.offsetY;
+	windowPos.x = workArea.left + mainOverlayX - layout.offsetX;
+	windowPos.y = workArea.top + mainOverlayY - layout.offsetY;
 
 	return windowPos;
 }

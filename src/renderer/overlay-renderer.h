@@ -52,6 +52,12 @@ public:
 	// Opens the in-overlay settings panel (replaces the old Qt dialog).
 	void OpenSettings();
 	void OpenGalleryFile(const std::wstring &filePath);
+	// Release decoder lock if this path is open in the gallery player.
+	void ReleaseGalleryFileIfOpen(const std::wstring &filePath);
+	void ReleaseGalleryFileIfOpenSync(const std::wstring &filePath);
+	// Refresh gallery list/selection after an external delete of this path.
+	void NotifyGalleryFileDeleted(const std::wstring &filePath);
+	void NotifyGalleryFileDeletedSync(const std::wstring &filePath);
 
 	void HandleClick(int x, int y);
 	void HandleRightClick(int x, int y);
@@ -181,6 +187,8 @@ private:
 	OverlayPosition m_position;
 	int m_margin;
 	OverlayOrientation m_orientation;
+	OverlayMonitorMode m_monitorMode;
+	int m_monitorIndex;
 	bool m_autoHideEnabled;
 	int m_autoHideSeconds;
 	ULONGLONG m_lastInteractionTick;
@@ -297,6 +305,7 @@ private:
 		RememberReplayBuffer,
 		SmartReplay,
 		SmartReplayMode,
+		SmartReplayClipIgnoreTrim,
 		GalleryInOverlay,
 		CaptureFocus,
 		ToastsEnabled,
@@ -310,6 +319,8 @@ private:
 		Position,
 		Margin,
 		Orientation,
+		MonitorMode,
+		MonitorIndex,
 		Opacity,
 		OverlayScale,
 		TextScale,
@@ -321,7 +332,8 @@ private:
 		ClipBufferLength,
 		ClipDuration0,
 		ClipDuration1,
-		ClipDuration2
+		ClipDuration2,
+		ToastHotkeysScope
 	};
 	static const int INDICATOR_CUSTOM_SLOT_COUNT = 4;
 	static const int INDICATOR_SOUND_EVENT_COUNT = 5;
@@ -354,6 +366,8 @@ private:
 	int m_setPosition;
 	int m_setMargin;
 	int m_setOrientation;
+	int m_setMonitorMode;
+	int m_setMonitorIndex;
 	int m_setOpacityPct;
 	int m_setOverlayScale;
 	int m_setTextScale;
@@ -376,6 +390,7 @@ private:
 	bool m_setRememberReplayBuffer;
 	bool m_setSmartReplay;
 	int m_setSmartReplayMode;
+	bool m_setSmartReplayClipIgnoreTrim;
 	bool m_setGalleryInOverlay;
 	bool m_setCaptureFocus;
 	bool m_setToastsEnabled;
@@ -384,6 +399,7 @@ private:
 	bool m_setToastLowDisk;
 	int m_setToastLowDiskGb;
 	int m_setToastDurationSec;
+	int m_setToastHotkeysScope; // 0 = while toast, 1 = always
 	int m_setBufferLengthSec;
 	int m_setClipSeconds[CLIP_SAVE_SLOT_COUNT];
 	bool m_setClipShow[CLIP_SAVE_SLOT_COUNT];
@@ -396,6 +412,7 @@ private:
 	void ApplyIndicatorSounds();
 	void ApplyToastActionHotkeys();
 	void ApplyClipSaveHotkeys();
+	void PollClipSaveHotkeys();
 	void ApplyToastAccentColor();
 	void ApplyToastOptions();
 
@@ -459,10 +476,16 @@ private:
 	// --- Timer ---
 	UINT_PTR m_updateTimer;
 	int m_updateIntervalMs;
+	// Separate from m_updateTimer so clip hotkeys work while the overlay is hidden.
+	UINT_PTR m_clipHotkeyTimer;
+	bool m_clipHotkeyWasDown[CLIP_SAVE_SLOT_COUNT];
 
 	void UpdateAutoHide();
 	void SetUpdateInterval(int intervalMs);
 	void ApplyWindowGeometry();
+	RECT GetTargetWorkArea() const;
+	RECT GetTargetWorkArea(OverlayMonitorMode mode, int monitorIndex) const;
+	std::wstring FormatMonitorLabel(int monitorIndex) const;
 	bool IsDimmingActive() const;
 	void ApplyDimmingWindowGeometry(POINT contentScreenTopLeft, int contentWidth, int contentHeight);
 	POINT ClientToLayoutPoint(int x, int y) const;

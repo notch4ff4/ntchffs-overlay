@@ -21,6 +21,12 @@ enum class OverlayOrientation {
 	Vertical = 1
 };
 
+enum class OverlayMonitorMode {
+	Primary = 0,
+	Specific = 1,
+	Cursor = 2
+};
+
 struct OverlayLayout {
 	// --- Core dimensions ---
 	int baseWidth;
@@ -71,10 +77,17 @@ public:
 	
 	POINT CalculateWindowPosition(OverlayPosition position, int margin,
 	                              const OverlayLayout &layout);
-	
+	POINT CalculateWindowPosition(OverlayPosition position, int margin,
+	                              const OverlayLayout &layout, const RECT &workArea);
+
 	RECT GetScreenWorkArea() const;
 	RECT GetMonitorBoundsForPoint(POINT screenPoint) const;
-	
+	RECT GetMonitorWorkAreaByIndex(int index) const;
+	RECT GetMonitorWorkAreaAtCursor() const;
+	RECT ResolveWorkArea(OverlayMonitorMode mode, int specificIndex) const;
+	int GetMonitorCount() const;
+	bool GetMonitorInfoByIndex(int index, RECT &workArea, RECT &monitorBounds) const;
+
 private:
 	void CalculateBaseSize(OverlayOrientation orientation, int &width, int &height);
 	void CalculateSettingsSize(int &width, int &height);

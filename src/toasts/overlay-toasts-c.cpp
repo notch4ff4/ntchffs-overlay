@@ -109,6 +109,14 @@ void overlay_toasts_set_action_hotkeys(void *toasts, int viewVk, int viewMod, in
 	renderer->SetActionHotkeys(viewVk, viewMod, deleteVk, deleteMod);
 }
 
+void overlay_toasts_set_hotkeys_always_active(void *toasts, bool always)
+{
+	if (!toasts)
+		return;
+	OverlayToasts *renderer = static_cast<OverlayToasts *>(toasts);
+	renderer->SetHotkeysAlwaysActive(always);
+}
+
 void overlay_toasts_set_accent_color(void *toasts, int colorRgb)
 {
 	if (!toasts)
@@ -157,6 +165,42 @@ void overlay_toasts_set_view_handler(void *toasts, void (*handler)(const char *p
 				return;
 			std::string utf8 = overlay::util::WideToUtf8(path);
 			b->handler(utf8.c_str(), b->userData);
+		},
+		&g_bridge);
+}
+
+void overlay_toasts_set_delete_handlers(void *toasts,
+					void (*releaseHandler)(const char *pathUtf8, void *userData),
+					void (*deletedHandler)(const char *pathUtf8, void *userData), void *userData)
+{
+	if (!toasts)
+		return;
+	OverlayToasts *renderer = static_cast<OverlayToasts *>(toasts);
+
+	struct Bridge {
+		void (*releaseHandler)(const char *, void *);
+		void (*deletedHandler)(const char *, void *);
+		void *userData;
+	};
+	static Bridge g_bridge = {};
+	g_bridge.releaseHandler = releaseHandler;
+	g_bridge.deletedHandler = deletedHandler;
+	g_bridge.userData = userData;
+
+	renderer->SetDeleteFileHandlers(
+		[](const wchar_t *path, void *ud) {
+			Bridge *b = static_cast<Bridge *>(ud);
+			if (!b || !b->releaseHandler || !path)
+				return;
+			std::string utf8 = overlay::util::WideToUtf8(path);
+			b->releaseHandler(utf8.c_str(), b->userData);
+		},
+		[](const wchar_t *path, void *ud) {
+			Bridge *b = static_cast<Bridge *>(ud);
+			if (!b || !b->deletedHandler || !path)
+				return;
+			std::string utf8 = overlay::util::WideToUtf8(path);
+			b->deletedHandler(utf8.c_str(), b->userData);
 		},
 		&g_bridge);
 }
