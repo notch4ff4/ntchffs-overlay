@@ -132,7 +132,7 @@ OverlayRenderer::OverlayRenderer()
 	  m_statsTitleFormat(nullptr),
 	  m_statsValueFormat(nullptr),
 	  m_iconPlayGeometry(nullptr),
-	  m_position(OverlayPosition::Top),
+	  m_position(OverlayPosition::Center),
 	  m_margin(20),
 	  m_orientation(OverlayOrientation::Horizontal),
 	  m_monitorMode(OverlayMonitorMode::Primary),
@@ -141,7 +141,7 @@ OverlayRenderer::OverlayRenderer()
 	  m_autoHideSeconds(5),
 	  m_lastInteractionTick(0),
 	  m_hoverTarget(HoverTarget::None),
-	  m_galleryEnabled(false),
+	  m_galleryEnabled(true),
 	  m_galleryOpen(false),
 	  m_galleryPage(0),
 	  m_gallerySelectedIndex(-1),
@@ -225,7 +225,7 @@ OverlayRenderer::OverlayRenderer()
 	m_settingsEditingIntField = -1;
 	m_settingsEditText.clear();
 	m_settingsHoverIndex = -1;
-	m_setPosition = 0;
+	m_setPosition = 8;
 	m_setMargin = 20;
 	m_setOrientation = 0;
 	m_setMonitorMode = 0;
@@ -249,7 +249,7 @@ OverlayRenderer::OverlayRenderer()
 	}
 	m_setRememberReplayBuffer = false;
 	m_setSmartReplay = true;
-	m_setSmartReplayMode = 0;
+	m_setSmartReplayMode = 1;
 	m_setSmartReplayClipIgnoreTrim = true;
 	m_setBufferLengthSec = 120;
 	static const int kDefaultClipSeconds[CLIP_SAVE_SLOT_COUNT] = {15, 30, 60};
@@ -257,7 +257,7 @@ OverlayRenderer::OverlayRenderer()
 		m_setClipSeconds[i] = kDefaultClipSeconds[i];
 		m_setClipShow[i] = true;
 	}
-	m_setGalleryInOverlay = false;
+	m_setGalleryInOverlay = true;
 	m_setCaptureFocus = true;
 	m_setToastsEnabled = true;
 	m_setToastVideoSaved = true;
@@ -334,9 +334,11 @@ bool OverlayRenderer::Initialize(HINSTANCE hInstance)
 	}
 
 	if (saved_settings_data) {
-		int64_t position = obs_data_get_int(saved_settings_data, "position");
-		if (position >= 0 && position <= 8) {
-			m_position = static_cast<OverlayPosition>(static_cast<int>(position));
+		if (obs_data_has_user_value(saved_settings_data, "position")) {
+			int64_t position = obs_data_get_int(saved_settings_data, "position");
+			if (position >= 0 && position <= 8) {
+				m_position = static_cast<OverlayPosition>(static_cast<int>(position));
+			}
 		}
 
 		int64_t margin = obs_data_get_int(saved_settings_data, "margin");
@@ -4324,7 +4326,7 @@ void OverlayRenderer::LoadSettingsWorkingValues()
 		return (d && obs_data_has_user_value(d, k)) ? obs_data_get_bool(d, k) : def;
 	};
 
-	m_setPosition = ClampInt(getIntDef("position", 0), 0, 8);
+	m_setPosition = ClampInt(getIntDef("position", 8), 0, 8);
 	m_setMargin = ClampInt(getIntDef("margin", 20), 0, 200);
 	int orient = getIntDef("orientation", 0);
 	m_setOrientation = (orient == 1) ? 1 : 0;
@@ -4366,7 +4368,7 @@ void OverlayRenderer::LoadSettingsWorkingValues()
 	}
 	m_setRememberReplayBuffer = getBoolDef("remember_replay_buffer", false);
 	m_setSmartReplay = getBoolDef("smart_replay", true);
-	m_setSmartReplayMode = ClampInt(getIntDef("smart_replay_mode", 0), 0, 1);
+	m_setSmartReplayMode = ClampInt(getIntDef("smart_replay_mode", 1), 0, 1);
 	m_setSmartReplayClipIgnoreTrim = getBoolDef("smart_replay_clip_ignore_trim", true);
 	{
 		const int profileLen = overlay_clip_save_get_buffer_length();
@@ -4380,7 +4382,7 @@ void OverlayRenderer::LoadSettingsWorkingValues()
 					       OVERLAY_CLIP_SAVE_MIN_SECONDS, OVERLAY_CLIP_SAVE_MAX_SECONDS);
 		m_setClipShow[i] = getBoolDef(showKey.c_str(), true);
 	}
-	m_setGalleryInOverlay = getBoolDef("gallery_in_overlay", false);
+	m_setGalleryInOverlay = getBoolDef("gallery_in_overlay", true);
 	m_setCaptureFocus = getBoolDef("capture_focus", true);
 	m_setToastsEnabled = getBoolDef("toasts_enabled", true);
 	m_setToastVideoSaved = getBoolDef("toast_video_saved", true);

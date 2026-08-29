@@ -43,7 +43,7 @@ the Free Software Foundation; either version 2 of the License, or
 #ifdef ENABLE_QT
 
 static bool g_smart_replay_enabled = true;
-static int g_smart_replay_mode = OVERLAY_SMART_REPLAY_LEGACY;
+static int g_smart_replay_mode = OVERLAY_SMART_REPLAY_TIMESTAMP_TRIM;
 static bool g_clip_ignore_trim = true;
 static bool g_replay_restart_pending = false;
 static int g_replay_restart_attempts = 0;

@@ -729,7 +729,7 @@ bool obs_module_load(void)
 		? true
 		: obs_data_get_bool(saved_settings_data, "smart_replay"));
 
-	int smartReplayMode = OVERLAY_SMART_REPLAY_LEGACY;
+	int smartReplayMode = OVERLAY_SMART_REPLAY_TIMESTAMP_TRIM;
 	if (saved_settings_data && obs_data_has_user_value(saved_settings_data, "smart_replay_mode")) {
 		smartReplayMode = static_cast<int>(obs_data_get_int(saved_settings_data, "smart_replay_mode"));
 	}
