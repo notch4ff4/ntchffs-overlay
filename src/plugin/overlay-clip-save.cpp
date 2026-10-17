@@ -104,8 +104,18 @@ bool overlay_clip_save_set_buffer_length(int seconds)
 
 bool overlay_clip_save_request(int seconds)
 {
+	const int requested = seconds;
+	const int buffer_len = overlay_clip_save_get_buffer_length();
+	const bool keep_last = overlay_smart_replay_clip_uses_keep_last();
+	const int pending_before = g_pending_clip_seconds.load();
+
+	obs_log(LOG_INFO,
+		"[ClipSave] request begin requested=%d s clamped_later keep_last_mode=%s buffer_len=%d pending_before=%d replay_active=%s",
+		requested, keep_last ? "yes" : "no", buffer_len, pending_before,
+		obs_frontend_replay_buffer_active() ? "yes" : "no");
+
 	if (seconds <= 0) {
-		obs_log(LOG_WARNING, "[ClipSave] request rejected: non-positive duration");
+		obs_log(LOG_WARNING, "[ClipSave] request rejected: non-positive duration (%d)", requested);
 		return false;
 	}
 
@@ -115,9 +125,11 @@ bool overlay_clip_save_request(int seconds)
 	}
 
 	seconds = clamp_clip_seconds(seconds);
-	const bool keep_last = overlay_smart_replay_clip_uses_keep_last();
+	if (seconds != requested) {
+		obs_log(LOG_INFO, "[ClipSave] duration clamped %d -> %d s", requested, seconds);
+	}
+
 	if (keep_last) {
-		const int buffer_len = overlay_clip_save_get_buffer_length();
 		if (buffer_len > 0 && seconds > buffer_len) {
 			obs_log(LOG_WARNING, "[ClipSave] request rejected: %d s > buffer %d s", seconds, buffer_len);
 			return false;
@@ -125,61 +137,155 @@ bool overlay_clip_save_request(int seconds)
 
 		int expected = 0;
 		if (!g_pending_clip_seconds.compare_exchange_strong(expected, seconds)) {
-			obs_log(LOG_INFO, "[ClipSave] request rejected: pending clip already set (%d s)", expected);
+			obs_log(LOG_WARNING, "[ClipSave] request rejected: pending clip already set (%d s)", expected);
 			return false;
 		}
-		obs_log(LOG_INFO, "[ClipSave] saving clip keep-last %d s", seconds);
+		obs_log(LOG_INFO,
+			"[ClipSave] pending keep-last set to %d s; calling obs_frontend_replay_buffer_save()",
+			seconds);
 	} else {
 		g_pending_clip_seconds.store(0);
-		obs_log(LOG_INFO,
-			"[ClipSave] saving via timestamp trim (requested %d s label ignored for length)",
+		obs_log(LOG_WARNING,
+			"[ClipSave] keep_last_mode=no: preset duration %d s will NOT trim to that length; using Smart Replay timestamp-trim path instead",
 			seconds);
 	}
 
 	// Advance Smart Replay timestamp-trim timeline so later full saves trim correctly.
-	overlay_smart_replay_note_save_request();
+	const bool noted = overlay_smart_replay_note_save_request();
+	obs_log(LOG_INFO, "[ClipSave] smart_replay_note_save_request=%s", noted ? "ok" : "failed/skipped");
 	obs_frontend_replay_buffer_save();
 	return true;
 }
 
 #ifdef _WIN32
+static uint64_t get_file_size_bytes(const std::wstring &path)
+{
+	WIN32_FILE_ATTRIBUTE_DATA attrs = {};
+	if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attrs))
+		return 0;
+	ULARGE_INTEGER size;
+	size.LowPart = attrs.nFileSizeLow;
+	size.HighPart = attrs.nFileSizeHigh;
+	return size.QuadPart;
+}
+
+static void log_clip_probe(const char *label, const std::wstring &path)
+{
+	double start_sec = 0.0;
+	double end_sec = 0.0;
+	int ref_stream = -1;
+	int video_packets = 0;
+	double container_duration_sec = -1.0;
+	std::wstring err;
+	const std::string path_utf8 = overlay::util::WideToUtf8(path);
+	if (!overlay_replay_probe_playback_range(path, start_sec, end_sec, err, &ref_stream, &video_packets,
+						 &container_duration_sec)) {
+		obs_log(LOG_WARNING, "[ClipSave] %s probe failed path=%s size=%llu error=%s", label,
+			path_utf8.c_str(), static_cast<unsigned long long>(get_file_size_bytes(path)),
+			overlay::util::WideToUtf8(err.empty() ? L"unknown" : err).c_str());
+		return;
+	}
+
+	obs_log(LOG_INFO,
+		"[ClipSave] %s path=%s size=%llu bytes container_duration=%.3f playback=[%.3f..%.3f] span=%.3f s ref_stream=%d video_packets=%d",
+		label, path_utf8.c_str(), static_cast<unsigned long long>(get_file_size_bytes(path)),
+		container_duration_sec, start_sec, end_sec, std::max(0.0, end_sec - start_sec), ref_stream,
+		video_packets);
+}
+
 static bool replace_file_with_trimmed(const std::wstring &originalPath, const std::wstring &trimmedPath)
 {
+	const std::string original_utf8 = overlay::util::WideToUtf8(originalPath);
+	const std::string trimmed_utf8 = overlay::util::WideToUtf8(trimmedPath);
+	const uint64_t original_size = get_file_size_bytes(originalPath);
+	const uint64_t trimmed_size = get_file_size_bytes(trimmedPath);
+
+	obs_log(LOG_INFO,
+		"[ClipSave] replace begin original=%s (%llu bytes) trimmed=%s (%llu bytes)",
+		original_utf8.c_str(), static_cast<unsigned long long>(original_size), trimmed_utf8.c_str(),
+		static_cast<unsigned long long>(trimmed_size));
+
+	if (trimmed_size == 0) {
+		obs_log(LOG_ERROR,
+			"[ClipSave] replace aborted: trimmed file missing or empty path=%s",
+			trimmed_utf8.c_str());
+		return false;
+	}
+
 	if (!DeleteFileW(originalPath.c_str())) {
-		obs_log(LOG_ERROR, "[ClipSave] failed to delete original file");
+		const DWORD err = GetLastError();
+		obs_log(LOG_ERROR, "[ClipSave] failed to delete original file path=%s winerr=%lu",
+			original_utf8.c_str(), static_cast<unsigned long>(err));
 		return false;
 	}
 	if (!MoveFileW(trimmedPath.c_str(), originalPath.c_str())) {
-		obs_log(LOG_ERROR, "[ClipSave] failed to move trimmed file into place");
+		const DWORD err = GetLastError();
+		obs_log(LOG_ERROR, "[ClipSave] failed to move trimmed file into place from=%s to=%s winerr=%lu",
+			trimmed_utf8.c_str(), original_utf8.c_str(), static_cast<unsigned long>(err));
 		return false;
 	}
+
+	obs_log(LOG_INFO, "[ClipSave] replace done path=%s final_size=%llu bytes", original_utf8.c_str(),
+		static_cast<unsigned long long>(get_file_size_bytes(originalPath)));
 	return true;
 }
 
 static void trim_clip_keep_last_async(const std::wstring &inputPath, double keepSeconds)
 {
+	obs_log(LOG_INFO, "[ClipSave] trim worker thread spawning keep=%.3f s path=%s", keepSeconds,
+		overlay::util::WideToUtf8(inputPath).c_str());
+
 	std::thread([inputPath, keepSeconds]() {
+		const std::string input_utf8 = overlay::util::WideToUtf8(inputPath);
+		obs_log(LOG_INFO, "[ClipSave] trim worker entered path=%s keep=%.3f s (waiting for trim mutex)",
+			input_utf8.c_str(), keepSeconds);
+
 		std::lock_guard<std::mutex> lock(g_clip_trim_mutex);
 
-		const std::string input_utf8 = overlay::util::WideToUtf8(inputPath);
-		obs_log(LOG_INFO, "[ClipSave] trim worker start path=%s keep=%.3f s", input_utf8.c_str(),
-			keepSeconds);
+		const uint64_t trim_start_ns = os_gettime_ns();
+		const uint64_t size_bytes = get_file_size_bytes(inputPath);
+		obs_log(LOG_INFO, "[ClipSave] trim worker start path=%s keep=%.3f s size=%llu bytes",
+			input_utf8.c_str(), keepSeconds, static_cast<unsigned long long>(size_bytes));
 
 		double playback_start_sec = 0.0;
 		double playback_end_sec = 0.0;
+		int ref_stream = -1;
+		int video_packets = 0;
+		double container_duration_sec = -1.0;
 		std::wstring probe_err;
-		if (!overlay_replay_probe_playback_range(inputPath, playback_start_sec, playback_end_sec, probe_err)) {
+
+		obs_log(LOG_INFO,
+			"[ClipSave] pre-trim probe begin path=%s (full packet scan; large files can take a while)",
+			input_utf8.c_str());
+		const uint64_t probe_start_ns = os_gettime_ns();
+		if (!overlay_replay_probe_playback_range(inputPath, playback_start_sec, playback_end_sec, probe_err,
+							 &ref_stream, &video_packets, &container_duration_sec)) {
 			obs_log(LOG_WARNING, "[ClipSave] trim probe failed path=%s error=%s", input_utf8.c_str(),
 				overlay::util::WideToUtf8(probe_err.empty() ? L"unknown" : probe_err).c_str());
 			return;
 		}
+		const double probe_elapsed_sec =
+			static_cast<double>(os_gettime_ns() - probe_start_ns) / 1000000000.0;
 
 		const double file_duration_sec = std::max(0.0, playback_end_sec - playback_start_sec);
+		const double trim_start_sec = std::max(playback_start_sec, playback_end_sec - keepSeconds);
+		const double trim_remove_sec = std::max(0.0, file_duration_sec - keepSeconds);
 		constexpr double kTailEpsilon = 0.05;
+
+		obs_log(LOG_INFO,
+			"[ClipSave] pre-trim probe done path=%s size=%llu bytes container_duration=%.3f playback=[%.3f..%.3f] span=%.3f s ref_stream=%d video_packets=%d probe_time=%.3f s",
+			input_utf8.c_str(), static_cast<unsigned long long>(size_bytes), container_duration_sec,
+			playback_start_sec, playback_end_sec, file_duration_sec, ref_stream, video_packets,
+			probe_elapsed_sec);
+
+		obs_log(LOG_INFO,
+			"[ClipSave] trim plan path=%s keep=%.3f trim_start=%.3f remove=%.3f",
+			input_utf8.c_str(), keepSeconds, trim_start_sec, trim_remove_sec);
+
 		if (keepSeconds + kTailEpsilon >= file_duration_sec) {
-			obs_log(LOG_INFO,
-				"[ClipSave] trim skipped path=%s reason=keep_ge_file keep=%.3f span=%.3f",
-				input_utf8.c_str(), keepSeconds, file_duration_sec);
+			obs_log(LOG_WARNING,
+				"[ClipSave] trim skipped path=%s reason=keep_ge_file keep=%.3f span=%.3f epsilon=%.3f (file left full-length)",
+				input_utf8.c_str(), keepSeconds, file_duration_sec, kTailEpsilon);
 			return;
 		}
 
@@ -188,21 +294,64 @@ static void trim_clip_keep_last_async(const std::wstring &inputPath, double keep
 						? inputPath + L".clipsave.tmp"
 						: inputPath.substr(0, dot) + L".clipsave.tmp" + inputPath.substr(dot);
 
+		obs_log(LOG_INFO, "[ClipSave] remux begin path=%s temp=%s keep=%.3f trim_start=%.3f",
+			input_utf8.c_str(), overlay::util::WideToUtf8(tempPath).c_str(), keepSeconds,
+			trim_start_sec);
+		const uint64_t remux_start_ns = os_gettime_ns();
+
 		std::wstring err;
-		const bool ok = overlay_replay_lossless_trim_keep_last(inputPath, tempPath, keepSeconds, err);
+		// Use startSeconds remux directly — keep_last would probe the whole file again.
+		const bool ok = overlay_replay_lossless_trim(inputPath, tempPath, trim_start_sec, err);
+		const double remux_elapsed_sec =
+			static_cast<double>(os_gettime_ns() - remux_start_ns) / 1000000000.0;
 		if (!ok) {
 			DeleteFileW(tempPath.c_str());
-			obs_log(LOG_ERROR, "[ClipSave] trim failed path=%s error=%s", input_utf8.c_str(),
+			obs_log(LOG_ERROR, "[ClipSave] trim failed path=%s remux_time=%.3f s error=%s",
+				input_utf8.c_str(), remux_elapsed_sec,
 				overlay::util::WideToUtf8(err.empty() ? L"unknown" : err).c_str());
 			return;
 		}
 
-		if (!replace_file_with_trimmed(inputPath, tempPath)) {
+		obs_log(LOG_INFO, "[ClipSave] remux finished path=%s remux_time=%.3f s temp_size=%llu bytes",
+			input_utf8.c_str(), remux_elapsed_sec,
+			static_cast<unsigned long long>(get_file_size_bytes(tempPath)));
+
+		if (get_file_size_bytes(tempPath) == 0) {
+			obs_log(LOG_ERROR,
+				"[ClipSave] trim reported success but temp output missing/empty path=%s temp=%s (file left full-length)",
+				input_utf8.c_str(), overlay::util::WideToUtf8(tempPath).c_str());
 			DeleteFileW(tempPath.c_str());
 			return;
 		}
 
-		obs_log(LOG_INFO, "[ClipSave] trim done path=%s keep=%.3f s", input_utf8.c_str(), keepSeconds);
+		log_clip_probe("temp-trim", tempPath);
+
+		if (!replace_file_with_trimmed(inputPath, tempPath)) {
+			DeleteFileW(tempPath.c_str());
+			obs_log(LOG_ERROR,
+				"[ClipSave] trim replace failed path=%s (original may be incomplete; check prior errors)",
+				input_utf8.c_str());
+			return;
+		}
+
+		log_clip_probe("post-trim", inputPath);
+
+		double actual_span_sec = 0.0;
+		{
+			double post_start_sec = 0.0;
+			double post_end_sec = 0.0;
+			std::wstring post_err;
+			if (overlay_replay_probe_playback_range(inputPath, post_start_sec, post_end_sec, post_err)) {
+				actual_span_sec = std::max(0.0, post_end_sec - post_start_sec);
+			}
+		}
+
+		const double worker_elapsed_sec =
+			static_cast<double>(os_gettime_ns() - trim_start_ns) / 1000000000.0;
+		obs_log(LOG_INFO,
+			"[ClipSave] trim done path=%s keep_target=%.3f actual=%.3f delta=%+.3f removed_planned=%.3f worker_time=%.3f s",
+			input_utf8.c_str(), keepSeconds, actual_span_sec, actual_span_sec - keepSeconds,
+			trim_remove_sec, worker_elapsed_sec);
 	}).detach();
 }
 #endif // _WIN32
@@ -210,15 +359,27 @@ static void trim_clip_keep_last_async(const std::wstring &inputPath, double keep
 bool overlay_clip_save_on_replay_saved(const char *replay_path)
 {
 	const int pending = g_pending_clip_seconds.exchange(0);
-	if (pending <= 0)
+	obs_log(LOG_INFO,
+		"[ClipSave] on_replay_saved pending=%d s path=%s exists=%s keep_last_mode=%s",
+		pending, replay_path ? replay_path : "(null)",
+		(replay_path && replay_path[0] != '\0' && os_file_exists(replay_path)) ? "yes" : "no",
+		overlay_smart_replay_clip_uses_keep_last() ? "yes" : "no");
+
+	if (pending <= 0) {
+		obs_log(LOG_INFO,
+			"[ClipSave] on_replay_saved: no pending keep-last duration (timed clip trim will not run)");
 		return false;
+	}
 
 	if (!replay_path || replay_path[0] == '\0' || !os_file_exists(replay_path)) {
-		obs_log(LOG_WARNING, "[ClipSave] pending %d s but saved path missing", pending);
+		obs_log(LOG_WARNING, "[ClipSave] pending %d s but saved path missing/invalid", pending);
 		return true;
 	}
 
 #ifdef _WIN32
+	obs_log(LOG_INFO, "[ClipSave] scheduling keep-last trim path=%s keep=%d s size=%llu bytes",
+		replay_path, pending,
+		static_cast<unsigned long long>(get_file_size_bytes(overlay::util::Utf8ToWide(replay_path))));
 	trim_clip_keep_last_async(overlay::util::Utf8ToWide(replay_path), static_cast<double>(pending));
 #else
 	UNUSED_PARAMETER(replay_path);

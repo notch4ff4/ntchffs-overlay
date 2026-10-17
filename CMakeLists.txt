@@ -95,6 +95,11 @@ if(WIN32)
     src/player/overlay-video-player.h
     src/trimmer/overlay-trimmer.cpp
     src/trimmer/overlay-trimmer.h
+    src/export/overlay-rebuild-preset.cpp
+    src/export/overlay-rebuild-preset.h
+    src/export/overlay-export-options.h
+    src/export/overlay-export-queue.cpp
+    src/export/overlay-export-queue.h
     src/indicators/overlay-indicators.cpp
     src/indicators/overlay-indicators-layout.cpp
     src/indicators/overlay-indicators-draw.cpp
@@ -149,6 +154,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/src/renderer"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/player"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/trimmer"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/export"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/indicators"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/toasts"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/window"

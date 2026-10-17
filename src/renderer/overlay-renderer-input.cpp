@@ -161,6 +161,13 @@ void OverlayRenderer::HandleMouseDown(int x, int y)
 	m_lastInteractionTick = GetTickCount64();
 	if (m_galleryOpen) {
 		POINT pt = ClientToLayoutPoint(x, y);
+		if (m_galleryExportSubmenuOpen && IsPointInRect(pt, m_galleryTimelineRect) &&
+		    !IsPointInRect(pt, m_galleryExportPanelRect)) {
+			m_timelineDragging = true;
+			m_suppressNextGalleryClick = true;
+			HandleGalleryClick(x, y);
+			return;
+		}
 		// Popups must consume mouse down so timeline drag does not start behind them.
 		if (m_galleryAudioTrackSubmenuOpen || m_galleryExportSubmenuOpen || m_galleryContextMenuOpen) {
 			// WM_LBUTTONDOWN also invokes Click; suppress the duplicate gallery action.

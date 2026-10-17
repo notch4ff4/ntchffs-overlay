@@ -207,16 +207,23 @@ static void save_replay_clip_ui_task(void *param)
 	const int seconds = static_cast<int>(reinterpret_cast<intptr_t>(param));
 
 	try {
+		obs_log(LOG_INFO, "[ClipSave] UI task start seconds=%d replay_active=%s saving=%s", seconds,
+			obs_frontend_replay_buffer_active() ? "yes" : "no",
+			OverlayStateManager::GetReplaySaving() ? "yes" : "no");
 		if (!obs_frontend_replay_buffer_active()) {
+			obs_log(LOG_WARNING, "[ClipSave] UI task aborted: replay buffer inactive");
 			return;
 		}
 		if (OverlayStateManager::GetReplaySaving()) {
+			obs_log(LOG_WARNING, "[ClipSave] UI task aborted: replay save already in progress");
 			return;
 		}
 		if (!overlay_clip_save_request(seconds)) {
+			obs_log(LOG_WARNING, "[ClipSave] UI task aborted: overlay_clip_save_request failed");
 			return;
 		}
 		OverlayStateManager::SetReplaySaving(true);
+		obs_log(LOG_INFO, "[ClipSave] UI task accepted seconds=%d", seconds);
 	} catch (...) {
 		obs_log(LOG_ERROR, "Failed to save replay clip");
 	}
@@ -224,6 +231,7 @@ static void save_replay_clip_ui_task(void *param)
 
 void OverlayStateManager::SaveReplayClip(int seconds)
 {
+	obs_log(LOG_INFO, "[ClipSave] SaveReplayClip queued seconds=%d", seconds);
 	obs_queue_task(OBS_TASK_UI, save_replay_clip_ui_task, reinterpret_cast<void *>(static_cast<intptr_t>(seconds)),
 		       false);
 }

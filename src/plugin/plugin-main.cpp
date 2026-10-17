@@ -153,10 +153,13 @@ static void handle_replay_saved_event(void)
 			"Replay buffer saved event without a valid file path");
 	}
 
-	if (overlay_clip_save_on_replay_saved(replay_path))
+	if (overlay_clip_save_on_replay_saved(replay_path)) {
+		obs_log(LOG_INFO, "[ClipSave] replay_saved routed to timed-clip path (Smart Replay overlap trim skipped)");
 		overlay_smart_replay_acknowledge_save(replay_path);
-	else
+	} else {
+		obs_log(LOG_INFO, "[ClipSave] replay_saved routed to Smart Replay full save-completed path");
 		overlay_smart_replay_on_save_completed(replay_path);
+	}
 }
 
 static void handle_recording_stopped_event(void)
@@ -410,6 +413,13 @@ extern "C" void overlay_runtime_set_toast_options(bool enabled, bool videoSaved,
 		return;
 	overlay_toasts_set_options(overlay_toasts, enabled, videoSaved, openHint, lowDisk, lowDiskThresholdGb,
 				   durationSec);
+}
+
+extern "C" void overlay_runtime_show_toast(const char *textUtf8, unsigned int durationMs)
+{
+	if (!overlay_toasts || !textUtf8 || !textUtf8[0])
+		return;
+	overlay_toasts_show(overlay_toasts, textUtf8, durationMs);
 }
 
 static void ToastViewInOverlayHandler(const char *pathUtf8, void *userData)

@@ -12,3 +12,4 @@
 #define IDR_ICON_ARROWS_IN       110
 #define IDR_ICON_GEAR            111
 #define IDR_ICON_CHART           112
+#define IDR_ICON_SPEAKER_SLASH   113

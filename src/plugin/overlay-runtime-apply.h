@@ -21,6 +21,7 @@ void overlay_runtime_set_toast_hotkeys_always_active(bool always);
 void overlay_runtime_set_toast_accent_color(int colorRgb);
 void overlay_runtime_set_toast_options(bool enabled, bool videoSaved, bool openHint, bool lowDisk,
 				       int lowDiskThresholdGb, int durationSec);
+void overlay_runtime_show_toast(const char *textUtf8, unsigned int durationMs);
 
 #ifdef __cplusplus
 }

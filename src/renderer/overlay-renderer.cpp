@@ -41,8 +41,11 @@ OverlayRenderer *OverlayRenderer::s_timerInstance = nullptr;
 namespace {
 constexpr UINT_PTR kOpenWithTimerId = 42;
 constexpr UINT_PTR kClipHotkeyTimerId = 43;
+constexpr UINT_PTR kExportQueueTimerId = 44;
 constexpr UINT kOpenWithDelayMs = 200;
 constexpr UINT kClipHotkeyPollMs = 33;
+// Keep harvesting export workers while the overlay is hidden so completion toasts fire.
+constexpr UINT kExportQueuePollMs = 250;
 } // namespace
 
 // Anchor symbol so GetModuleHandleEx can resolve this DLL for embedded icons.
@@ -142,6 +145,7 @@ OverlayRenderer::OverlayRenderer()
 	  m_lastInteractionTick(0),
 	  m_hoverTarget(HoverTarget::None),
 	  m_galleryEnabled(true),
+	  m_returnHomeOnHide(false),
 	  m_galleryOpen(false),
 	  m_galleryPage(0),
 	  m_gallerySelectedIndex(-1),
@@ -174,7 +178,8 @@ OverlayRenderer::OverlayRenderer()
 	  m_galleryContentHeight(0),
 	  m_updateTimer(0),
 	  m_updateIntervalMs(500),
-	  m_clipHotkeyTimer(0)
+	  m_clipHotkeyTimer(0),
+	  m_exportQueueTimer(0)
 {
 	ZeroMemory(&m_dragStart, sizeof(m_dragStart));
 	ZeroMemory(&m_galleryListRect, sizeof(m_galleryListRect));
@@ -258,6 +263,7 @@ OverlayRenderer::OverlayRenderer()
 		m_setClipShow[i] = true;
 	}
 	m_setGalleryInOverlay = true;
+	m_setReturnHomeOnHide = false;
 	m_setCaptureFocus = true;
 	m_setToastsEnabled = true;
 	m_setToastVideoSaved = true;
@@ -295,6 +301,12 @@ void CALLBACK OverlayRenderer::TimerProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD
 	if (id == kClipHotkeyTimerId) {
 		if (s_timerInstance)
 			s_timerInstance->PollClipSaveHotkeys();
+		return;
+	}
+
+	if (id == kExportQueueTimerId) {
+		if (s_timerInstance)
+			s_timerInstance->PollExportQueue();
 		return;
 	}
 
@@ -377,6 +389,9 @@ bool OverlayRenderer::Initialize(HINSTANCE hInstance)
 
 		if (obs_data_has_user_value(saved_settings_data, "gallery_in_overlay")) {
 			m_galleryEnabled = obs_data_get_bool(saved_settings_data, "gallery_in_overlay");
+		}
+		if (obs_data_has_user_value(saved_settings_data, "return_home_on_hide")) {
+			m_returnHomeOnHide = obs_data_get_bool(saved_settings_data, "return_home_on_hide");
 		}
 		if (obs_data_has_user_value(saved_settings_data, "gallery_share_compress")) {
 			m_galleryShareCompress = obs_data_get_bool(saved_settings_data, "gallery_share_compress");
@@ -464,6 +479,7 @@ bool OverlayRenderer::Initialize(HINSTANCE hInstance)
 		}
 	}
 	ApplyClipSaveHotkeys();
+	EnsureExportInfrastructure();
 
 	m_windowManager.SetClickHandler(
 		[](int x, int y, void *userData) {
@@ -534,6 +550,10 @@ void OverlayRenderer::Shutdown()
 	if (hwnd && m_clipHotkeyTimer) {
 		KillTimer(hwnd, m_clipHotkeyTimer);
 		m_clipHotkeyTimer = 0;
+	}
+	if (hwnd && m_exportQueueTimer) {
+		KillTimer(hwnd, m_exportQueueTimer);
+		m_exportQueueTimer = 0;
 	}
 
 	if (m_updateTimer) {
@@ -836,10 +856,21 @@ void OverlayRenderer::Show()
 
 void OverlayRenderer::Hide()
 {
+	if (m_returnHomeOnHide) {
+		if (m_settingsOpen)
+			CloseSettings();
+		else if (m_galleryOpen)
+			CloseGallery();
+		m_replayClipPickerOpen = false;
+	}
+
 	if (m_updateTimer) {
 		KillTimer(m_windowManager.GetHWND(), m_updateTimer);
 		m_updateTimer = 0;
 	}
+
+	// Overlay update timer stops on hide; keep a dedicated poll so export toasts still fire.
+	SyncExportQueueTimer();
 
 	m_windowManager.Hide();
 	overlay_indicators_set_overlay_visible(false);
@@ -942,8 +973,36 @@ POINT OverlayRenderer::ClientToLayoutPoint(int x, int y) const
 	return {x, y};
 }
 
+void OverlayRenderer::SyncExportQueueTimer()
+{
+	HWND hwnd = m_windowManager.GetHWND();
+	if (!hwnd)
+		return;
+
+	const bool need = m_exportInfraReady && m_exportQueue.IsBusy();
+	if (need) {
+		s_timerInstance = this;
+		if (!m_exportQueueTimer)
+			m_exportQueueTimer = SetTimer(hwnd, kExportQueueTimerId, kExportQueuePollMs, TimerProc);
+	} else if (m_exportQueueTimer) {
+		KillTimer(hwnd, m_exportQueueTimer);
+		m_exportQueueTimer = 0;
+	}
+}
+
+void OverlayRenderer::PollExportQueue()
+{
+	if (m_exportInfraReady)
+		m_exportQueue.Tick();
+	SyncExportQueueTimer();
+}
+
 void OverlayRenderer::UpdateStatus()
 {
+	if (m_exportInfraReady)
+		m_exportQueue.Tick();
+	SyncExportQueueTimer();
+
 	m_stateManager.UpdateStatus(m_state);
 	UpdateAutoHide();
 	if (m_galleryOpen) {
@@ -1683,10 +1742,11 @@ bool OverlayRenderer::LoadIconFromResource(int iconType)
 	if (iconType < 0 || iconType >= ICON_CACHE_SIZE || m_iconBitmaps[iconType]) {
 		return m_iconBitmaps[iconType] != nullptr;
 	}
-	static const int resourceIds[] = {IDR_ICON_PLAY,        IDR_ICON_PAUSE,      IDR_ICON_CARET_LEFT,
-					  IDR_ICON_CARET_RIGHT, IDR_ICON_DOWNLOAD,   IDR_ICON_TRASH,
-					  IDR_ICON_SPEAKER,     IDR_ICON_ARROW_LEFT, IDR_ICON_ARROWS_OUT,
-					  IDR_ICON_ARROWS_IN,   IDR_ICON_GEAR,       IDR_ICON_CHART};
+	static const int resourceIds[] = {IDR_ICON_PLAY,        IDR_ICON_PAUSE,         IDR_ICON_CARET_LEFT,
+					  IDR_ICON_CARET_RIGHT, IDR_ICON_DOWNLOAD,      IDR_ICON_TRASH,
+					  IDR_ICON_SPEAKER,     IDR_ICON_ARROW_LEFT,    IDR_ICON_ARROWS_OUT,
+					  IDR_ICON_ARROWS_IN,   IDR_ICON_GEAR,          IDR_ICON_CHART,
+					  IDR_ICON_SPEAKER_SLASH};
 	HMODULE hMod = NULL;
 	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
 				(LPCWSTR)&g_overlayIconsModuleAnchor, &hMod) ||
@@ -1793,7 +1853,8 @@ bool OverlayRenderer::LoadIconBitmap(int iconType)
 						"icons/arrows-out.png",
 						"icons/arrows-in.png",
 						"icons/gear.png",
-						"icons/chart-line.png"};
+						"icons/chart-line.png",
+						"icons/speaker-slash.png"};
 	const char *fileName = iconFiles[iconType];
 	char *path = obs_module_file(fileName);
 	if (!path) {
@@ -2363,7 +2424,7 @@ void OverlayRenderer::UpdateAutoHide()
 	if (m_settingsOpen)
 		return;
 	// Long exports should not trigger auto-hide mid-job.
-	if (m_trimmer.GetStatus() == OverlayTrimmer::Status::Trimming)
+	if (m_exportInfraReady && m_exportQueue.IsBusy())
 		return;
 
 	ULONGLONG now = GetTickCount64();
@@ -2526,6 +2587,167 @@ std::wstring BuildSharedOutputPathExt(const std::wstring &sharedFolder, const st
 	return sharedFolder + L"\\" + fileName;
 }
 
+} // namespace
+
+void OverlayRenderer::EnsureExportInfrastructure()
+{
+	if (m_exportInfraReady)
+		return;
+	overlay_settings_ensure();
+	if (saved_settings_data) {
+		m_rebuildPresets.EnsureSeeded(saved_settings_data);
+		m_rebuildPresets.Load(saved_settings_data);
+		overlay_settings_save();
+	} else {
+		m_rebuildPresets.presets = RebuildPresetStore::DefaultSeedPresets();
+		m_rebuildPresets.selectedId = "seed_balanced";
+	}
+	m_rebuildDraft = m_rebuildPresets.GetSelectedOrDefault();
+	m_setExportMaxParallel = m_rebuildPresets.maxParallel;
+	m_exportQueue.SetMaxParallel(m_setExportMaxParallel);
+	m_exportQueue.SetBatchPreset(m_rebuildDraft);
+	m_exportQueue.SetToastHandler([](const std::string &utf8) { overlay_runtime_show_toast(utf8.c_str(), 5000); });
+	m_exportQueue.Load();
+	m_exportInfraReady = true;
+}
+
+void OverlayRenderer::SyncExportQueueFolder()
+{
+	std::string recordingPath = m_stateManager.GetRecordingPath();
+	if (recordingPath.empty())
+		recordingPath = m_stateManager.GetConfiguredRecordingPath();
+	m_exportQueue.SetDefaultExportFolder(BuildGalleryExportFolder(recordingPath));
+}
+
+void OverlayRenderer::PersistRebuildPresets()
+{
+	overlay_settings_ensure();
+	if (!saved_settings_data)
+		return;
+	m_rebuildPresets.selectedId = m_rebuildDraft.id;
+	m_rebuildPresets.maxParallel = m_setExportMaxParallel;
+	m_rebuildPresets.Save(saved_settings_data);
+	obs_data_set_bool(saved_settings_data, "gallery_share_compress", m_rebuildDraft.mode != RebuildMode::Copy);
+	obs_data_set_int(saved_settings_data, "gallery_share_crf", m_rebuildDraft.Crf());
+	overlay_settings_save();
+	m_exportQueue.SetMaxParallel(m_setExportMaxParallel);
+}
+
+void OverlayRenderer::PopulateExportTrackChoices(const std::vector<int> *keepStreamIndices)
+{
+	m_exportTrackStreamIndices.clear();
+	m_exportTrackKeep.clear();
+	m_exportTrackLabels.clear();
+
+	auto kept = [&](int streamIndex) -> bool {
+		if (!keepStreamIndices || keepStreamIndices->empty())
+			return true;
+		for (int idx : *keepStreamIndices) {
+			if (idx == streamIndex)
+				return true;
+		}
+		return false;
+	};
+
+	int trackNum = 0;
+	const int videoIdx = m_videoPlayer.GetVideoStreamIndex();
+	if (videoIdx >= 0) {
+		trackNum++;
+		m_exportTrackStreamIndices.push_back(videoIdx);
+		m_exportTrackKeep.push_back(kept(videoIdx));
+		std::wstring videoName = WideFromUtf8(m_videoPlayer.GetVideoStreamName());
+		m_exportTrackLabels.push_back(std::to_wstring(trackNum) + L": " +
+					      (videoName.empty() ? overlay::util::ModuleTextW("Export.Video") : videoName));
+	}
+	const int audioCount = m_videoPlayer.GetAudioTrackCount();
+	for (int i = 0; i < audioCount; i++) {
+		OverlayVideoPlayer::AudioTrackInfo info;
+		m_videoPlayer.GetAudioTrackInfo(i, info);
+		trackNum++;
+		m_exportTrackStreamIndices.push_back(info.streamIndex);
+		m_exportTrackKeep.push_back(kept(info.streamIndex));
+		std::wstring name = WideFromUtf8(info.name);
+		m_exportTrackLabels.push_back(
+			std::to_wstring(trackNum) + L": " +
+			(name.empty() ? overlay::util::ModuleTextW("Export.Audio") + L" " + std::to_wstring(i + 1)
+				      : name));
+	}
+}
+
+void OverlayRenderer::CaptureExportTracksToDraft()
+{
+	if (m_exportTrackStreamIndices.empty())
+		return;
+
+	m_rebuildDraft.tracksConfigured = true;
+	m_rebuildDraft.keepVideoTrack = true;
+	m_rebuildDraft.keepAudioOrdinals.clear();
+
+	const int videoIdx = m_videoPlayer.GetVideoStreamIndex();
+	int audioOrd = 0;
+	for (size_t i = 0; i < m_exportTrackStreamIndices.size(); i++) {
+		const bool on = (i < m_exportTrackKeep.size()) && m_exportTrackKeep[i];
+		const int streamIdx = m_exportTrackStreamIndices[i];
+		if (streamIdx == videoIdx) {
+			m_rebuildDraft.keepVideoTrack = on;
+		} else {
+			if (on)
+				m_rebuildDraft.keepAudioOrdinals.push_back(audioOrd);
+			audioOrd++;
+		}
+	}
+	m_rebuildDraft.keepAudio = !m_rebuildDraft.keepAudioOrdinals.empty();
+}
+
+void OverlayRenderer::ApplyDraftTracksToExportUi()
+{
+	PopulateExportTrackChoices(nullptr);
+	if (!m_rebuildDraft.tracksConfigured)
+		return;
+
+	const int videoIdx = m_videoPlayer.GetVideoStreamIndex();
+	int audioOrd = 0;
+	for (size_t i = 0; i < m_exportTrackStreamIndices.size(); i++) {
+		const int streamIdx = m_exportTrackStreamIndices[i];
+		if (streamIdx == videoIdx) {
+			if (i < m_exportTrackKeep.size())
+				m_exportTrackKeep[i] = m_rebuildDraft.keepVideoTrack;
+		} else {
+			if (i < m_exportTrackKeep.size())
+				m_exportTrackKeep[i] = m_rebuildDraft.ShouldKeepAudioOrdinal(audioOrd);
+			audioOrd++;
+		}
+	}
+}
+
+bool OverlayRenderer::AddSelectedClipToExportQueue()
+{
+	const GalleryItem *item = m_gallery.GetItem(m_gallerySelectedIndex);
+	if (!item || item->type != GalleryItem::Type::Video)
+		return false;
+	EnsureExportInfrastructure();
+	SyncExportQueueFolder();
+
+	ExportQueueJob job;
+	job.inputPath = item->path;
+	job.displayName = item->name;
+	job.startSeconds = m_galleryTrimIn;
+	job.endSeconds = m_galleryTrimOut;
+	if (job.endSeconds <= job.startSeconds)
+		job.endSeconds = job.startSeconds + 1.0;
+	const double mediaDur = m_videoPlayer.GetDuration();
+	if (job.startSeconds <= 0.001 && mediaDur > 0.0 && job.endSeconds >= mediaDur - 0.15)
+		job.endSeconds = 0.0;
+	job.preset = m_exportQueue.GetBatchPreset();
+	job.streamIndicesToKeep.clear();
+	m_exportQueue.Enqueue(job);
+	overlay_runtime_show_toast(
+		(std::string("Added to export queue: ") + overlay::util::WideToUtf8(job.displayName)).c_str(), 3500);
+	return true;
+}
+
+namespace {
+
 HGLOBAL CreateHDropData(const std::wstring &path)
 {
 	size_t bytes = (path.size() + 2) * sizeof(wchar_t);
@@ -2652,6 +2874,7 @@ struct RenamePromptState {
 	std::wstring text;
 	bool accepted = false;
 	bool closed = false;
+	bool selectStemBeforeDot = true;
 };
 
 constexpr int kRenameEditId = 1001;
@@ -2680,9 +2903,11 @@ LRESULT CALLBACK RenamePromptWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 		if (edit) {
 			SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),
 				     TRUE);
-			size_t selEnd = state->text.find_last_of(L'.');
-			if (selEnd == std::wstring::npos) {
-				selEnd = state->text.size();
+			size_t selEnd = state->text.size();
+			if (state->selectStemBeforeDot) {
+				const size_t dot = state->text.find_last_of(L'.');
+				if (dot != std::wstring::npos)
+					selEnd = dot;
 			}
 			SendMessageW(edit, EM_SETSEL, 0, static_cast<LPARAM>(selEnd));
 			SetFocus(edit);
@@ -2747,7 +2972,7 @@ bool EnsureRenamePromptClass(HINSTANCE instance)
 	return true;
 }
 
-bool PromptRenameFileName(HWND owner, std::wstring &nameInOut)
+bool PromptTextInput(HWND owner, const std::wstring &title, std::wstring &textInOut, bool selectStemBeforeDot)
 {
 	HMODULE instance = nullptr;
 	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -2760,7 +2985,8 @@ bool PromptRenameFileName(HWND owner, std::wstring &nameInOut)
 	}
 
 	RenamePromptState state;
-	state.text = nameInOut;
+	state.text = textInOut;
+	state.selectStemBeforeDot = selectStemBeforeDot;
 
 	const int width = 400;
 	const int height = 120;
@@ -2773,8 +2999,7 @@ bool PromptRenameFileName(HWND owner, std::wstring &nameInOut)
 	const int x = ownerRect.left + ((ownerRect.right - ownerRect.left) - width) / 2;
 	const int y = ownerRect.top + ((ownerRect.bottom - ownerRect.top) - height) / 2;
 
-	HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, kRenamePromptClass,
-				    overlay::util::ModuleTextW("Gallery.Ctx.Rename").c_str(),
+	HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, kRenamePromptClass, title.c_str(),
 				    WS_POPUP | WS_CAPTION | WS_SYSMENU, x, y, width, height, owner, nullptr,
 				    instance, &state);
 	if (!hwnd) {
@@ -2803,7 +3028,33 @@ bool PromptRenameFileName(HWND owner, std::wstring &nameInOut)
 	if (!state.accepted) {
 		return false;
 	}
-	nameInOut = state.text;
+	textInOut = state.text;
+	return true;
+}
+
+bool PromptRenameFileName(HWND owner, std::wstring &nameInOut)
+{
+	return PromptTextInput(owner, overlay::util::ModuleTextW("Gallery.Ctx.Rename"), nameInOut, true);
+}
+
+static std::wstring TrimPresetName(std::wstring s)
+{
+	while (!s.empty() && (s.front() == L' ' || s.front() == L'\t'))
+		s.erase(s.begin());
+	while (!s.empty() && (s.back() == L' ' || s.back() == L'\t'))
+		s.pop_back();
+	return s;
+}
+
+static bool PromptPresetName(HWND owner, std::wstring &nameInOut)
+{
+	std::wstring draft = nameInOut;
+	if (!PromptTextInput(owner, overlay::util::ModuleTextW("Rebuild.PresetName"), draft, false))
+		return false;
+	draft = TrimPresetName(draft);
+	if (draft.empty())
+		return false;
+	nameInOut = draft;
 	return true;
 }
 
@@ -2986,7 +3237,10 @@ void OverlayRenderer::OpenGallery()
 	m_galleryTrimUserSet = false;
 	m_galleryExportSubmenuOpen = false;
 	m_galleryAudioTrackSubmenuOpen = false;
+	m_exportSettingsPendingStart = false;
+	m_editingQueueJobId.clear();
 	CloseGalleryContextMenu();
+	EnsureExportInfrastructure();
 	m_trimmer.Reset();
 	SetUpdateInterval(16);
 	m_videoPlayer.SetMuted(m_galleryMuted);
@@ -3016,6 +3270,7 @@ void OverlayRenderer::OpenGallery()
 					m_galleryTrimIn = 0.0;
 					m_galleryTrimOut = m_videoPlayer.GetDuration();
 					m_galleryTrimUserSet = false;
+					ApplyGalleryWindowSize();
 				}
 				break;
 			}
@@ -3101,6 +3356,7 @@ void OverlayRenderer::OpenGalleryFile(const std::wstring &filePath)
 			m_galleryTrimIn = 0.0;
 			m_galleryTrimOut = m_videoPlayer.GetDuration();
 			m_galleryTrimUserSet = false;
+			ApplyGalleryWindowSize();
 		}
 	} else {
 		m_videoPlayer.Close();
@@ -3115,6 +3371,8 @@ void OverlayRenderer::CloseGallery()
 	m_galleryFullscreen = false;
 	m_galleryExportSubmenuOpen = false;
 	m_galleryAudioTrackSubmenuOpen = false;
+	m_exportSettingsPendingStart = false;
+	m_editingQueueJobId.clear();
 	CloseGalleryContextMenu();
 	m_sharedFolderToOpenOnSuccess.clear();
 	m_gallerySelectedIndex = -1;
@@ -3259,23 +3517,82 @@ void OverlayRenderer::ApplyGalleryWindowSize()
 		targetWidth = workWidth;
 		targetHeight = workHeight;
 		contentPos = {workArea.left, workArea.top};
+		m_galleryLayoutSrcW = m_videoPlayer.GetSourceWidth();
+		m_galleryLayoutSrcH = m_videoPlayer.GetSourceHeight();
 	} else {
-		targetWidth = std::min(1200, workWidth - 40);
+		constexpr int kOuterPad = 3;
+		constexpr int kContentInsetH = 14;
+		constexpr int kHeaderH = 30;
+		constexpr int kHeaderTop = 12;
+		constexpr int kHeaderGap = 12;
+		constexpr int kSectionGap = 16;
+		constexpr int kPreviewTimelineGap = 28;
+		constexpr int kControlsH = 42;
+		constexpr int kTimelineH = 30;
+		constexpr int kSidebarW = 260;
+		constexpr int kQueueW = 280;
+		constexpr int kMinPreviewW = 480;
+		constexpr int kMinWindowH = 520;
+
 		targetHeight = std::min(820, workHeight - 40);
-		if (targetWidth < 800)
-			targetWidth = std::max(640, workWidth - 20);
-		if (targetHeight < 500)
-			targetHeight = std::max(420, workHeight - 20);
+		if (targetHeight < kMinWindowH)
+			targetHeight = std::max(kMinWindowH, workHeight - 20);
+
+		const int contentTop = kOuterPad + kHeaderTop + kHeaderH + kHeaderGap;
+		const int contentBottom = targetHeight - kOuterPad - kContentInsetH;
+		const int contentH = std::max(1, contentBottom - contentTop);
+		int previewH = contentH - kControlsH - kSectionGap - kTimelineH - kPreviewTimelineGap;
+		if (previewH < 200)
+			previewH = 200;
+
+		int srcW = m_videoPlayer.GetSourceWidth();
+		int srcH = m_videoPlayer.GetSourceHeight();
+		if (srcW <= 0 || srcH <= 0) {
+			srcW = 16;
+			srcH = 9;
+		}
+		m_galleryLayoutSrcW = srcW;
+		m_galleryLayoutSrcH = srcH;
+
+		const double aspect = static_cast<double>(srcW) / static_cast<double>(srcH);
+		int previewW = static_cast<int>(std::lround(static_cast<double>(previewH) * aspect));
+		if (previewW < kMinPreviewW)
+			previewW = kMinPreviewW;
+
+		const int chromeW = kOuterPad * 2 + kContentInsetH * 2 + kSidebarW + kSectionGap + kSectionGap + kQueueW;
+		targetWidth = chromeW + previewW;
+
+		const int maxW = std::max(800, workWidth - 40);
+		if (targetWidth > maxW) {
+			// Monitor too narrow: shrink preview width, then height so video still fills preview.
+			previewW = std::max(kMinPreviewW, maxW - chromeW);
+			previewH = static_cast<int>(std::lround(static_cast<double>(previewW) / aspect));
+			if (previewH < 200)
+				previewH = 200;
+			const int neededContentH = previewH + kControlsH + kSectionGap + kTimelineH + kPreviewTimelineGap;
+			targetHeight = kOuterPad + kHeaderTop + kHeaderH + kHeaderGap + neededContentH + kContentInsetH +
+				       kOuterPad;
+			if (targetHeight > workHeight - 40)
+				targetHeight = workHeight - 40;
+			if (targetHeight < kMinWindowH)
+				targetHeight = std::min(kMinWindowH, workHeight - 20);
+			targetWidth = chromeW + previewW;
+			if (targetWidth > maxW)
+				targetWidth = maxW;
+		}
+
 		contentPos = {workArea.left + (workWidth - targetWidth) / 2,
 			     workArea.top + (workHeight - targetHeight) / 2};
 	}
 
+	const bool sizeChanged =
+		(targetWidth != m_galleryContentWidth || targetHeight != m_galleryContentHeight);
 	m_galleryContentWidth = targetWidth;
 	m_galleryContentHeight = targetHeight;
 
 	if (IsDimmingActive()) {
 		ApplyDimmingWindowGeometry(contentPos, targetWidth, targetHeight);
-	} else {
+	} else if (sizeChanged) {
 		m_dimContentOffset = {0, 0};
 		m_windowManager.SetPosition(contentPos, targetWidth, targetHeight);
 	}
@@ -3305,11 +3622,36 @@ void OverlayRenderer::RenderGallery()
 
 	const RECT clientRect = {0, 0, width, height};
 
+	EnsureExportInfrastructure();
+	SyncExportQueueFolder();
+	m_exportQueue.Tick();
+	SyncExportQueueTimer();
+
+	const int srcW = m_videoPlayer.GetSourceWidth();
+	const int srcH = m_videoPlayer.GetSourceHeight();
+	if (!m_galleryFullscreen && srcW > 0 && srcH > 0 &&
+	    (srcW != m_galleryLayoutSrcW || srcH != m_galleryLayoutSrcH)) {
+		ApplyGalleryWindowSize();
+		if (IsDimmingActive()) {
+			width = m_galleryContentWidth;
+			height = m_galleryContentHeight;
+		} else {
+			HWND hwnd = m_windowManager.GetHWND();
+			if (hwnd) {
+				RECT clientRect;
+				GetClientRect(hwnd, &clientRect);
+				width = clientRect.right - clientRect.left;
+				height = clientRect.bottom - clientRect.top;
+			}
+		}
+	}
+
 	int outerPadding = 3;
 	int sectionGap = 16;
 	int contentInsetH = 14;
 	int headerHeight = 30;
-	int sidebarWidth = std::max(240, std::min(340, width / 3));
+	int sidebarWidth = 260;
+	int queueWidth = 280;
 	int controlsHeight = 42;
 	int timelineHeight = 30;
 
@@ -3321,13 +3663,17 @@ void OverlayRenderer::RenderGallery()
 
 	m_galleryListRect = {shellRect.left + contentInsetH, contentTop, shellRect.left + contentInsetH + sidebarWidth,
 			     contentBottom};
+	m_galleryQueueRect = {shellRect.right - contentInsetH - queueWidth, contentTop, shellRect.right - contentInsetH,
+			      contentBottom};
 	const int previewColumnLeft = m_galleryListRect.right + sectionGap;
-	const int previewColumnRight = shellRect.right - contentInsetH;
+	const int previewColumnRight = m_galleryQueueRect.left - sectionGap;
 
 	m_galleryControlsRect = {previewColumnLeft, contentBottom - controlsHeight, previewColumnRight, contentBottom};
 	m_galleryTimelineRect = {previewColumnLeft, m_galleryControlsRect.top - sectionGap - timelineHeight,
 				 previewColumnRight, m_galleryControlsRect.top - sectionGap};
-	m_galleryPreviewRect = {previewColumnLeft, contentTop, previewColumnRight, m_galleryTimelineRect.top - sectionGap};
+	const int previewTimelineGap = 28;
+	m_galleryPreviewRect = {previewColumnLeft, contentTop, previewColumnRight,
+				m_galleryTimelineRect.top - previewTimelineGap};
 
 	const int headerIconSize = 30;
 	const int headerIconGap = 8;
@@ -3381,10 +3727,8 @@ void OverlayRenderer::RenderGallery()
 
 	RenderGalleryList(m_galleryListRect, 52, 0);
 
-	// Preview
-	DrawRoundedRectangle(m_galleryPreviewRect, 12.0f, D2D1::ColorF(30.0f / 255.0f, 30.0f / 255.0f, 38.0f / 255.0f, 1.0f));
-	DrawRoundedRectangleBorder(m_galleryPreviewRect, 12.0f, 1.0f,
-				   D2D1::ColorF(58.0f / 255.0f, 58.0f / 255.0f, 69.0f / 255.0f, 1.0f));
+	DrawRoundedRectangle(m_galleryPreviewRect, 0.0f,
+			     D2D1::ColorF(30.0f / 255.0f, 30.0f / 255.0f, 38.0f / 255.0f, 1.0f));
 	// Match decode resolution to preview size to save CPU.
 	m_videoPlayer.SetTargetSize(m_galleryPreviewRect.right - m_galleryPreviewRect.left,
 				    m_galleryPreviewRect.bottom - m_galleryPreviewRect.top);
@@ -3416,23 +3760,26 @@ void OverlayRenderer::RenderGallery()
 					static_cast<float>(m_galleryPreviewRect.right - m_galleryPreviewRect.left);
 				float destH =
 					static_cast<float>(m_galleryPreviewRect.bottom - m_galleryPreviewRect.top);
-				float destAspect = destW / destH;
+				float destAspect = destW / std::max(1.0f, destH);
 				D2D1_RECT_F destRect = D2D1::RectF(static_cast<float>(m_galleryPreviewRect.left),
 								   static_cast<float>(m_galleryPreviewRect.top),
 								   static_cast<float>(m_galleryPreviewRect.right),
 								   static_cast<float>(m_galleryPreviewRect.bottom));
-				if (srcAspect > destAspect) {
-					float newH = destW / srcAspect;
-					float top =
-						static_cast<float>(m_galleryPreviewRect.top) + (destH - newH) * 0.5f;
-					destRect.top = top;
-					destRect.bottom = top + newH;
-				} else {
-					float newW = destH * srcAspect;
-					float left =
-						static_cast<float>(m_galleryPreviewRect.left) + (destW - newW) * 0.5f;
-					destRect.left = left;
-					destRect.right = left + newW;
+				constexpr float kAspectEps = 0.02f;
+				if (std::fabs(srcAspect - destAspect) > kAspectEps) {
+					if (srcAspect > destAspect) {
+						float newH = destW / srcAspect;
+						float top = static_cast<float>(m_galleryPreviewRect.top) +
+							    (destH - newH) * 0.5f;
+						destRect.top = top;
+						destRect.bottom = top + newH;
+					} else {
+						float newW = destH * srcAspect;
+						float left = static_cast<float>(m_galleryPreviewRect.left) +
+							     (destW - newW) * 0.5f;
+						destRect.left = left;
+						destRect.right = left + newW;
+					}
 				}
 				if (m_galleryFullscreen) {
 					DrawRoundedRectangle(m_galleryPreviewRect, 0.0f,
@@ -3446,52 +3793,7 @@ void OverlayRenderer::RenderGallery()
 			   D2D1::ColorF(0.72f, 0.76f, 0.84f));
 	}
 
-	// Open the export folder only after a successful trim completes.
-	if (m_trimmer.GetStatus() == OverlayTrimmer::Status::Success && !m_sharedFolderToOpenOnSuccess.empty()) {
-		ShellExecuteW(NULL, L"open", m_sharedFolderToOpenOnSuccess.c_str(), NULL, NULL, SW_SHOWDEFAULT);
-		m_sharedFolderToOpenOnSuccess.clear();
-	}
-	if (m_trimmer.GetStatus() == OverlayTrimmer::Status::Error) {
-		m_sharedFolderToOpenOnSuccess.clear();
-	}
-
-	// Export progress overlay
-	if (m_trimmer.GetStatus() == OverlayTrimmer::Status::Trimming) {
-		DrawRoundedRectangle(m_galleryPreviewRect, 10.0f, D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.75f));
-		int pw = m_galleryPreviewRect.right - m_galleryPreviewRect.left;
-		int ph = m_galleryPreviewRect.bottom - m_galleryPreviewRect.top;
-		RECT statusTextRect = {m_galleryPreviewRect.left, m_galleryPreviewRect.top + ph / 2 - 36,
-				       m_galleryPreviewRect.right, m_galleryPreviewRect.top + ph / 2 - 16};
-		RenderText(overlay::util::ModuleTextW("Processing"), statusTextRect, 14.0f, DWRITE_FONT_WEIGHT_BOLD,
-			   D2D1::ColorF(1.0f, 1.0f, 1.0f));
-
-		// Spinner
-		float cx = m_galleryPreviewRect.left + pw / 2.0f;
-		float cy = m_galleryPreviewRect.top + ph / 2.0f + 2.0f;
-		float radius = 14.0f;
-		double angle = (GetTickCount64() % 2000) / 2000.0 * (2.0 * 3.141592653589793);
-		ID2D1RenderTarget *target = m_bitmapRenderTarget ? m_bitmapRenderTarget : m_renderTarget;
-		if (target && m_textBrush) {
-			for (int i = 0; i < 4; i++) {
-				double a = angle + i * (2.0 * 3.141592653589793 / 4.0);
-				float ex = cx + radius * static_cast<float>(cos(a));
-				float ey = cy + radius * static_cast<float>(sin(a));
-				target->DrawLine(D2D1::Point2F(cx, cy), D2D1::Point2F(ex, ey), m_textBrush, 2.5f);
-			}
-		}
-
-		int cancelBtnW = 80;
-		int cancelBtnH = 28;
-		int cancelBtnTop = m_galleryPreviewRect.top + ph / 2 + 24;
-		m_galleryExportCancelRect = {m_galleryPreviewRect.left + (pw - cancelBtnW) / 2, cancelBtnTop,
-					     m_galleryPreviewRect.left + (pw + cancelBtnW) / 2,
-					     cancelBtnTop + cancelBtnH};
-		DrawRoundedRectangle(m_galleryExportCancelRect, 6.0f, D2D1::ColorF(0.4f, 0.2f, 0.2f, 1.0f));
-		RenderText(overlay::util::ModuleTextW("Cancel"), m_galleryExportCancelRect, 11.0f, DWRITE_FONT_WEIGHT_NORMAL,
-			   D2D1::ColorF(1.0f, 1.0f, 1.0f));
-	} else {
-		m_galleryExportCancelRect = RECT{0, 0, 0, 0};
-	}
+	m_galleryExportCancelRect = RECT{0, 0, 0, 0};
 
 	// Timeline
 	DrawRoundedRectangle(m_galleryTimelineRect, 10.0f, D2D1::ColorF(40.0f / 255.0f, 40.0f / 255.0f, 50.0f / 255.0f, 1.0f));
@@ -3506,18 +3808,65 @@ void OverlayRenderer::RenderGallery()
 		displayDuration = std::max(trimOut, current);
 	}
 	if (displayDuration > 0.0) {
-		double startRatio = std::max(0.0, std::min(1.0, trimIn / displayDuration));
-		double endRatio = std::max(0.0, std::min(1.0, trimOut / displayDuration));
-		double curRatio = std::max(0.0, std::min(1.0, current / displayDuration));
 		int left = m_galleryTimelineRect.left + 6;
 		int right = m_galleryTimelineRect.right - 6;
 		int top = m_galleryTimelineRect.top + 10;
 		int bottom = m_galleryTimelineRect.bottom - 10;
 		int trackWidth = right - left;
+		const std::wstring &openPath = m_videoPlayer.GetOpenPath();
+		auto sameMediaPath = [](const std::wstring &a, const std::wstring &b) -> bool {
+			if (a.empty() || b.empty())
+				return false;
+			if (_wcsicmp(a.c_str(), b.c_str()) == 0)
+				return true;
+			wchar_t fullA[MAX_PATH];
+			wchar_t fullB[MAX_PATH];
+			const DWORD na = GetFullPathNameW(a.c_str(), MAX_PATH, fullA, nullptr);
+			const DWORD nb = GetFullPathNameW(b.c_str(), MAX_PATH, fullB, nullptr);
+			return na > 0 && na < MAX_PATH && nb > 0 && nb < MAX_PATH && _wcsicmp(fullA, fullB) == 0;
+		};
+
+		double startRatio = std::max(0.0, std::min(1.0, trimIn / displayDuration));
+		double endRatio = std::max(0.0, std::min(1.0, trimOut / displayDuration));
+		double curRatio = std::max(0.0, std::min(1.0, current / displayDuration));
 		int trimLeft = left + static_cast<int>(trackWidth * startRatio);
 		int trimRight = left + static_cast<int>(trackWidth * endRatio);
 		RECT trimRect = {trimLeft, top, std::max(trimLeft + 4, trimRight), bottom};
-		DrawRoundedRectangle(trimRect, 4.0f, AccentMuted());
+		D2D1_COLOR_F trimColor = AccentMuted();
+		if (!m_editingQueueJobId.empty()) {
+			for (const auto &job : m_exportQueue.GetJobs()) {
+				if (job.id == m_editingQueueJobId && job.markerColorRgb != 0) {
+					trimColor = ColorFromRgb(job.markerColorRgb, 0.80f);
+					break;
+				}
+			}
+		}
+		DrawRoundedRectangle(trimRect, 4.0f, trimColor);
+
+		if (m_exportInfraReady && !openPath.empty() && trackWidth > 0) {
+			for (const auto &job : m_exportQueue.GetJobs()) {
+				if (job.inputPath.empty() || !sameMediaPath(job.inputPath, openPath))
+					continue;
+				if (!m_editingQueueJobId.empty() && job.id == m_editingQueueJobId)
+					continue; // active trim already uses this job's color
+				double jIn = std::max(0.0, job.startSeconds);
+				double jOut = job.endSeconds;
+				if (!(jOut > jIn))
+					jOut = displayDuration;
+				jOut = std::min(jOut, displayDuration);
+				if (jOut <= jIn)
+					continue;
+				const double sR = std::max(0.0, std::min(1.0, jIn / displayDuration));
+				const double eR = std::max(0.0, std::min(1.0, jOut / displayDuration));
+				const int jL = left + static_cast<int>(trackWidth * sR);
+				const int jR = left + static_cast<int>(trackWidth * eR);
+				RECT mark = {jL, top + 1, std::max(jL + 3, jR), bottom - 1};
+				const int rgb = job.markerColorRgb != 0 ? job.markerColorRgb : 0xE67E22;
+				DrawRoundedRectangle(mark, 3.0f, ColorFromRgb(rgb, 0.55f));
+				DrawRoundedRectangleBorder(mark, 3.0f, 1.5f, ColorFromRgb(rgb, 1.0f));
+			}
+		}
+
 		int playX = left + static_cast<int>(trackWidth * curRatio);
 		RECT playRect = {playX - 2, m_galleryTimelineRect.top, playX + 2, m_galleryTimelineRect.bottom};
 		DrawRoundedRectangle(playRect, 2.0f,
@@ -3530,7 +3879,201 @@ void OverlayRenderer::RenderGallery()
 		   D2D1::ColorF(0.86f, 0.86f, 0.9f), DWRITE_TEXT_ALIGNMENT_TRAILING);
 
 	RenderGalleryControls(m_galleryControlsRect);
+	RenderGalleryExportQueue(m_galleryQueueRect);
 	RenderGalleryContextMenu(width, height);
+}
+
+void OverlayRenderer::RenderGalleryExportQueue(const RECT &queueRect)
+{
+	m_queueItemRects.clear();
+	m_queueCancelRects.clear();
+	m_queueRemoveRects.clear();
+	m_queueRetryRects.clear();
+	m_queueEditRects.clear();
+	m_queueRenameRects.clear();
+	m_queueOpenRects.clear();
+	m_queueUpRects.clear();
+	m_queueDownRects.clear();
+	m_queueItemIds.clear();
+	m_galleryQueueStartRect = RECT{0, 0, 0, 0};
+	m_galleryQueueClearRect = RECT{0, 0, 0, 0};
+	m_galleryQueueOpenFolderRect = RECT{0, 0, 0, 0};
+
+	DrawRoundedRectangle(queueRect, 12.0f, D2D1::ColorF(30.0f / 255.0f, 30.0f / 255.0f, 38.0f / 255.0f, 1.0f));
+	DrawRoundedRectangleBorder(queueRect, 12.0f, 1.0f,
+				   D2D1::ColorF(58.0f / 255.0f, 58.0f / 255.0f, 69.0f / 255.0f, 1.0f));
+
+	const int clearBtnW = 78;
+	const int clearBtnH = 26;
+	m_galleryQueueClearRect = {queueRect.right - 12 - clearBtnW, queueRect.top + 10, queueRect.right - 12,
+				   queueRect.top + 10 + clearBtnH};
+	const bool mergeMode = m_exportQueue.GetMode() == ExportQueueMode::Merge;
+	double mergeProgress = 0.0;
+	const bool showMergeProgress = mergeMode && m_exportQueue.GetMergeProgress(mergeProgress);
+
+	RenderText(overlay::util::ModuleTextW("Export.Queue"),
+		   RECT{queueRect.left + 12, queueRect.top + 12, m_galleryQueueClearRect.left - 8, queueRect.top + 34},
+		   11.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, D2D1::ColorF(0.93f, 0.95f, 1.0f),
+		   DWRITE_TEXT_ALIGNMENT_LEADING);
+	if (showMergeProgress) {
+		wchar_t mergePct[24];
+		swprintf(mergePct, 24, L"%s %d%%", overlay::util::ModuleTextW("Export.Merge").c_str(),
+			 static_cast<int>(mergeProgress * 100.0 + 0.5));
+		RenderText(mergePct,
+			   RECT{queueRect.left + 12, queueRect.top + 12, m_galleryQueueClearRect.left - 8,
+				queueRect.top + 34},
+			   11.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, D2D1::ColorF(0.95f, 0.72f, 0.28f),
+			   DWRITE_TEXT_ALIGNMENT_TRAILING);
+	}
+	const bool canClear = !m_exportQueue.IsEmpty();
+	DrawRoundedRectangle(m_galleryQueueClearRect, 8.0f,
+			     canClear ? D2D1::ColorF(0.42f, 0.18f, 0.18f, 1.0f)
+				      : D2D1::ColorF(40.0f / 255.0f, 40.0f / 255.0f, 50.0f / 255.0f, 1.0f));
+	RenderText(overlay::util::ModuleTextW("Export.ClearQueue"), m_galleryQueueClearRect, 9.5f,
+		   DWRITE_FONT_WEIGHT_SEMI_BOLD, canClear ? D2D1::ColorF(1, 1, 1) : D2D1::ColorF(0.55f, 0.55f, 0.6f));
+
+	const int footerH = 72;
+	RECT listArea = {queueRect.left + 10, queueRect.top + 44, queueRect.right - 10, queueRect.bottom - footerH};
+	const auto jobs = m_exportQueue.GetJobs();
+	const int rowH = 68;
+	const int rowGap = 6;
+	int y = listArea.top - m_queueScroll;
+	for (const auto &job : jobs) {
+		if (y + rowH < listArea.top) {
+			y += rowH + rowGap;
+			continue;
+		}
+		if (y > listArea.bottom)
+			break;
+		const int rowBottom = (y + rowH < listArea.bottom) ? (y + rowH) : listArea.bottom;
+		RECT row = {listArea.left, y, listArea.right, rowBottom};
+		m_queueItemRects.push_back(row);
+		m_queueItemIds.push_back(job.id);
+		const bool editingRow = (!m_editingQueueJobId.empty() && job.id == m_editingQueueJobId);
+		DrawRoundedRectangle(row, 8.0f,
+				     editingRow ? D2D1::ColorF(34.0f / 255.0f, 34.0f / 255.0f, 46.0f / 255.0f, 1.0f)
+						: D2D1::ColorF(26.0f / 255.0f, 26.0f / 255.0f, 34.0f / 255.0f, 1.0f));
+		const int markerRgb = job.markerColorRgb != 0 ? job.markerColorRgb : 0xE67E22;
+		RECT colorBar = {row.left + 3, row.top + 6, row.left + 7, row.bottom - 6};
+		DrawRoundedRectangle(colorBar, 2.0f, ColorFromRgb(markerRgb, 1.0f));
+		if (editingRow)
+			DrawRoundedRectangleBorder(row, 8.0f, 1.0f, ColorFromRgb(markerRgb, 0.9f));
+
+		const int remW = 22;
+		const int remH = 22;
+		RECT remRect = {row.right - 8 - remW, row.top + 6, row.right - 8, row.top + 6 + remH};
+		m_queueRemoveRects.push_back(remRect);
+		DrawRoundedRectangle(remRect, 6.0f, D2D1::ColorF(0.4f, 0.16f, 0.16f, 1.0f));
+		if (m_bitmapRenderTarget && m_textBrush) {
+			m_textBrush->SetColor(D2D1::ColorF(1.0f, 0.85f, 0.85f));
+			const float inset = 6.5f;
+			const float x0 = static_cast<float>(remRect.left) + inset;
+			const float y0 = static_cast<float>(remRect.top) + inset;
+			const float x1 = static_cast<float>(remRect.right) - inset;
+			const float y1 = static_cast<float>(remRect.bottom) - inset;
+			m_bitmapRenderTarget->DrawLine(D2D1::Point2F(x0, y0), D2D1::Point2F(x1, y1), m_textBrush, 1.8f);
+			m_bitmapRenderTarget->DrawLine(D2D1::Point2F(x1, y0), D2D1::Point2F(x0, y1), m_textBrush, 1.8f);
+		}
+
+		std::wstring st;
+		switch (job.status) {
+		case ExportJobStatus::Queued:
+			st = overlay::util::ModuleTextW("Export.Status.Queued");
+			break;
+		case ExportJobStatus::Running:
+			st = overlay::util::ModuleTextW("Export.Status.Running");
+			break;
+		case ExportJobStatus::Success:
+			st = overlay::util::ModuleTextW("Done");
+			break;
+		case ExportJobStatus::Failed:
+			st = overlay::util::ModuleTextW("Failed");
+			break;
+		case ExportJobStatus::Cancelled:
+			st = overlay::util::ModuleTextW("Export.Status.Cancelled");
+			break;
+		}
+		RenderText(job.displayName, RECT{row.left + 12, row.top + 6, remRect.left - 6, row.top + 24}, 10.0f,
+			   DWRITE_FONT_WEIGHT_SEMI_BOLD, D2D1::ColorF(0.95f, 0.96f, 1.0f),
+			   DWRITE_TEXT_ALIGNMENT_LEADING);
+		std::wstring meta = st;
+		if (job.status == ExportJobStatus::Running && !mergeMode) {
+			wchar_t pbuf[16];
+			swprintf(pbuf, 16, L" %d%%", static_cast<int>(job.progress * 100.0 + 0.5));
+			meta += pbuf;
+		} else if (job.status == ExportJobStatus::Running && mergeMode) {
+			meta += L" · ";
+			meta += FormatTime(job.startSeconds);
+			meta += L"–";
+			if (job.endSeconds > job.startSeconds)
+				meta += FormatTime(job.endSeconds);
+			else
+				meta += L"EOF";
+		} else if (job.status == ExportJobStatus::Failed && !job.errorText.empty()) {
+			meta += L": ";
+			meta += job.errorText.size() > 32 ? job.errorText.substr(0, 32) + L"…" : job.errorText;
+		} else {
+			meta += L" · ";
+			meta += FormatTime(job.startSeconds);
+			meta += L"–";
+			if (job.endSeconds > job.startSeconds)
+				meta += FormatTime(job.endSeconds);
+			else
+				meta += L"EOF";
+		}
+		RenderText(meta, RECT{row.left + 12, row.top + 24, row.right - 10, row.top + 40}, 8.5f,
+			   DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(0.66f, 0.71f, 0.82f),
+			   DWRITE_TEXT_ALIGNMENT_LEADING);
+
+		const int btnH = 22;
+		int btnY = row.bottom - btnH - 6;
+		int bx = row.left + 8;
+		auto pushBtn = [&](std::vector<RECT> &store, const std::wstring &label, int w) {
+			RECT r = {bx, btnY, bx + w, btnY + btnH};
+			store.push_back(r);
+			DrawRoundedRectangle(r, 6.0f, D2D1::ColorF(40.0f / 255.0f, 40.0f / 255.0f, 50.0f / 255.0f, 1.0f));
+			RenderText(label, r, 9.0f, DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(0.9f, 0.9f, 0.9f));
+			bx += w + 5;
+		};
+		pushBtn(m_queueUpRects, L"↑", 24);
+		pushBtn(m_queueDownRects, L"↓", 24);
+		pushBtn(m_queueEditRects, overlay::util::ModuleTextW("Export.Edit"), 52);
+		if (job.status != ExportJobStatus::Running)
+			pushBtn(m_queueRenameRects, overlay::util::ModuleTextW("Export.Rename"), 58);
+		else
+			m_queueRenameRects.push_back(RECT{0, 0, 0, 0});
+		m_queueCancelRects.push_back(RECT{0, 0, 0, 0}); // cancel is the footer Export/Cancel button
+		if (job.status == ExportJobStatus::Failed || job.status == ExportJobStatus::Cancelled)
+			pushBtn(m_queueRetryRects, overlay::util::ModuleTextW("Export.Retry"), 58);
+		else
+			m_queueRetryRects.push_back(RECT{0, 0, 0, 0});
+		if (job.status == ExportJobStatus::Success && !job.outputFolder.empty())
+			pushBtn(m_queueOpenRects, overlay::util::ModuleTextW("Export.OpenDir"), 54);
+		else
+			m_queueOpenRects.push_back(RECT{0, 0, 0, 0});
+		y += rowH + rowGap;
+	}
+
+	RECT footer = {queueRect.left + 10, queueRect.bottom - footerH + 6, queueRect.right - 10, queueRect.bottom - 10};
+
+	m_galleryQueueStartRect = {footer.left, footer.top, footer.right, footer.top + 30};
+	const bool exportBusy = m_exportQueue.IsBusy();
+	DrawRoundedRectangle(m_galleryQueueStartRect, 8.0f,
+			     exportBusy ? D2D1::ColorF(0.42f, 0.18f, 0.18f, 1.0f) : AccentSelected());
+	RenderText(exportBusy ? overlay::util::ModuleTextW("Cancel") : overlay::util::ModuleTextW("Export.Start"),
+		   m_galleryQueueStartRect, 11.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, D2D1::ColorF(1, 1, 1));
+
+	if (m_exportQueue.HasAnySuccess() && !m_exportQueue.IsBusy()) {
+		std::wstring common;
+		const bool oneFolder = m_exportQueue.AllOutputsSameFolder(common);
+		if (oneFolder) {
+			m_galleryQueueOpenFolderRect = {footer.left, footer.top + 36, footer.right, footer.bottom};
+			DrawRoundedRectangle(m_galleryQueueOpenFolderRect, 8.0f,
+					     D2D1::ColorF(40.0f / 255.0f, 40.0f / 255.0f, 50.0f / 255.0f, 1.0f));
+			RenderText(overlay::util::ModuleTextW("Export.OpenFolder"), m_galleryQueueOpenFolderRect, 9.5f,
+				   DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(0.9f, 0.9f, 0.9f));
+		}
+	}
 }
 
 void OverlayRenderer::RenderGalleryList(const RECT &listRect, int itemHeight, int itemsPerPageHint)
@@ -3703,8 +4246,11 @@ void OverlayRenderer::RenderGalleryControls(const RECT &controlsRect)
 	const D2D1_COLOR_F normalIcon = D2D1::ColorF(0.85f, 0.85f, 0.9f);
 
 	const bool hoverMute = (m_hoverTarget == HoverTarget::GalleryMute);
-	const D2D1_COLOR_F muteTint = hoverMute ? hoverColor : normalIcon;
-	DrawGalleryIcon(m_galleryMuteRect, 6, &muteTint);
+	const D2D1_COLOR_F muteRed = D2D1::ColorF(0.95f, 0.25f, 0.25f);
+	const D2D1_COLOR_F muteRedHover = D2D1::ColorF(1.0f, 0.4f, 0.4f);
+	const D2D1_COLOR_F muteTint = m_galleryMuted ? (hoverMute ? muteRedHover : muteRed)
+						     : (hoverMute ? hoverColor : normalIcon);
+	DrawGalleryIcon(m_galleryMuteRect, m_galleryMuted ? 12 : 6, &muteTint);
 	DrawRoundedRectangle(m_galleryVolumeRect, 4.0f,
 			     D2D1::ColorF(40.0f / 255.0f, 40.0f / 255.0f, 50.0f / 255.0f, 1.0f));
 	int volWidth = m_galleryVolumeRect.right - m_galleryVolumeRect.left - 4;
@@ -3732,118 +4278,193 @@ void OverlayRenderer::RenderGalleryControls(const RECT &controlsRect)
 	DrawGalleryIcon(m_galleryTrimRect, 4, &trimTint);
 	DrawGalleryIcon(m_galleryDeleteRect, 5, &delTint);
 
-	// Export submenu
 	if (m_galleryExportSubmenuOpen) {
-		int pad = 12;
-		int row1H = 24;
-		int row2H = 24;
-		int row3H = 32;
-		int trackRowH = 16;
-		int tracksHeight = static_cast<int>(m_exportTrackStreamIndices.size()) * trackRowH;
-		if (tracksHeight > 0)
-			tracksHeight += 4;
-		int boxSize = 184 + tracksHeight;
-		int gap = 8;
-		int panelLeft = (controlsRect.left + controlsRect.right) / 2 - boxSize / 2;
-		int panelTop = controlsRect.top - gap - boxSize;
-		RECT exportBlockRect = {panelLeft, panelTop, panelLeft + boxSize, panelTop + boxSize};
+		const int pad = 12;
+		const int rowH = 22;
+		const int rowGap = 4;
+		const int row3H = 30;
+		const int trackRowH = 18;
+		const int presetBtnH = 22;
+		const int presetBtnGap = 4;
+		const int sectionGap = 6;
+		const size_t trackCount = m_exportTrackStreamIndices.size();
+		const int tracksHeight =
+			trackCount > 0 ? (static_cast<int>(trackCount) * trackRowH + sectionGap) : 0;
+		const bool isRe = m_rebuildDraft.mode == RebuildMode::Reencode;
+		const bool isGif = isRe && m_rebuildDraft.format == RebuildOutputFormat::Gif;
+		const int reRows = isRe ? (4 * (rowH + rowGap) + (isGif ? 18 : 0)) : 0;
+		const int presetBtnsBlockH = presetBtnH + sectionGap;
+		const int queueModeBlockH = rowH + sectionGap;
+		const int boxH = pad + queueModeBlockH + (rowH + rowGap) + presetBtnsBlockH + (rowH + sectionGap) +
+				 reRows + tracksHeight + row3H + pad;
+		const int boxW = 320;
+		const int gap = 8;
+		const int panelLeft = (controlsRect.left + controlsRect.right) / 2 - boxW / 2;
+		const int panelTop = controlsRect.top - gap - boxH;
+		RECT exportBlockRect = {panelLeft, panelTop, panelLeft + boxW, panelTop + boxH};
 		m_galleryExportPanelRect = exportBlockRect;
 		DrawRoundedRectangle(exportBlockRect, 10.0f, AccentPanel());
 		DrawRoundedRectangleBorder(exportBlockRect, 10.0f, 1.0f,
 					   D2D1::ColorF(58.0f / 255.0f, 58.0f / 255.0f, 69.0f / 255.0f, 1.0f));
 
 		int contentTop = exportBlockRect.top + pad;
-		m_exportTrackKeepRects.clear();
-		for (size_t i = 0; i < m_exportTrackStreamIndices.size(); i++) {
-			int rowTop = contentTop + static_cast<int>(i) * trackRowH;
-			int cbSize = 12;
-			RECT keepRect = {exportBlockRect.left + pad, rowTop, exportBlockRect.left + pad + cbSize,
-					 rowTop + trackRowH};
-			m_exportTrackKeepRects.push_back(keepRect);
-			DrawRoundedRectangle(keepRect, 2.0f, D2D1::ColorF(0.2f, 0.2f, 0.25f, 1.0f));
-			if (i < m_exportTrackKeep.size() && m_exportTrackKeep[i]) {
-				RECT checkR = {keepRect.left + 2, keepRect.top + 2, keepRect.right - 2,
-					       keepRect.bottom - 2};
-				DrawRoundedRectangle(checkR, 1.0f, AccentMuted());
-			}
-			RECT labelRect = {exportBlockRect.left + pad + cbSize + 4, rowTop, exportBlockRect.right - pad,
-					  rowTop + trackRowH};
-			RenderText(i < m_exportTrackLabels.size() ? m_exportTrackLabels[i] : L"", labelRect, 9.0f,
+		auto cycleRow = [&](RECT &prev, RECT &next, const std::wstring &label, const std::wstring &value) {
+			const int btnW = 22;
+			prev = {exportBlockRect.left + pad, contentTop, exportBlockRect.left + pad + btnW,
+				contentTop + rowH};
+			next = {exportBlockRect.right - pad - btnW, contentTop, exportBlockRect.right - pad,
+				contentTop + rowH};
+			RenderText(L"<", prev, 11.0f, DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(0.9f, 0.9f, 0.9f));
+			RenderText(label + L": " + value,
+				   RECT{prev.right + 4, contentTop, next.left - 4, contentTop + rowH}, 9.0f,
 				   DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(0.9f, 0.9f, 0.9f),
 				   DWRITE_TEXT_ALIGNMENT_LEADING);
-		}
-		if (tracksHeight > 0)
-			contentTop += tracksHeight;
+			RenderText(L">", next, 11.0f, DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(0.9f, 0.9f, 0.9f));
+			contentTop += rowH + rowGap;
+		};
 
-		int cbSize = 14;
-		UNUSED_PARAMETER(cbSize);
-
-		// Compress row
-		m_galleryCompressRect = {exportBlockRect.left + pad, contentTop,
-					 exportBlockRect.left + pad + cbSize + 4 + 70, contentTop + row1H};
-		DrawRoundedRectangle(RECT{exportBlockRect.left + pad, contentTop + (row1H - cbSize) / 2,
-					  exportBlockRect.left + pad + cbSize,
-					  contentTop + (row1H - cbSize) / 2 + cbSize},
-				     3.0f, D2D1::ColorF(0.2f, 0.2f, 0.25f, 1.0f));
-		if (m_galleryShareCompress) {
-			RECT checkR = {exportBlockRect.left + pad + 2, contentTop + (row1H - cbSize) / 2 + 2,
-				       exportBlockRect.left + pad + cbSize - 2,
-				       contentTop + (row1H - cbSize) / 2 + cbSize - 2};
-			DrawRoundedRectangle(checkR, 2.0f, AccentMuted());
-		}
-		RenderText(overlay::util::ModuleTextW("Compress"),
-			   RECT{exportBlockRect.left + pad + cbSize + 4, contentTop, exportBlockRect.right - pad,
-				contentTop + row1H},
-			   10.0f, DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(0.9f, 0.9f, 0.9f),
-			   DWRITE_TEXT_ALIGNMENT_LEADING);
-
-		// Quality row
-		if (m_galleryShareCompress) {
-			int qRowTop = contentTop + row1H + 4;
-			int qBtnW = 28;
-			m_galleryQualityPrevRect = {exportBlockRect.left + pad, qRowTop,
-						    exportBlockRect.left + pad + qBtnW, qRowTop + row2H};
-			m_galleryQualityNextRect = {exportBlockRect.right - pad - qBtnW, qRowTop,
-						    exportBlockRect.right - pad, qRowTop + row2H};
-			RenderText(L"-", m_galleryQualityPrevRect, 11.0f, DWRITE_FONT_WEIGHT_NORMAL,
-				   D2D1::ColorF(0.9f, 0.9f, 0.9f));
-			const std::wstring qualityText =
-				overlay::util::ModuleTextW("CompressionQuality") + L" " +
-				CompressQualityLabel(m_galleryShareCompressQuality);
-			RenderText(qualityText,
-				   RECT{m_galleryQualityPrevRect.right + 4, qRowTop, m_galleryQualityNextRect.left - 4,
-					qRowTop + row2H},
-				   9.5f, DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(0.85f, 0.85f, 0.85f));
-			RenderText(L"+", m_galleryQualityNextRect, 11.0f, DWRITE_FONT_WEIGHT_NORMAL,
-				   D2D1::ColorF(0.9f, 0.9f, 0.9f));
-		} else {
-			m_galleryQualityPrevRect = RECT{0, 0, 0, 0};
-			m_galleryQualityNextRect = RECT{0, 0, 0, 0};
+		// 0) Queue output mode — not part of rebuild preset
+		{
+			const bool merge = m_exportQueue.GetMode() == ExportQueueMode::Merge;
+			const int modeW = (boxW - pad * 2 - 4) / 2;
+			m_galleryQueueModeSeparateRect = {exportBlockRect.left + pad, contentTop,
+							  exportBlockRect.left + pad + modeW, contentTop + rowH};
+			m_galleryQueueModeMergeRect = {m_galleryQueueModeSeparateRect.right + 4, contentTop,
+						       exportBlockRect.right - pad, contentTop + rowH};
+			DrawRoundedRectangle(m_galleryQueueModeSeparateRect, 4.0f,
+					     !merge ? AccentSelected()
+						    : D2D1::ColorF(0.2f, 0.2f, 0.25f, 1.0f));
+			DrawRoundedRectangle(m_galleryQueueModeMergeRect, 4.0f,
+					     merge ? AccentSelected() : D2D1::ColorF(0.2f, 0.2f, 0.25f, 1.0f));
+			RenderText(overlay::util::ModuleTextW("Export.Separate"), m_galleryQueueModeSeparateRect, 9.5f,
+				   DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(1, 1, 1));
+			RenderText(overlay::util::ModuleTextW("Export.Merge"), m_galleryQueueModeMergeRect, 9.5f,
+				   DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(1, 1, 1));
+			contentTop += queueModeBlockH;
 		}
 
-		// Export button
-		int exportBtnTop = exportBlockRect.bottom - pad - row3H;
-		m_galleryExportConfirmRect = {exportBlockRect.left + pad, exportBtnTop, exportBlockRect.right - pad,
-					      exportBlockRect.bottom - pad};
+		// 1) Preset
+		cycleRow(m_galleryPresetPrevRect, m_galleryPresetNextRect, overlay::util::ModuleTextW("Rebuild.Preset"),
+			 m_rebuildDraft.name.empty() ? L"—" : m_rebuildDraft.name);
+		const int presetBtnW = (boxW - pad * 2 - presetBtnGap * 2) / 3;
+		const D2D1_COLOR_F presetBtnBg = D2D1::ColorF(40.0f / 255.0f, 40.0f / 255.0f, 50.0f / 255.0f, 1.0f);
+		m_galleryPresetSaveRect = {exportBlockRect.left + pad, contentTop,
+					   exportBlockRect.left + pad + presetBtnW, contentTop + presetBtnH};
+		m_galleryPresetSaveAsRect = {m_galleryPresetSaveRect.right + presetBtnGap, contentTop,
+					     m_galleryPresetSaveRect.right + presetBtnGap + presetBtnW,
+					     contentTop + presetBtnH};
+		m_galleryPresetDeleteRect = {m_galleryPresetSaveAsRect.right + presetBtnGap, contentTop,
+					     exportBlockRect.right - pad, contentTop + presetBtnH};
+		DrawRoundedRectangle(m_galleryPresetSaveRect, 6.0f, presetBtnBg);
+		DrawRoundedRectangle(m_galleryPresetSaveAsRect, 6.0f, presetBtnBg);
+		DrawRoundedRectangle(m_galleryPresetDeleteRect, 6.0f, D2D1::ColorF(0.32f, 0.2f, 0.22f, 1.0f));
+		RenderText(overlay::util::ModuleTextW("Rebuild.SavePreset"), m_galleryPresetSaveRect, 8.5f,
+			   DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(1, 1, 1));
+		RenderText(overlay::util::ModuleTextW("Rebuild.SaveAsPreset"), m_galleryPresetSaveAsRect, 8.5f,
+			   DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(1, 1, 1));
+		RenderText(overlay::util::ModuleTextW("Rebuild.DeletePreset"), m_galleryPresetDeleteRect, 8.5f,
+			   DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(1, 1, 1));
+		contentTop += presetBtnsBlockH;
+
+		// 2) Type Copy / Reencode
+		int modeW = (boxW - pad * 2 - 4) / 2;
+		m_galleryRebuildModeCopyRect = {exportBlockRect.left + pad, contentTop,
+						exportBlockRect.left + pad + modeW, contentTop + rowH};
+		m_galleryRebuildModeReencodeRect = {m_galleryRebuildModeCopyRect.right + 4, contentTop,
+						    exportBlockRect.right - pad, contentTop + rowH};
+		auto drawMode = [&](const RECT &r, RebuildMode mode, const wchar_t *label) {
+			const bool on = m_rebuildDraft.mode == mode;
+			DrawRoundedRectangle(r, 4.0f, on ? AccentSelected() : D2D1::ColorF(0.2f, 0.2f, 0.25f, 1.0f));
+			RenderText(label, r, 9.5f, DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(1, 1, 1));
+		};
+		drawMode(m_galleryRebuildModeCopyRect, RebuildMode::Copy, L"Copy");
+		drawMode(m_galleryRebuildModeReencodeRect, RebuildMode::Reencode, L"Reencode");
+		contentTop += rowH + sectionGap;
+
+		m_galleryFormatPrevRect = m_galleryFormatNextRect = RECT{0, 0, 0, 0};
+		m_galleryResPrevRect = m_galleryResNextRect = RECT{0, 0, 0, 0};
+		m_galleryBitratePrevRect = m_galleryBitrateNextRect = RECT{0, 0, 0, 0};
+		m_galleryFpsPrevRect = m_galleryFpsNextRect = RECT{0, 0, 0, 0};
+		m_galleryQualityPrevRect = m_galleryQualityNextRect = RECT{0, 0, 0, 0};
+
+		if (isRe) {
+			cycleRow(m_galleryFormatPrevRect, m_galleryFormatNextRect,
+				 overlay::util::ModuleTextW("Rebuild.Format"), m_rebuildDraft.FormatLabel());
+			cycleRow(m_galleryResPrevRect, m_galleryResNextRect,
+				 overlay::util::ModuleTextW("Rebuild.Resolution"), m_rebuildDraft.ResolutionLabel());
+			cycleRow(m_galleryBitratePrevRect, m_galleryBitrateNextRect,
+				 overlay::util::ModuleTextW("Rebuild.Quality"), m_rebuildDraft.QualityLabel());
+			cycleRow(m_galleryFpsPrevRect, m_galleryFpsNextRect, overlay::util::ModuleTextW("Rebuild.Fps"),
+				 m_rebuildDraft.FpsLabel());
+			if (isGif) {
+				wchar_t gifExtra[64];
+				swprintf(gifExtra, 64, L"%d colors · dither %d", m_rebuildDraft.gifColors,
+					 m_rebuildDraft.gifDither);
+				RenderText(gifExtra,
+					   RECT{exportBlockRect.left + pad, contentTop, exportBlockRect.right - pad,
+						contentTop + 16},
+					   8.0f, DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(0.75f, 0.75f, 0.8f),
+					   DWRITE_TEXT_ALIGNMENT_LEADING);
+				contentTop += 18;
+			}
+		}
+
+		m_exportTrackKeepRects.clear();
+		if (trackCount > 0) {
+			contentTop += sectionGap;
+			for (size_t i = 0; i < trackCount; i++) {
+				const int rowTop = contentTop + static_cast<int>(i) * trackRowH;
+				const int cbSize = 14;
+				RECT keepRect = {exportBlockRect.left + pad, rowTop,
+						 exportBlockRect.left + pad + cbSize, rowTop + trackRowH};
+				m_exportTrackKeepRects.push_back(keepRect);
+				DrawRoundedRectangle(keepRect, 3.0f, D2D1::ColorF(0.2f, 0.2f, 0.25f, 1.0f));
+				if (i < m_exportTrackKeep.size() && m_exportTrackKeep[i]) {
+					RECT checkR = {keepRect.left + 2, keepRect.top + 3, keepRect.right - 2,
+						       keepRect.bottom - 3};
+					DrawRoundedRectangle(checkR, 2.0f, AccentMuted());
+				}
+				RECT labelRect = {exportBlockRect.left + pad + cbSize + 6, rowTop,
+						  exportBlockRect.right - pad, rowTop + trackRowH};
+				RenderText(i < m_exportTrackLabels.size() ? m_exportTrackLabels[i] : L"", labelRect,
+					   9.0f, DWRITE_FONT_WEIGHT_NORMAL, D2D1::ColorF(0.9f, 0.9f, 0.9f),
+					   DWRITE_TEXT_ALIGNMENT_LEADING);
+			}
+			contentTop += static_cast<int>(trackCount) * trackRowH;
+		}
+
+		m_galleryExportConfirmRect = {exportBlockRect.left + pad, exportBlockRect.bottom - pad - row3H,
+					      exportBlockRect.right - pad, exportBlockRect.bottom - pad};
 		DrawRoundedRectangle(m_galleryExportConfirmRect, 6.0f, AccentSelected());
-		RenderText(overlay::util::ModuleTextW("Save"), m_galleryExportConfirmRect, 11.0f, DWRITE_FONT_WEIGHT_NORMAL,
+		RenderText(m_exportSettingsPendingStart ? overlay::util::ModuleTextW("Export.Start")
+							  : overlay::util::ModuleTextW("Export.AddToQueue"),
+			   m_galleryExportConfirmRect, 11.0f, DWRITE_FONT_WEIGHT_NORMAL,
 			   D2D1::ColorF(1.0f, 1.0f, 1.0f));
+		m_galleryCompressRect = RECT{0, 0, 0, 0};
 	} else {
 		m_galleryCompressRect = RECT{0, 0, 0, 0};
 		m_galleryExportPanelRect = RECT{0, 0, 0, 0};
 		m_galleryQualityPrevRect = RECT{0, 0, 0, 0};
 		m_galleryQualityNextRect = RECT{0, 0, 0, 0};
 		m_galleryExportConfirmRect = RECT{0, 0, 0, 0};
+		m_galleryRebuildModeCopyRect = RECT{0, 0, 0, 0};
+		m_galleryRebuildModeReencodeRect = RECT{0, 0, 0, 0};
+		m_galleryQueueModeSeparateRect = RECT{0, 0, 0, 0};
+		m_galleryQueueModeMergeRect = RECT{0, 0, 0, 0};
+		m_galleryPresetPrevRect = RECT{0, 0, 0, 0};
+		m_galleryPresetNextRect = RECT{0, 0, 0, 0};
+		m_galleryPresetSaveRect = RECT{0, 0, 0, 0};
+		m_galleryPresetSaveAsRect = RECT{0, 0, 0, 0};
+		m_galleryPresetDeleteRect = RECT{0, 0, 0, 0};
+		m_galleryFormatPrevRect = m_galleryFormatNextRect = RECT{0, 0, 0, 0};
+		m_galleryResPrevRect = m_galleryResNextRect = RECT{0, 0, 0, 0};
+		m_galleryBitratePrevRect = m_galleryBitrateNextRect = RECT{0, 0, 0, 0};
+		m_galleryFpsPrevRect = m_galleryFpsNextRect = RECT{0, 0, 0, 0};
 	}
 
 	std::wstring status = L"";
-	OverlayTrimmer::Status trimStatus = m_trimmer.GetStatus();
-	if (trimStatus == OverlayTrimmer::Status::Trimming) {
+	if (m_exportInfraReady && m_exportQueue.IsBusy()) {
 		status = overlay::util::ModuleTextW("Processing");
-	} else if (trimStatus == OverlayTrimmer::Status::Success) {
-		status = overlay::util::ModuleTextW("Done");
-	} else if (trimStatus == OverlayTrimmer::Status::Error) {
-		status = overlay::util::ModuleTextW("Failed");
 	}
 	if (status.empty() && m_videoPlayer.IsDurationScanActive()) {
 		status = overlay::util::ModuleTextW("ScanningDuration");
@@ -3886,9 +4507,6 @@ void OverlayRenderer::HandleGalleryKey(int vkCode, int mods)
 		return;
 	}
 	if (m_gallerySelectedIndex < 0) {
-		return;
-	}
-	if (m_trimmer.GetStatus() == OverlayTrimmer::Status::Trimming) {
 		return;
 	}
 	int vk, m;
@@ -4383,6 +5001,8 @@ void OverlayRenderer::LoadSettingsWorkingValues()
 		m_setClipShow[i] = getBoolDef(showKey.c_str(), true);
 	}
 	m_setGalleryInOverlay = getBoolDef("gallery_in_overlay", true);
+	m_setReturnHomeOnHide = getBoolDef("return_home_on_hide", false);
+	m_setExportMaxParallel = ClampInt(getIntDef("gallery_export_max_parallel", 1), 1, 4);
 	m_setCaptureFocus = getBoolDef("capture_focus", true);
 	m_setToastsEnabled = getBoolDef("toasts_enabled", true);
 	m_setToastVideoSaved = getBoolDef("toast_video_saved", true);
@@ -4448,7 +5068,14 @@ void OverlayRenderer::PersistSettingsWorkingValues()
 		obs_data_set_bool(d, ("clip_slot_" + std::to_string(i) + "_show").c_str(), m_setClipShow[i]);
 	}
 	obs_data_set_bool(d, "gallery_in_overlay", m_setGalleryInOverlay);
+	obs_data_set_bool(d, "return_home_on_hide", m_setReturnHomeOnHide);
+	obs_data_set_int(d, "gallery_export_max_parallel", m_setExportMaxParallel);
 	obs_data_set_bool(d, "capture_focus", m_setCaptureFocus);
+	if (m_exportInfraReady) {
+		m_rebuildPresets.maxParallel = m_setExportMaxParallel;
+		m_exportQueue.SetMaxParallel(m_setExportMaxParallel);
+		m_rebuildPresets.Save(d);
+	}
 	obs_data_set_bool(d, "toasts_enabled", m_setToastsEnabled);
 	obs_data_set_bool(d, "toast_video_saved", m_setToastVideoSaved);
 	obs_data_set_bool(d, "toast_open_hint", m_setToastOpenHint);
@@ -4651,6 +5278,7 @@ void OverlayRenderer::CloseSettings()
 	m_autoHideEnabled = m_setAutoHideEnabled;
 	m_autoHideSeconds = ClampInt(m_setAutoHideSeconds, 1, 3600);
 	m_galleryEnabled = m_setGalleryInOverlay;
+	m_returnHomeOnHide = m_setReturnHomeOnHide;
 	m_captureFocus = m_setCaptureFocus;
 	m_windowManager.SetAllowActivate(m_setCaptureFocus);
 
@@ -4971,7 +5599,11 @@ void OverlayRenderer::RenderSettingsPanel()
 			   SettingsField::AutoHideSeconds);
 		checkboxRow(overlay::util::ModuleTextW("Gallery.InOverlay"), m_setGalleryInOverlay,
 			    SettingsField::GalleryInOverlay);
+		checkboxRow(overlay::util::ModuleTextW("ReturnHomeOnHide"), m_setReturnHomeOnHide,
+			    SettingsField::ReturnHomeOnHide);
 		pathRow();
+		stepperRow(overlay::util::ModuleTextW("Export.MaxParallel"), std::to_wstring(m_setExportMaxParallel),
+			   SettingsField::ExportMaxParallel);
 		checkboxRow(overlay::util::ModuleTextW("CaptureFocus"), m_setCaptureFocus, SettingsField::CaptureFocus);
 		break;
 	case SettingsPage::Appearance:
@@ -5605,6 +6237,10 @@ void OverlayRenderer::HandleSettingsClick(int x, int y)
 		case SettingsField::GalleryInOverlay:
 			m_setGalleryInOverlay = !m_setGalleryInOverlay;
 			break;
+		case SettingsField::ReturnHomeOnHide:
+			m_setReturnHomeOnHide = !m_setReturnHomeOnHide;
+			m_returnHomeOnHide = m_setReturnHomeOnHide;
+			break;
 		case SettingsField::CaptureFocus:
 			m_setCaptureFocus = !m_setCaptureFocus;
 			m_captureFocus = m_setCaptureFocus;
@@ -5698,6 +6334,13 @@ void OverlayRenderer::HandleSettingsClick(int x, int y)
 		case SettingsField::ToastDurationSec:
 			m_setToastDurationSec = ClampInt(m_setToastDurationSec + dir, 2, 60);
 			ApplyToastOptions();
+			break;
+		case SettingsField::ExportMaxParallel:
+			m_setExportMaxParallel = ClampInt(m_setExportMaxParallel + dir, 1, 4);
+			EnsureExportInfrastructure();
+			m_rebuildPresets.maxParallel = m_setExportMaxParallel;
+			m_exportQueue.SetMaxParallel(m_setExportMaxParallel);
+			PersistRebuildPresets();
 			break;
 		case SettingsField::ToastHotkeysScope:
 			m_setToastHotkeysScope = (m_setToastHotkeysScope + dir + 2) % 2;
@@ -6009,6 +6652,12 @@ bool OverlayRenderer::DeleteGallerySelectedVideo()
 	if (!item || item->type != GalleryItem::Type::Video) {
 		return false;
 	}
+	EnsureExportInfrastructure();
+	if (m_exportQueue.IsPathLocked(item->path)) {
+		MessageBoxW(m_windowManager.GetHWND(), overlay::util::ModuleTextW("Export.FileBusy").c_str(),
+			    overlay::util::ModuleTextW("DeleteFile").c_str(), MB_OK | MB_ICONWARNING);
+		return false;
+	}
 	int ret = MessageBoxW(m_windowManager.GetHWND(), item->name.c_str(),
 			      overlay::util::ModuleTextW("DeleteFile").c_str(), MB_YESNO | MB_ICONQUESTION);
 	if (ret != IDYES) {
@@ -6043,6 +6692,12 @@ bool OverlayRenderer::RenameGalleryContextVideo()
 {
 	const GalleryItem *item = m_gallery.GetItem(m_galleryContextMenuIndex);
 	if (!item || item->type != GalleryItem::Type::Video) {
+		return false;
+	}
+	EnsureExportInfrastructure();
+	if (m_exportQueue.IsPathLocked(item->path)) {
+		MessageBoxW(m_windowManager.GetHWND(), overlay::util::ModuleTextW("Export.FileBusy").c_str(),
+			    overlay::util::ModuleTextW("Gallery.Ctx.Rename").c_str(), MB_OK | MB_ICONWARNING);
 		return false;
 	}
 
@@ -6159,9 +6814,177 @@ bool OverlayRenderer::ExecuteGalleryContextAction(int actionIndex)
 void OverlayRenderer::HandleGalleryClick(int x, int y)
 {
 	POINT pt = ClientToLayoutPoint(x, y);
-	if (m_trimmer.GetStatus() == OverlayTrimmer::Status::Trimming) {
-		if (IsPointInRect(pt, m_galleryExportCancelRect)) {
-			m_trimmer.RequestCancel();
+	EnsureExportInfrastructure();
+
+	// Export queue panel interactions (non-blocking).
+	if (IsPointInRect(pt, m_galleryQueueRect)) {
+		if (IsPointInRect(pt, m_galleryQueueStartRect)) {
+			if (m_exportQueue.IsBusy()) {
+				m_exportQueue.CancelBatch();
+				SyncExportQueueTimer();
+				Render();
+				return;
+			}
+			if (m_exportQueue.IsEmpty()) {
+				overlay_runtime_show_toast(
+					overlay::util::WideToUtf8(overlay::util::ModuleTextW("Export.QueueEmpty")).c_str(),
+					3000);
+				Render();
+				return;
+			}
+			// Shared export settings for the whole queue — ask once before Start.
+			SyncExportQueueFolder();
+			m_editingQueueJobId.clear();
+			m_rebuildDraft = m_exportQueue.GetBatchPreset();
+			if (m_rebuildDraft.id.empty())
+				m_rebuildDraft = m_rebuildPresets.GetSelectedOrDefault();
+			ApplyDraftTracksToExportUi();
+			m_exportSettingsPendingStart = true;
+			m_galleryAudioTrackSubmenuOpen = false;
+			m_galleryExportSubmenuOpen = true;
+			Render();
+			return;
+		}
+		if (IsPointInRect(pt, m_galleryQueueClearRect)) {
+			if (!m_exportQueue.IsEmpty()) {
+				m_exportQueue.ClearAll();
+				m_editingQueueJobId.clear();
+				overlay_runtime_show_toast(
+					overlay::util::WideToUtf8(overlay::util::ModuleTextW("Export.QueueCleared")).c_str(),
+					3000);
+				Render();
+			}
+			return;
+		}
+		if (IsPointInRect(pt, m_galleryQueueOpenFolderRect)) {
+			std::wstring folder;
+			if (m_exportQueue.AllOutputsSameFolder(folder) && !folder.empty())
+				ShellExecuteW(NULL, L"open", folder.c_str(), NULL, NULL, SW_SHOWDEFAULT);
+			return;
+		}
+		for (size_t i = 0; i < m_queueItemIds.size(); i++) {
+			const std::string &id = m_queueItemIds[i];
+			if (i < m_queueUpRects.size() && IsPointInRect(pt, m_queueUpRects[i])) {
+				m_exportQueue.Reorder(id, static_cast<int>(i) - 1);
+				Render();
+				return;
+			}
+			if (i < m_queueDownRects.size() && IsPointInRect(pt, m_queueDownRects[i])) {
+				m_exportQueue.Reorder(id, static_cast<int>(i) + 1);
+				Render();
+				return;
+			}
+			if (i < m_queueCancelRects.size() && IsPointInRect(pt, m_queueCancelRects[i])) {
+				m_exportQueue.CancelJob(id);
+				Render();
+				return;
+			}
+			if (i < m_queueRemoveRects.size() && IsPointInRect(pt, m_queueRemoveRects[i])) {
+				if (m_editingQueueJobId == id)
+					m_editingQueueJobId.clear();
+				m_exportQueue.RemoveJob(id);
+				Render();
+				return;
+			}
+			if (i < m_queueRetryRects.size() && IsPointInRect(pt, m_queueRetryRects[i])) {
+				m_exportQueue.Retry(id);
+				Render();
+				return;
+			}
+			if (i < m_queueRenameRects.size() && IsPointInRect(pt, m_queueRenameRects[i])) {
+				for (const auto &job : m_exportQueue.GetJobs()) {
+					if (job.id != id || job.status == ExportJobStatus::Running)
+						continue;
+					HWND hwnd = m_windowManager.GetHWND();
+					std::wstring newName = job.displayName;
+					if (!PromptTextInput(hwnd, overlay::util::ModuleTextW("Export.Rename"), newName,
+							     true))
+						return;
+					while (!newName.empty() && (newName.front() == L' ' || newName.front() == L'\t'))
+						newName.erase(newName.begin());
+					while (!newName.empty() && (newName.back() == L' ' || newName.back() == L'\t'))
+						newName.pop_back();
+					if (newName.empty()) {
+						MessageBoxW(hwnd,
+							    overlay::util::ModuleTextW("Gallery.Ctx.RenameInvalid").c_str(),
+							    overlay::util::ModuleTextW("Export.Rename").c_str(),
+							    MB_OK | MB_ICONWARNING);
+						return;
+					}
+					const wchar_t *invalid = L"<>:\"/\\|?*";
+					if (newName.find_first_of(invalid) != std::wstring::npos) {
+						MessageBoxW(hwnd,
+							    overlay::util::ModuleTextW("Gallery.Ctx.RenameInvalid").c_str(),
+							    overlay::util::ModuleTextW("Export.Rename").c_str(),
+							    MB_OK | MB_ICONWARNING);
+						return;
+					}
+					m_exportQueue.RenameJob(id, newName);
+					Render();
+					return;
+				}
+				return;
+			}
+			if (i < m_queueOpenRects.size() && IsPointInRect(pt, m_queueOpenRects[i])) {
+				for (const auto &job : m_exportQueue.GetJobs()) {
+					if (job.id == id && !job.outputFolder.empty()) {
+						ShellExecuteW(NULL, L"open", job.outputFolder.c_str(), NULL, NULL,
+							      SW_SHOWDEFAULT);
+						break;
+					}
+				}
+				return;
+			}
+			if (i < m_queueEditRects.size() && IsPointInRect(pt, m_queueEditRects[i])) {
+				for (const auto &job : m_exportQueue.GetJobs()) {
+					if (job.id == id && job.status != ExportJobStatus::Running) {
+						m_editingQueueJobId = id;
+						m_rebuildDraft = job.preset;
+						// Select source clip and restore its queued trim onto the timeline.
+						if (!job.inputPath.empty()) {
+							const auto &items = m_gallery.GetItems();
+							int found = -1;
+							for (size_t gi = 0; gi < items.size(); gi++) {
+								if (items[gi].type == GalleryItem::Type::Video &&
+								    _wcsicmp(items[gi].path.c_str(), job.inputPath.c_str()) ==
+									    0) {
+									found = static_cast<int>(gi);
+									break;
+								}
+							}
+							if (found >= 0)
+								m_gallerySelectedIndex = found;
+							const GalleryItem *sel = m_gallery.GetItem(m_gallerySelectedIndex);
+							if (!sel || _wcsicmp(sel->path.c_str(), job.inputPath.c_str()) != 0)
+								m_videoPlayer.Open(job.inputPath);
+							else if (_wcsicmp(m_videoPlayer.GetOpenPath().c_str(),
+									  job.inputPath.c_str()) != 0)
+								m_videoPlayer.Open(job.inputPath);
+						}
+						const double mediaDur = m_videoPlayer.GetDuration();
+						m_galleryTrimIn = std::max(0.0, job.startSeconds);
+						if (job.endSeconds > job.startSeconds)
+							m_galleryTrimOut = job.endSeconds;
+						else
+							m_galleryTrimOut = mediaDur > 0.0 ? mediaDur : (job.startSeconds + 1.0);
+						if (mediaDur > 0.0 && m_galleryTrimOut > mediaDur)
+							m_galleryTrimOut = mediaDur;
+						m_galleryTrimUserSet = true;
+						m_videoPlayer.SetTrimIn(m_galleryTrimIn);
+						m_videoPlayer.SetTrimOut(m_galleryTrimOut);
+						m_exportSettingsPendingStart = false;
+						m_galleryExportSubmenuOpen = false;
+						overlay_runtime_show_toast(
+							overlay::util::WideToUtf8(
+								overlay::util::ModuleTextW("Export.EditTrimHint"))
+								.c_str(),
+							3500);
+						Render();
+						return;
+					}
+				}
+				return;
+			}
 		}
 		return;
 	}
@@ -6216,99 +7039,264 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 
 	if (m_galleryExportSubmenuOpen) {
 		if (IsPointInRect(pt, m_galleryExportPanelRect)) {
+			// Queue Separate/Merge — independent of rebuild preset.
+			if (IsPointInRect(pt, m_galleryQueueModeSeparateRect)) {
+				m_exportQueue.SetMode(ExportQueueMode::Separate);
+				Render();
+				return;
+			}
+			if (IsPointInRect(pt, m_galleryQueueModeMergeRect)) {
+				m_exportQueue.SetMode(ExportQueueMode::Merge);
+				Render();
+				return;
+			}
 			for (size_t i = 0; i < m_exportTrackKeepRects.size(); i++) {
 				if (IsPointInRect(pt, m_exportTrackKeepRects[i]) && i < m_exportTrackKeep.size()) {
 					m_exportTrackKeep[i] = !m_exportTrackKeep[i];
+					CaptureExportTracksToDraft();
 					Render();
 					return;
 				}
 			}
-			if (IsPointInRect(pt, m_galleryExportConfirmRect)) {
-				const GalleryItem *item = m_gallery.GetItem(m_gallerySelectedIndex);
-				if (item && item->type == GalleryItem::Type::Video) {
-					double start = m_galleryTrimIn;
-					double end = m_galleryTrimOut;
-					if (end <= start) {
-						end = start + 1.0;
-					}
-					std::string recordingPath = m_stateManager.GetRecordingPath();
-					std::wstring sharedFolder = BuildGalleryExportFolder(recordingPath);
-					if (!sharedFolder.empty()) {
-						if (!CreateDirectoryW(sharedFolder.c_str(), NULL)) {
-							DWORD mkdirErr = GetLastError();
-							if (mkdirErr != ERROR_ALREADY_EXISTS) {
-								obs_log(LOG_ERROR,
-									"Gallery export: failed to create output folder '%s' (error %lu)",
-									overlay::util::WideToUtf8(sharedFolder).c_str(), mkdirErr);
-							}
-						}
-						std::wstring sharePath =
-							m_galleryShareCompress
-								? BuildSharedOutputPathExt(sharedFolder, item->path, L"_share",
-											   L".mp4")
-								: BuildSharedOutputPath(sharedFolder, item->path, L"_share");
-						m_sharedFolderToOpenOnSuccess = sharedFolder;
-						std::vector<int> streamIndicesToKeep;
-						for (size_t i = 0; i < m_exportTrackStreamIndices.size(); i++) {
-							if (i < m_exportTrackKeep.size() && m_exportTrackKeep[i]) {
-								streamIndicesToKeep.push_back(m_exportTrackStreamIndices[i]);
-							}
-						}
-						m_videoPlayer.SetPlaying(false);
-						if (!m_trimmer.StartExport(item->path, sharePath, start, end, m_galleryShareCompress,
-									   m_galleryShareCrf, streamIndicesToKeep,
-									   /*customFfmpegArgs=*/L"",
-									   /*useCpuEncoder=*/true)) {
-							m_sharedFolderToOpenOnSuccess.clear();
-							obs_log(LOG_WARNING,
-								"Gallery export could not start: another export is already in progress");
-						}
-					} else {
-						obs_log(LOG_ERROR,
-							"Gallery export failed: export folder path is empty (configure gallery export path or recording directory)");
+			if (IsPointInRect(pt, m_galleryRebuildModeCopyRect)) {
+				m_rebuildDraft.mode = RebuildMode::Copy;
+				PersistRebuildPresets();
+				Render();
+				return;
+			}
+			if (IsPointInRect(pt, m_galleryRebuildModeReencodeRect)) {
+				m_rebuildDraft.mode = RebuildMode::Reencode;
+				PersistRebuildPresets();
+				Render();
+				return;
+			}
+			auto selectPresetDelta = [&](int delta) {
+				if (m_rebuildPresets.presets.empty())
+					return;
+				int idx = 0;
+				for (size_t i = 0; i < m_rebuildPresets.presets.size(); i++) {
+					if (m_rebuildPresets.presets[i].id == m_rebuildDraft.id) {
+						idx = static_cast<int>(i);
+						break;
 					}
 				}
+				idx = (idx + delta + static_cast<int>(m_rebuildPresets.presets.size())) %
+				      static_cast<int>(m_rebuildPresets.presets.size());
+				m_rebuildDraft = m_rebuildPresets.presets[static_cast<size_t>(idx)];
+				m_rebuildPresets.selectedId = m_rebuildDraft.id;
+				ApplyDraftTracksToExportUi();
+				PersistRebuildPresets();
+			};
+			auto cycleFormat = [&](int delta) {
+				int f = RebuildFormatToInt(m_rebuildDraft.format);
+				f = (f + delta + 3) % 3;
+				m_rebuildDraft.format = RebuildFormatFromInt(f);
+				if (m_rebuildDraft.format == RebuildOutputFormat::Gif && m_rebuildDraft.fps <= 0.5)
+					m_rebuildDraft.fps = 15.0;
+				if (m_rebuildDraft.format == RebuildOutputFormat::Gif && m_rebuildDraft.width <= 0)
+					m_rebuildDraft.width = 480;
+			};
+			auto cycleRes = [&](int delta) {
+				struct Res {
+					int w;
+					int h;
+				};
+				static const Res kRes[] = {{0, 0}, {1920, 1080}, {1280, 720}, {854, 480}, {640, 360}};
+				int idx = 0;
+				for (int i = 0; i < 5; i++) {
+					if (m_rebuildDraft.width == kRes[i].w) {
+						idx = i;
+						break;
+					}
+				}
+				idx = (idx + delta + 5) % 5;
+				m_rebuildDraft.width = kRes[idx].w;
+				m_rebuildDraft.height = kRes[idx].h;
+			};
+			auto cycleQuality = [&](int delta) {
+				if (m_rebuildDraft.format == RebuildOutputFormat::Gif) {
+					static const int kColors[] = {32, 64, 96, 128, 160, 192, 224, 256};
+					constexpr int n = 8;
+					int idx = 0;
+					for (int i = 0; i < n; i++) {
+						if (m_rebuildDraft.gifColors == kColors[i]) {
+							idx = i;
+							break;
+						}
+					}
+					idx = (idx + delta + n) % n;
+					m_rebuildDraft.gifColors = kColors[idx];
+					if (idx <= 1)
+						m_rebuildDraft.quality = RebuildQuality::Low;
+					else if (idx <= 3)
+						m_rebuildDraft.quality = RebuildQuality::Medium;
+					else if (idx <= 5)
+						m_rebuildDraft.quality = RebuildQuality::High;
+					else
+						m_rebuildDraft.quality = RebuildQuality::VeryHigh;
+					return;
+				}
+				static const int kCrf[] = {18, 20, 22, 23, 24, 26, 28, 30, 32, 35, 40};
+				constexpr int n = 11;
+				int idx = 6; // default near 28
+				int bestDist = 1000;
+				for (int i = 0; i < n; i++) {
+					const int d = std::abs(m_rebuildDraft.Crf() - kCrf[i]);
+					if (d < bestDist) {
+						bestDist = d;
+						idx = i;
+					}
+				}
+				idx = (idx + delta + n) % n;
+				m_rebuildDraft.SetCrf(kCrf[idx]);
+			};
+			auto cycleFps = [&](int delta) {
+				static const double kFps[] = {0.0, 60.0, 30.0, 24.0, 15.0, 12.0};
+				int idx = 0;
+				for (int i = 0; i < 6; i++) {
+					if (std::abs(m_rebuildDraft.fps - kFps[i]) < 0.1) {
+						idx = i;
+						break;
+					}
+				}
+				idx = (idx + delta + 6) % 6;
+				m_rebuildDraft.fps = kFps[idx];
+			};
+			if (IsPointInRect(pt, m_galleryPresetPrevRect)) {
+				selectPresetDelta(-1);
+				Render();
+				return;
+			}
+			if (IsPointInRect(pt, m_galleryPresetNextRect)) {
+				selectPresetDelta(1);
+				Render();
+				return;
+			}
+			if (IsPointInRect(pt, m_galleryPresetSaveRect)) {
+				HWND hwnd = m_windowManager.GetHWND();
+				std::wstring name = m_rebuildDraft.name;
+				if (!PromptPresetName(hwnd, name)) {
+					Render();
+					return;
+				}
+				m_rebuildDraft.name = name;
+				CaptureExportTracksToDraft();
+				if (m_rebuildDraft.id.empty())
+					m_rebuildDraft.id = m_rebuildPresets.GenerateId();
+				m_rebuildPresets.Upsert(m_rebuildDraft);
+				m_rebuildPresets.selectedId = m_rebuildDraft.id;
+				PersistRebuildPresets();
+				Render();
+				return;
+			}
+			if (IsPointInRect(pt, m_galleryPresetSaveAsRect)) {
+				HWND hwnd = m_windowManager.GetHWND();
+				std::wstring name = m_rebuildDraft.name;
+				if (!name.empty())
+					name += L" copy";
+				if (!PromptPresetName(hwnd, name)) {
+					Render();
+					return;
+				}
+				m_rebuildDraft.name = name;
+				CaptureExportTracksToDraft();
+				m_rebuildDraft.id = m_rebuildPresets.GenerateId();
+				m_rebuildPresets.Upsert(m_rebuildDraft);
+				m_rebuildPresets.selectedId = m_rebuildDraft.id;
+				PersistRebuildPresets();
+				Render();
+				return;
+			}
+			if (IsPointInRect(pt, m_galleryPresetDeleteRect)) {
+				if (!m_rebuildDraft.id.empty()) {
+					m_rebuildPresets.Remove(m_rebuildDraft.id);
+					m_rebuildDraft = m_rebuildPresets.GetSelectedOrDefault();
+					PersistRebuildPresets();
+				}
+				Render();
+				return;
+			}
+			if (IsPointInRect(pt, m_galleryFormatPrevRect)) {
+				cycleFormat(-1);
+				PersistRebuildPresets();
+				Render();
+				return;
+			}
+			if (IsPointInRect(pt, m_galleryFormatNextRect)) {
+				cycleFormat(1);
+				PersistRebuildPresets();
+				Render();
+				return;
+			}
+			if (IsPointInRect(pt, m_galleryResPrevRect)) {
+				cycleRes(-1);
+				PersistRebuildPresets();
+				Render();
+				return;
+			}
+			if (IsPointInRect(pt, m_galleryResNextRect)) {
+				cycleRes(1);
+				PersistRebuildPresets();
+				Render();
+				return;
+			}
+			if (IsPointInRect(pt, m_galleryBitratePrevRect)) {
+				cycleQuality(-1);
+				PersistRebuildPresets();
+				Render();
+				return;
+			}
+			if (IsPointInRect(pt, m_galleryBitrateNextRect)) {
+				cycleQuality(1);
+				PersistRebuildPresets();
+				Render();
+				return;
+			}
+			if (IsPointInRect(pt, m_galleryFpsPrevRect)) {
+				cycleFps(-1);
+				PersistRebuildPresets();
+				Render();
+				return;
+			}
+			if (IsPointInRect(pt, m_galleryFpsNextRect)) {
+				cycleFps(1);
+				PersistRebuildPresets();
+				Render();
+				return;
+			}
+			if (IsPointInRect(pt, m_galleryExportConfirmRect)) {
+				CaptureExportTracksToDraft();
+				if (m_exportTrackStreamIndices.empty())
+					ApplyDraftTracksToExportUi();
+				bool anyKept = false;
+				for (size_t i = 0; i < m_exportTrackKeep.size(); i++) {
+					if (m_exportTrackKeep[i]) {
+						anyKept = true;
+						break;
+					}
+				}
+				if (!m_exportTrackStreamIndices.empty() && !anyKept) {
+					overlay_runtime_show_toast("Select at least one track to export", 3500);
+					return;
+				}
+				PersistRebuildPresets();
+				m_exportQueue.SetBatchPreset(m_rebuildDraft);
 				m_galleryExportSubmenuOpen = false;
+				if (m_exportSettingsPendingStart) {
+					m_exportSettingsPendingStart = false;
+					SyncExportQueueFolder();
+					m_exportQueue.SetMaxParallel(m_setExportMaxParallel);
+					m_exportQueue.Start();
+					SyncExportQueueTimer();
+				}
 				Render();
 				return;
 			}
-			if (IsPointInRect(pt, m_galleryCompressRect)) {
-				m_galleryShareCompress = !m_galleryShareCompress;
-				overlay_settings_ensure();
-				obs_data_set_bool(saved_settings_data, "gallery_share_compress", m_galleryShareCompress);
-				overlay_settings_save();
-				Render();
-				return;
-			}
-			if (IsPointInRect(pt, m_galleryQualityPrevRect)) {
-				m_galleryShareCompressQuality =
-					std::max(kCompressQualityStrongCompression, m_galleryShareCompressQuality - 1);
-				m_galleryShareCrf = CrfForCompressQuality(m_galleryShareCompressQuality);
-				overlay_settings_ensure();
-				obs_data_set_int(saved_settings_data, "gallery_share_compress_quality",
-						 m_galleryShareCompressQuality);
-				obs_data_set_int(saved_settings_data, "gallery_share_crf", m_galleryShareCrf);
-				overlay_settings_save();
-				Render();
-				return;
-			}
-			if (IsPointInRect(pt, m_galleryQualityNextRect)) {
-				m_galleryShareCompressQuality =
-					std::min(kCompressQualityQuality, m_galleryShareCompressQuality + 1);
-				m_galleryShareCrf = CrfForCompressQuality(m_galleryShareCompressQuality);
-				overlay_settings_ensure();
-				obs_data_set_int(saved_settings_data, "gallery_share_compress_quality",
-						 m_galleryShareCompressQuality);
-				obs_data_set_int(saved_settings_data, "gallery_share_crf", m_galleryShareCrf);
-				overlay_settings_save();
-				Render();
-				return;
-			}
-			// Consume clicks on the popup background so they do not reach controls below.
 			return;
 		}
 
 		m_galleryExportSubmenuOpen = false;
+		m_exportSettingsPendingStart = false;
 		Render();
 		return;
 	}
@@ -6429,11 +7417,17 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 					m_galleryAudioTrackSubmenuOpen = false;
 				}
 			} else {
+				if (m_gallerySelectedIndex == itemIndex) {
+					Render();
+					return;
+				}
+				m_editingQueueJobId.clear();
 				m_gallerySelectedIndex = itemIndex;
 				m_videoPlayer.Open(item->path);
 				m_galleryTrimIn = 0.0;
 				m_galleryTrimOut = m_videoPlayer.GetDuration();
 				m_galleryTrimUserSet = false;
+				ApplyGalleryWindowSize();
 			}
 			Render();
 		}
@@ -6454,6 +7448,23 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 		m_galleryTrimIn = m_videoPlayer.GetCurrentTime();
 		m_videoPlayer.SetTrimIn(m_galleryTrimIn);
 		m_galleryTrimUserSet = true;
+		if (!m_editingQueueJobId.empty()) {
+			for (const auto &job : m_exportQueue.GetJobs()) {
+				if (job.id != m_editingQueueJobId)
+					continue;
+				ExportQueueJob updated = job;
+				updated.startSeconds = m_galleryTrimIn;
+				updated.endSeconds = m_galleryTrimOut;
+				if (updated.endSeconds <= updated.startSeconds)
+					updated.endSeconds = updated.startSeconds + 1.0;
+				const double mediaDur = m_videoPlayer.GetDuration();
+				if (updated.startSeconds <= 0.001 && mediaDur > 0.0 &&
+				    updated.endSeconds >= mediaDur - 0.15)
+					updated.endSeconds = 0.0;
+				m_exportQueue.UpdateJob(m_editingQueueJobId, updated);
+				break;
+			}
+		}
 		Render();
 		return;
 	}
@@ -6462,6 +7473,23 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 		m_galleryTrimOut = m_videoPlayer.GetCurrentTime();
 		m_videoPlayer.SetTrimOut(m_galleryTrimOut);
 		m_galleryTrimUserSet = true;
+		if (!m_editingQueueJobId.empty()) {
+			for (const auto &job : m_exportQueue.GetJobs()) {
+				if (job.id != m_editingQueueJobId)
+					continue;
+				ExportQueueJob updated = job;
+				updated.startSeconds = m_galleryTrimIn;
+				updated.endSeconds = m_galleryTrimOut;
+				if (updated.endSeconds <= updated.startSeconds)
+					updated.endSeconds = updated.startSeconds + 1.0;
+				const double mediaDur = m_videoPlayer.GetDuration();
+				if (updated.startSeconds <= 0.001 && mediaDur > 0.0 &&
+				    updated.endSeconds >= mediaDur - 0.15)
+					updated.endSeconds = 0.0;
+				m_exportQueue.UpdateJob(m_editingQueueJobId, updated);
+				break;
+			}
+		}
 		Render();
 		return;
 	}
@@ -6472,33 +7500,38 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 			return;
 		}
 		CloseGalleryContextMenu();
-		m_galleryExportSubmenuOpen = true;
 		m_galleryAudioTrackSubmenuOpen = false;
-		m_exportTrackStreamIndices.clear();
-		m_exportTrackKeep.clear();
-		m_exportTrackLabels.clear();
-		int trackNum = 0;
-		int videoIdx = m_videoPlayer.GetVideoStreamIndex();
-		if (videoIdx >= 0) {
-			trackNum++;
-			m_exportTrackStreamIndices.push_back(videoIdx);
-			m_exportTrackKeep.push_back(true);
-			std::wstring videoName = WideFromUtf8(m_videoPlayer.GetVideoStreamName());
-			m_exportTrackLabels.push_back(std::to_wstring(trackNum) + L": " +
-						      (videoName.empty() ? overlay::util::ModuleTextW("Export.Video") : videoName));
+		m_exportSettingsPendingStart = false;
+		m_galleryExportSubmenuOpen = false;
+
+		if (!m_editingQueueJobId.empty()) {
+			bool updatedOk = false;
+			for (const auto &job : m_exportQueue.GetJobs()) {
+				if (job.id != m_editingQueueJobId)
+					continue;
+				ExportQueueJob updated = job;
+				updated.startSeconds = m_galleryTrimIn;
+				updated.endSeconds = m_galleryTrimOut;
+				if (updated.endSeconds <= updated.startSeconds)
+					updated.endSeconds = updated.startSeconds + 1.0;
+				const double mediaDur = m_videoPlayer.GetDuration();
+				if (updated.startSeconds <= 0.001 && mediaDur > 0.0 &&
+				    updated.endSeconds >= mediaDur - 0.15)
+					updated.endSeconds = 0.0;
+				updatedOk = m_exportQueue.UpdateJob(m_editingQueueJobId, updated);
+				break;
+			}
+			m_editingQueueJobId.clear();
+			overlay_runtime_show_toast(
+				overlay::util::WideToUtf8(overlay::util::ModuleTextW(
+					updatedOk ? "Export.TrimUpdated" : "Export.EditTrimHint"))
+					.c_str(),
+				3000);
+			Render();
+			return;
 		}
-		int audioCount = m_videoPlayer.GetAudioTrackCount();
-		for (int i = 0; i < audioCount; i++) {
-			OverlayVideoPlayer::AudioTrackInfo info;
-			m_videoPlayer.GetAudioTrackInfo(i, info);
-			trackNum++;
-			m_exportTrackStreamIndices.push_back(info.streamIndex);
-			m_exportTrackKeep.push_back(true);
-			std::wstring name = WideFromUtf8(info.name);
-			m_exportTrackLabels.push_back(std::to_wstring(trackNum) + L": " +
-						      (name.empty() ? overlay::util::ModuleTextW("Export.Audio") + L" " + std::to_wstring(i + 1)
-								    : name));
-		}
+
+		AddSelectedClipToExportQueue();
 		Render();
 		return;
 	}
@@ -6515,9 +7548,6 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 void OverlayRenderer::HandleGalleryRightClick(int x, int y)
 {
 	POINT pt = ClientToLayoutPoint(x, y);
-	if (m_trimmer.GetStatus() == OverlayTrimmer::Status::Trimming) {
-		return;
-	}
 
 	if (m_galleryContextMenuOpen && !IsPointInRect(pt, m_galleryContextMenuRect)) {
 		CloseGalleryContextMenu();

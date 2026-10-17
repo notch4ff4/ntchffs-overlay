@@ -13,9 +13,12 @@
 #include "overlay-gallery.h"
 #include "overlay-video-player.h"
 #include "overlay-trimmer.h"
+#include "overlay-export-queue.h"
+#include "overlay-rebuild-preset.h"
 #include "overlay-icon-frames.h"
 #include <unordered_map>
 #include <vector>
+#include <string>
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
@@ -84,6 +87,15 @@ private:
 	void RenderGallery();
 	void RenderGalleryList(const RECT &listRect, int itemHeight, int itemsPerPage);
 	void RenderGalleryControls(const RECT &controlsRect);
+	void RenderGalleryExportQueue(const RECT &queueRect);
+	void EnsureExportInfrastructure();
+	void SyncExportQueueFolder();
+	bool AddSelectedClipToExportQueue();
+	void PersistRebuildPresets();
+	// Fills export track checkboxes from the open player; optional keep filter by stream index.
+	void PopulateExportTrackChoices(const std::vector<int> *keepStreamIndices = nullptr);
+	void CaptureExportTracksToDraft();
+	void ApplyDraftTracksToExportUi();
 	void OpenGallery();
 	void CloseGallery();
 	void ApplyGalleryWindowSize();
@@ -195,6 +207,7 @@ private:
 	HoverTarget m_hoverTarget;
 
 	bool m_galleryEnabled;
+	bool m_returnHomeOnHide;
 	bool m_galleryOpen;
 	int m_galleryPage;
 	int m_gallerySelectedIndex;
@@ -205,6 +218,14 @@ private:
 	// Preset 0..2 maps to CRF for ffmpeg; kept for backward compatibility with older CRF-only settings.
 	int m_galleryShareCompressQuality;
 	int m_galleryShareCrf;
+	RebuildPresetStore m_rebuildPresets;
+	RebuildPreset m_rebuildDraft;
+	OverlayExportQueue m_exportQueue;
+	bool m_exportInfraReady = false;
+	std::string m_editingQueueJobId;
+	// Rebuild sheet opened from Export — Confirm applies shared settings and starts the queue.
+	bool m_exportSettingsPendingStart = false;
+	int m_queueScroll = 0;
 	bool m_galleryMuted;
 	int m_galleryVolume;
 	bool m_galleryExportSubmenuOpen;
@@ -257,10 +278,42 @@ private:
 	bool m_galleryAudioTrackSubmenuOpen;
 	std::vector<RECT> m_galleryAudioTrackOptionRects;
 	RECT m_galleryExportCancelRect;
+	RECT m_galleryQueueRect;
+	RECT m_galleryQueueStartRect;
+	RECT m_galleryQueueClearRect;
+	RECT m_galleryQueueModeSeparateRect;
+	RECT m_galleryQueueModeMergeRect;
+	RECT m_galleryQueueOpenFolderRect;
+	RECT m_galleryRebuildModeCopyRect;
+	RECT m_galleryRebuildModeReencodeRect;
+	RECT m_galleryPresetPrevRect;
+	RECT m_galleryPresetNextRect;
+	RECT m_galleryPresetSaveRect;
+	RECT m_galleryPresetSaveAsRect;
+	RECT m_galleryPresetDeleteRect;
+	RECT m_galleryFormatPrevRect;
+	RECT m_galleryFormatNextRect;
+	RECT m_galleryResPrevRect;
+	RECT m_galleryResNextRect;
+	RECT m_galleryBitratePrevRect;
+	RECT m_galleryBitrateNextRect;
+	RECT m_galleryFpsPrevRect;
+	RECT m_galleryFpsNextRect;
+	std::vector<RECT> m_queueItemRects;
+	std::vector<RECT> m_queueCancelRects;
+	std::vector<RECT> m_queueRemoveRects;
+	std::vector<RECT> m_queueRetryRects;
+	std::vector<RECT> m_queueEditRects;
+	std::vector<RECT> m_queueRenameRects;
+	std::vector<RECT> m_queueOpenRects;
+	std::vector<RECT> m_queueUpRects;
+	std::vector<RECT> m_queueDownRects;
+	std::vector<std::string> m_queueItemIds;
 	std::vector<int> m_exportTrackStreamIndices;
 	std::vector<bool> m_exportTrackKeep;
 	std::vector<RECT> m_exportTrackKeepRects;
 	std::vector<std::wstring> m_exportTrackLabels;
+	int m_setExportMaxParallel = 1;
 
 	// --- Settings panel state ---
 	enum class SettingsPage {
@@ -307,6 +360,7 @@ private:
 		SmartReplayMode,
 		SmartReplayClipIgnoreTrim,
 		GalleryInOverlay,
+		ReturnHomeOnHide,
 		CaptureFocus,
 		ToastsEnabled,
 		ToastVideoSaved,
@@ -329,6 +383,7 @@ private:
 		IndicatorsScale,
 		ToastLowDiskGb,
 		ToastDurationSec,
+		ExportMaxParallel,
 		ClipBufferLength,
 		ClipDuration0,
 		ClipDuration1,
@@ -392,6 +447,7 @@ private:
 	int m_setSmartReplayMode;
 	bool m_setSmartReplayClipIgnoreTrim;
 	bool m_setGalleryInOverlay;
+	bool m_setReturnHomeOnHide;
 	bool m_setCaptureFocus;
 	bool m_setToastsEnabled;
 	bool m_setToastVideoSaved;
@@ -413,6 +469,8 @@ private:
 	void ApplyToastActionHotkeys();
 	void ApplyClipSaveHotkeys();
 	void PollClipSaveHotkeys();
+	void SyncExportQueueTimer();
+	void PollExportQueue();
 	void ApplyToastAccentColor();
 	void ApplyToastOptions();
 
@@ -438,7 +496,7 @@ private:
 	ID2D1PathGeometry *m_iconPlayGeometry;
 
 	// Index 0..11 matches icon type; loaded from embedded pack or data/icons/.
-	static const int ICON_CACHE_SIZE = 12;
+	static const int ICON_CACHE_SIZE = 13;
 	ID2D1Bitmap *m_iconBitmaps[ICON_CACHE_SIZE];
 	bool LoadIconBitmap(int iconType);
 	bool LoadIconFromResource(int iconType);
@@ -472,12 +530,17 @@ private:
 	POINT m_dimContentOffset;
 	int m_galleryContentWidth;
 	int m_galleryContentHeight;
+	// Last video size used to compute adaptive gallery window width.
+	int m_galleryLayoutSrcW = 0;
+	int m_galleryLayoutSrcH = 0;
 
 	// --- Timer ---
 	UINT_PTR m_updateTimer;
 	int m_updateIntervalMs;
 	// Separate from m_updateTimer so clip hotkeys work while the overlay is hidden.
 	UINT_PTR m_clipHotkeyTimer;
+	// Harvest export workers / fire completion toasts while the overlay is hidden.
+	UINT_PTR m_exportQueueTimer;
 	bool m_clipHotkeyWasDown[CLIP_SAVE_SLOT_COUNT];
 
 	void UpdateAutoHide();

@@ -49,6 +49,8 @@ public:
 	double GetDuration() const { return m_duration.load(); }
 	double GetCurrentTime() const { return m_currentTime.load(); }
 	double GetVideoFps() const { return m_videoFps; }
+	int GetSourceWidth() const { return m_sourceWidth; }
+	int GetSourceHeight() const { return m_sourceHeight; }
 	bool IsDurationScanActive() const { return false; }
 	void SetMuted(bool muted);
 	bool IsMuted() const { return m_muted.load(); }
