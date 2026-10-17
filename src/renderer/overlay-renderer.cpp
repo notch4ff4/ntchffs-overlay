@@ -267,6 +267,7 @@ OverlayRenderer::OverlayRenderer()
 	m_setCaptureFocus = true;
 	m_setToastsEnabled = true;
 	m_setToastVideoSaved = true;
+	m_setToastExport = true;
 	m_setToastOpenHint = true;
 	m_setToastLowDisk = true;
 	m_setToastLowDiskGb = 5;
@@ -1846,7 +1847,7 @@ bool OverlayRenderer::LoadIconBitmap(int iconType)
 						"icons/pause.png",
 						"icons/caret-line-left.png",
 						"icons/caret-line-right.png",
-						"icons/download-simple.png",
+						"icons/plus.png",
 						"icons/trash-simple.png",
 						"icons/speaker-high.png",
 						"icons/arrow-left.png",
@@ -2606,7 +2607,10 @@ void OverlayRenderer::EnsureExportInfrastructure()
 	m_setExportMaxParallel = m_rebuildPresets.maxParallel;
 	m_exportQueue.SetMaxParallel(m_setExportMaxParallel);
 	m_exportQueue.SetBatchPreset(m_rebuildDraft);
-	m_exportQueue.SetToastHandler([](const std::string &utf8) { overlay_runtime_show_toast(utf8.c_str(), 5000); });
+	m_exportQueue.SetToastHandler([this](const std::string &utf8) {
+		if (m_setToastExport)
+			overlay_runtime_show_toast(utf8.c_str(), 5000);
+	});
 	m_exportQueue.Load();
 	m_exportInfraReady = true;
 }
@@ -2741,8 +2745,10 @@ bool OverlayRenderer::AddSelectedClipToExportQueue()
 	job.preset = m_exportQueue.GetBatchPreset();
 	job.streamIndicesToKeep.clear();
 	m_exportQueue.Enqueue(job);
-	overlay_runtime_show_toast(
-		(std::string("Added to export queue: ") + overlay::util::WideToUtf8(job.displayName)).c_str(), 3500);
+	if (m_setToastExport)
+		overlay_runtime_show_toast(
+			(std::string("Added to export queue: ") + overlay::util::WideToUtf8(job.displayName)).c_str(),
+			3500);
 	return true;
 }
 
@@ -5006,6 +5012,7 @@ void OverlayRenderer::LoadSettingsWorkingValues()
 	m_setCaptureFocus = getBoolDef("capture_focus", true);
 	m_setToastsEnabled = getBoolDef("toasts_enabled", true);
 	m_setToastVideoSaved = getBoolDef("toast_video_saved", true);
+	m_setToastExport = getBoolDef("toast_export", true);
 	m_setToastOpenHint = getBoolDef("toast_open_hint", true);
 	m_setToastLowDisk = getBoolDef("toast_low_disk", true);
 	m_setToastLowDiskGb = ClampInt(getIntDef("toast_low_disk_gb", 5), 1, 100);
@@ -5078,6 +5085,7 @@ void OverlayRenderer::PersistSettingsWorkingValues()
 	}
 	obs_data_set_bool(d, "toasts_enabled", m_setToastsEnabled);
 	obs_data_set_bool(d, "toast_video_saved", m_setToastVideoSaved);
+	obs_data_set_bool(d, "toast_export", m_setToastExport);
 	obs_data_set_bool(d, "toast_open_hint", m_setToastOpenHint);
 	obs_data_set_bool(d, "toast_low_disk", m_setToastLowDisk);
 	obs_data_set_int(d, "toast_low_disk_gb", m_setToastLowDiskGb);
@@ -5883,6 +5891,8 @@ void OverlayRenderer::RenderSettingsPanel()
 			    SettingsField::ToastsEnabled);
 		checkboxRow(overlay::util::ModuleTextW("Notifications.VideoSaved"), m_setToastVideoSaved,
 			    SettingsField::ToastVideoSaved);
+		checkboxRow(overlay::util::ModuleTextW("Notifications.Export"), m_setToastExport,
+			    SettingsField::ToastExport);
 		checkboxRow(overlay::util::ModuleTextW("Notifications.OpenHint"), m_setToastOpenHint,
 			    SettingsField::ToastOpenHint);
 		checkboxRow(overlay::util::ModuleTextW("Notifications.LowDisk"), m_setToastLowDisk,
@@ -6254,6 +6264,9 @@ void OverlayRenderer::HandleSettingsClick(int x, int y)
 		case SettingsField::ToastVideoSaved:
 			m_setToastVideoSaved = !m_setToastVideoSaved;
 			ApplyToastOptions();
+			break;
+		case SettingsField::ToastExport:
+			m_setToastExport = !m_setToastExport;
 			break;
 		case SettingsField::ToastOpenHint:
 			m_setToastOpenHint = !m_setToastOpenHint;
@@ -6826,9 +6839,11 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 				return;
 			}
 			if (m_exportQueue.IsEmpty()) {
-				overlay_runtime_show_toast(
-					overlay::util::WideToUtf8(overlay::util::ModuleTextW("Export.QueueEmpty")).c_str(),
-					3000);
+				if (m_setToastExport)
+					overlay_runtime_show_toast(
+						overlay::util::WideToUtf8(overlay::util::ModuleTextW("Export.QueueEmpty"))
+							.c_str(),
+						3000);
 				Render();
 				return;
 			}
@@ -6849,9 +6864,11 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 			if (!m_exportQueue.IsEmpty()) {
 				m_exportQueue.ClearAll();
 				m_editingQueueJobId.clear();
-				overlay_runtime_show_toast(
-					overlay::util::WideToUtf8(overlay::util::ModuleTextW("Export.QueueCleared")).c_str(),
-					3000);
+				if (m_setToastExport)
+					overlay_runtime_show_toast(
+						overlay::util::WideToUtf8(overlay::util::ModuleTextW("Export.QueueCleared"))
+							.c_str(),
+						3000);
 				Render();
 			}
 			return;
@@ -6974,11 +6991,12 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 						m_videoPlayer.SetTrimOut(m_galleryTrimOut);
 						m_exportSettingsPendingStart = false;
 						m_galleryExportSubmenuOpen = false;
-						overlay_runtime_show_toast(
-							overlay::util::WideToUtf8(
-								overlay::util::ModuleTextW("Export.EditTrimHint"))
-								.c_str(),
-							3500);
+						if (m_setToastExport)
+							overlay_runtime_show_toast(
+								overlay::util::WideToUtf8(
+									overlay::util::ModuleTextW("Export.EditTrimHint"))
+									.c_str(),
+								3500);
 						Render();
 						return;
 					}
@@ -7276,7 +7294,8 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 					}
 				}
 				if (!m_exportTrackStreamIndices.empty() && !anyKept) {
-					overlay_runtime_show_toast("Select at least one track to export", 3500);
+					if (m_setToastExport)
+						overlay_runtime_show_toast("Select at least one track to export", 3500);
 					return;
 				}
 				PersistRebuildPresets();
@@ -7522,11 +7541,12 @@ void OverlayRenderer::HandleGalleryClick(int x, int y)
 				break;
 			}
 			m_editingQueueJobId.clear();
-			overlay_runtime_show_toast(
-				overlay::util::WideToUtf8(overlay::util::ModuleTextW(
-					updatedOk ? "Export.TrimUpdated" : "Export.EditTrimHint"))
-					.c_str(),
-				3000);
+			if (m_setToastExport)
+				overlay_runtime_show_toast(
+					overlay::util::WideToUtf8(overlay::util::ModuleTextW(
+							 updatedOk ? "Export.TrimUpdated" : "Export.EditTrimHint"))
+						.c_str(),
+					3000);
 			Render();
 			return;
 		}

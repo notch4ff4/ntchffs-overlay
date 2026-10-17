@@ -364,6 +364,7 @@ private:
 		CaptureFocus,
 		ToastsEnabled,
 		ToastVideoSaved,
+		ToastExport,
 		ToastOpenHint,
 		ToastLowDisk,
 		ClipShow0,
@@ -451,6 +452,7 @@ private:
 	bool m_setCaptureFocus;
 	bool m_setToastsEnabled;
 	bool m_setToastVideoSaved;
+	bool m_setToastExport;
 	bool m_setToastOpenHint;
 	bool m_setToastLowDisk;
 	int m_setToastLowDiskGb;
